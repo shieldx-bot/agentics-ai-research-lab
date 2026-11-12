@@ -132,3 +132,11 @@ def test_run_command_kills_timed_out_process(ws):
 def test_agent_id_cannot_escape_workspace(ws):
     with pytest.raises(ValueError):
         RepoWorkspace("../outside", ws.settings)
+
+
+def test_git_network_environment_contains_only_git_auth_not_provider_cookies(ws, monkeypatch):
+    monkeypatch.setenv("PPLX_COOKIE", "must-not-leak")
+    env = ws._git_env()
+    assert "PPLX_COOKIE" not in env
+    assert env["GIT_CONFIG_KEY_0"] == "http.extraheader"
+    assert "must-not-leak" not in repr(env)
