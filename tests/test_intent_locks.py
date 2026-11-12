@@ -96,7 +96,7 @@ PLAN = {
 
 
 def _patch_llm(monkeypatch, payload):
-    async def fake(ctx, prompt, mode="concise", purpose="general"):
+    async def fake(ctx, prompt, mode="concise", purpose="general", state=None):
         return json.dumps(payload), []
     monkeypatch.setattr(nodes, "_llm_ask", fake)
 
@@ -200,6 +200,9 @@ def test_implement_passes_when_diff_stays_in_scope(mem, monkeypatch):
     local = SimpleNamespace(guard=ProtectedPathsGuard(),
                             locks=_locks(mem))
     ctx = _impl_ctx(mem, ws, local=local)
+    # the degradation port (P-fix) turns a missing LLM into state["error"],
+    # so give the node a canned model — this test is about P14 scope binding
+    _patch_llm(monkeypatch, {"file": "experiments/bench.py"})
     state = {
         "branch": "agent/a04/task-3-x", "issue_number": 3,
         "issue_title": "Experiment: bench", "category": "experiment",

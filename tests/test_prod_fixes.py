@@ -78,8 +78,13 @@ class _FakeIssue:
 
 
 class _FakeRepo:
-    def __init__(self, issues):
+    """Duck-typed repo WITH a stable identity — the only kind the shared
+    scan cache caches (see issue_ops.scan_open_issues: id()-keying poisons
+    the cache when CPython reuses a dead fake's address)."""
+
+    def __init__(self, issues, repo_id=42001):
         self._issues = issues
+        self.id = repo_id
         self.get_issues_calls = 0
 
     def get_issues(self, **kw):
@@ -96,11 +101,24 @@ def test_scan_open_issues_cached_across_calls():
 
 
 def test_scan_cache_distinguishes_repos_and_limits():
-    repo_a = _FakeRepo([_FakeIssue(1, "A")])
-    repo_b = _FakeRepo([_FakeIssue(2, "B")])
+    repo_a = _FakeRepo([_FakeIssue(1, "A")], repo_id=42002)
+    repo_b = _FakeRepo([_FakeIssue(2, "B")], repo_id=42003)
     assert issue_ops.scan_open_issues(repo_a)[0].number == 1
     assert issue_ops.scan_open_issues(repo_b)[0].number == 2
     assert repo_a.get_issues_calls == 1 and repo_b.get_issues_calls == 1
+
+
+def test_scan_cache_skips_identity_less_repos():
+    """Their c90ded0 contract: a duck-typed repo WITHOUT a stable id must NOT
+    poison the shared cache — every scan goes to the (fake) API."""
+    class NoIdRepo(_FakeRepo):
+        def __init__(self, issues):
+            super().__init__(issues)
+            del self.id
+    repo = NoIdRepo([_FakeIssue(1, "A")])
+    issue_ops.scan_open_issues(repo)
+    issue_ops.scan_open_issues(repo)
+    assert repo.get_issues_calls == 2
 
 
 def test_scan_cache_refresh_after_clear():
