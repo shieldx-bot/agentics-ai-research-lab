@@ -101,9 +101,14 @@ class RepoWorkspace:
         if not self._command_allowed(cmd):
             return 126, "command rejected by workspace allowlist"
         try:
+            # Do not expose GitHub/LLM credentials to test processes. This is
+            # defense-in-depth, not a replacement for an OS/container sandbox.
+            blocked = ("TOKEN", "COOKIE", "PASSWORD", "SECRET", "API_KEY", "AUTHORIZATION")
+            child_env = {k: v for k, v in os.environ.items()
+                         if not any(marker in k.upper() for marker in blocked)}
             proc = subprocess.run(
                 cmd, cwd=self.path, capture_output=True, text=True,
-                timeout=max(1, min(int(timeout), 300)),
+                timeout=max(1, min(int(timeout), 300)), env=child_env,
             )
             return proc.returncode, (proc.stdout + proc.stderr)[-4000:]
         except subprocess.TimeoutExpired:
