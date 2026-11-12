@@ -34,5 +34,14 @@ ownership:
   integrator: [".github/"]
   supervisor: ["configs/"]
 
+# --- Rootless Docker execution sandbox ------------------------------------
+sandbox_enabled: true
+sandbox_image: "agentics-sandbox:py311"
+sandbox_require_rootless: true
+sandbox_cpu_millis: 1000
+sandbox_memory_mb: 1024
+sandbox_pids_limit: 128
+sandbox_tmpfs_mb: 128
+
 # --- Perplexity ------------------------------------------------------------
 pplx_timeout: 180
