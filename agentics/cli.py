@@ -36,8 +36,9 @@ def run(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     install_signal_handlers(loop)
-    console.print(f"[bold green]Agentics v{__version__}[/] — {len(orch.pool)} accounts, "
-                  f"repo {settings.github_repo}")
+    console.print(f"[bold green]Agentics v{__version__}[/] — {len(orch.host)} browser-session "
+                  f"identities (perplexity: {len(orch.host.pools['perplexity'])}, "
+                  f"qwen: {len(orch.host.pools['qwen'])}), repo {settings.github_repo}")
     if should_stop():
         from agentics.stop import clear_stop
         clear_stop()
@@ -67,12 +68,12 @@ def status() -> None:
 
     orch = Orchestrator.__new__(Orchestrator)  # avoid GitHub connection
     from agentics.memory.shared_memory import SharedMemory
-    from agentics.llm.pool import AccountPool
+    from agentics.llm.session_host import BrowserSessionHost
     from agentics.memory.vector_store import VectorStore
 
     settings.ensure_dirs()
     memory = SharedMemory(settings.db_path)
-    pool = AccountPool(settings)
+    host = BrowserSessionHost.from_settings(settings)
     table = Table(title="Agents (heartbeat)")
     for col in ("agent", "role", "cycle", "status", "last seen"):
         table.add_column(col)
@@ -86,8 +87,9 @@ def status() -> None:
         console.print("[bold]Active claims:[/]")
         for issue_no, c in claims.items():
             console.print(f"  issue #{issue_no} -> {c.agent} ({c.branch})")
-    console.print(f"[bold]Accounts loaded:[/] {len(pool)}")
-    for line in pool.status_lines():
+    console.print(f"[bold]Browser-session identities loaded:[/] {len(host)} "
+                  f"(perplexity: {len(host.pools['perplexity'])}, qwen: {len(host.pools['qwen'])})")
+    for line in host.status_lines():
         console.print(f"  {line}")
     memory.close()
 
@@ -149,21 +151,28 @@ def memory_stats() -> None:
 @app.command()
 def test_llm(
     account: int = typer.Option(1, "--account", help="account index (1-based)"),
+    provider: str = typer.Option("perplexity", "--provider", help="perplexity | qwen"),
     query: str = typer.Option("What is network function virtualization? One paragraph.",
                               "--query"),
 ) -> None:
-    """Smoke-test one cookie account against Perplexity."""
+    """Smoke-test one browser-session account (Perplexity or Qwen)."""
     settings = _settings()
     setup_logging("INFO")
-    from agentics.llm.pool import AccountPool
+    from agentics.llm.session_host import BrowserSessionHost
 
-    pool = AccountPool(settings)
+    host = BrowserSessionHost.from_settings(settings)
+    prov = provider.lower()
+    if prov not in host.pools:
+        console.print(f"[red]unknown provider '{provider}' (use perplexity|qwen)[/]")
+        raise typer.Exit(1)
+    pool = host.pools[prov]
     if not pool.accounts:
-        console.print("[red]No accounts found in accounts/[/]")
+        console.print(f"[red]No {prov} accounts found in accounts/[/]")
         raise typer.Exit(1)
     acc = pool.accounts[min(account, len(pool.accounts)) - 1]
-    console.print(f"Testing [bold]{acc.name}[/] ({len(acc.cookies)} cookies)…")
-    client = pool.client_for(acc)
+    console.print(f"Testing [bold]{acc.name}[/] ({prov}, "
+                  f"{len(acc.cookies)} cookies, model={getattr(acc, 'model', '-')})…")
+    client = host._client_for(prov, acc)
 
     async def _run():
         resp = await client.ask(query, mode="academic")
@@ -182,13 +191,15 @@ def test_llm(
 def assign_roles() -> None:
     """Print the role assignment for current accounts (dry-run)."""
     settings = _settings()
-    from agentics.llm.pool import AccountPool
+    from agentics.llm.session_host import BrowserSessionHost
     from agentics.orchestrator import _role_map
     from agentics.agents.roles import assign_roles
 
-    pool = AccountPool(settings)
-    roles = assign_roles(min(len(pool), settings.max_agents), _role_map(settings))
-    for acc, role in zip(pool.accounts, roles):
+    host = BrowserSessionHost.from_settings(settings)
+    roles = assign_roles(min(len(host), settings.max_agents), _role_map(settings))
+    for i, role in zip(range(len(host)), roles):
+        acc = host.pools["perplexity"].accounts[i] if i < len(host.pools["perplexity"]) \
+            else host.pools["qwen"].accounts[i]
         console.print(f"{acc.name:<14} -> [bold cyan]{role.value}[/]")
 
 

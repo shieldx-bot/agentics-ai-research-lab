@@ -45,14 +45,19 @@ def _memory_context(ctx: AgentContext) -> dict:
     }
 
 
-def _llm_ask(ctx: AgentContext, prompt: str, mode: str = "concise") -> tuple[str, list[str]]:
+def _llm_ask(
+    ctx: AgentContext, prompt: str, mode: str = "concise", purpose: str = "general"
+) -> tuple[str, list[str]]:
+    """Route one LLM call through the BrowserSessionHost by purpose:
+    research -> Perplexity (citations); plan/implement/review -> Qwen."""
     if ctx.llm is None:
         return "", []
     resp = asyncio.get_event_loop().run_until_complete(
-        ctx.llm.ask(prompt, mode=mode, system=build_system_prompt(
+        ctx.llm.ask(prompt, mode=mode, purpose=purpose, system=build_system_prompt(
             ctx.agent_id, ctx.role, ctx.settings.research_topic))
     )
-    ctx.meta["account"] = ctx.llm.account.name
+    acc = getattr(ctx.llm, "account", None)
+    ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     return resp.answer, resp.citations
 
 
@@ -191,9 +196,10 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["done"] = True
         return state
     resp = asyncio.get_event_loop().run_until_complete(
-        papers_mod.search_papers(ctx.llm, query)
+        papers_mod.search_papers(ctx.llm, query, purpose="research")
     )
-    ctx.meta["account"] = ctx.llm.account.name
+    acc = getattr(ctx.llm, "account", None)
+    ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     state["papers"] = [{"title": topic, "answer": resp.answer}]
     state["citations"] = list(resp.citations)
     state["bibtex"] = cite_fmt.to_bibtex(cite_fmt.parse_citations(resp.citations))
@@ -253,7 +259,7 @@ def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
         "'reusable_tools' if it is a genuinely reusable utility.)"
     )
-    answer, _ = _llm_ask(ctx, prompt, mode="concise")
+    answer, _ = _llm_ask(ctx, prompt, mode="concise", purpose="plan")
     parsed = parse_json_block(answer)
     if not parsed:
         state["error"] = "plan parsing failed"
@@ -310,7 +316,7 @@ def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
-        answer, _ = _llm_ask(ctx, prompt, mode="concise")
+        answer, _ = _llm_ask(ctx, prompt, mode="concise", purpose="implement")
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
             ctx.workspace.write_file(path, content)
@@ -438,7 +444,7 @@ def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         'Reply ONLY JSON: {"verdict": "approve|request_changes", '
         '"comment": "..."}'
     )
-    answer, _ = _llm_ask(ctx, prompt, mode="concise")
+    answer, _ = _llm_ask(ctx, prompt, mode="concise", purpose="review")
     parsed = parse_json_block(answer)
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")

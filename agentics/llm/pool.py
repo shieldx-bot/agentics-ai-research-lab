@@ -62,6 +62,8 @@ class AccountPool:
         provider = (self.settings.llm_provider or "perplexity").lower()
         pattern = "qwen-*.json" if provider == "qwen" else "account-*.json"
         files = sorted(self.settings.accounts_dir.glob(pattern))
+        # templates (accounts/*.example.json) are docs, never live sessions
+        files = [f for f in files if ".example" not in f.name]
         loader = load_qwen_account if provider == "qwen" else load_account_file
         for f in files:
             try:

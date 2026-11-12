@@ -14,7 +14,7 @@ from agentics.agents.roles import Role, assign_roles
 from agentics.config import Settings, load_yaml_overrides, PROJECT_ROOT
 from agentics.github_ops.client import GitHubClient
 from agentics.github_ops.repo_workspace import RepoWorkspace
-from agentics.llm.pool import AccountPool
+from agentics.llm.session_host import BrowserSessionHost
 from agentics.memory.personal_memory import PersonalMemory
 from agentics.memory.shared_memory import SharedMemory
 from agentics.memory.vector_store import VectorStore
@@ -45,24 +45,32 @@ class Orchestrator:
         self.settings.ensure_dirs()
         self.memory = SharedMemory(self.settings.db_path)
         self.vector = VectorStore(self.settings.chroma_path)
-        self.pool = AccountPool(self.settings)
+        self.host = BrowserSessionHost.from_settings(self.settings)
+        # back-compat alias: the perplexity pool (1 thread = 1 cookie identity)
+        self.pool = self.host.pools["perplexity"]
         self.gh = GitHubClient(self.settings)
         self.ownership = OwnershipPolicy.from_config(None)
         self.agents: list[AgentContext] = []
 
     # ------------------------------------------------------------ assembly
     def build_contexts(self) -> list[AgentContext]:
-        n = min(len(self.pool), self.settings.max_agents) or 0
+        n = min(len(self.host), self.settings.max_agents) or 0
         if n == 0:
             raise RuntimeError(
-                "No cookie accounts found. Put account-01.json… into accounts/ "
-                "(see accounts/README.md)."
+                "No browser-session accounts found. Put account-01.json… "
+                "(Perplexity) and/or qwen-01.json… (Qwen) into accounts/ "
+                "(see accounts/README.md and docs/LLM_PROVIDERS.md)."
             )
         roles = assign_roles(n, _role_map(self.settings))
         contexts: list[AgentContext] = []
         for i in range(n):
             agent_id = f"a{i + 1:02d}"
-            account = self.pool.accounts[i]
+            # agent i is pinned to account i of each pool (1 thread = 1 identity)
+            pinned = self.host.view(prefer_index=i)
+            pplx_accs = self.host.pools["perplexity"].accounts
+            qwen_accs = self.host.pools["qwen"].accounts
+            first = (pplx_accs[i] if i < len(pplx_accs)
+                     else qwen_accs[i] if i < len(qwen_accs) else None)
             personal = PersonalMemory(agent_id, self.settings.data_dir / "personal")
             ctx = AgentContext(
                 agent_id=agent_id,
@@ -71,12 +79,12 @@ class Orchestrator:
                 gh=self.gh,
                 memory=self.memory,
                 vector=self.vector,
-                llm=self.pool.client_for(account),
+                llm=pinned,
                 workspace=RepoWorkspace(agent_id, self.settings),
                 claims=ClaimPolicy(self.gh, self.memory, self.settings.claim_ttl_minutes),
                 ownership=self.ownership,
                 merge_queue=MergeQueue(self.gh, self.memory, self.settings.auto_merge),
-                meta={"account": account.name, "personal": personal},
+                meta={"account": getattr(first, "name", "shared"), "personal": personal},
             )
             contexts.append(ctx)
         self.agents = contexts
@@ -101,13 +109,10 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 log.exception("[%s] cycle failed: %s", tag, exc)
                 ctx.memory.post_message(ctx.agent_id, "alert", f"cycle error: {exc}")
-                # cookie trouble → cooldown & maybe swap account
+                # cookie trouble -> cooldown the account that served the call;
+                # the host re-leases a healthy one automatically at next ask
                 if ctx.llm is not None and ("4" in str(exc)[:2] or "auth" in str(exc).lower()):
-                    self.pool.mark_failed(ctx.llm.account, str(exc))
-                    nxt = self.pool.lease()
-                    if nxt is not None:
-                        ctx.llm = self.pool.client_for(nxt)
-                        log.info("[%s] switched to account %s", tag, nxt.name)
+                    ctx.llm.mark_failed(str(exc))
             pause = self.settings.cycle_pause_seconds + random.uniform(0, 15)
             for _ in range(int(pause)):
                 if should_stop():
@@ -138,7 +143,7 @@ class Orchestrator:
                 f"status={a['status']}"
             )
         lines.append("== accounts ==")
-        lines.extend(self.pool.status_lines())
+        lines.extend(self.host.status_lines())
         lines.append("== claims ==")
         for issue_no, c in self.memory.active_claims().items():
             lines.append(f"issue #{issue_no} -> {c.agent} (branch {c.branch})")

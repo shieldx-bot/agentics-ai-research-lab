@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from agentics.config import Settings
 from agentics.github_ops.client import GitHubClient
 from agentics.github_ops.repo_workspace import RepoWorkspace
-from agentics.llm.perplexity_client import PerplexityClient
+from agentics.llm.session_host import BrowserSessionHost
 from agentics.memory.personal_memory import PersonalMemory
 from agentics.memory.shared_memory import SharedMemory
 from agentics.memory.vector_store import VectorStore
@@ -24,7 +24,7 @@ class AgentContext:
     gh: GitHubClient
     memory: SharedMemory
     vector: VectorStore
-    llm: PerplexityClient | None
+    llm: BrowserSessionHost | None
     workspace: RepoWorkspace
     claims: ClaimPolicy
     ownership: OwnershipPolicy

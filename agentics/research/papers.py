@@ -20,15 +20,22 @@ async def search_papers(
     client: PerplexityClient,
     query: str,
     max_papers: int = 8,
+    purpose: str | None = "research",
 ) -> LLMResponse:
-    """Ask Perplexity in academic mode; returns answer + citation URLs."""
+    """Ask Perplexity in academic mode; returns answer + citation URLs.
+
+    ``purpose="research"`` routes the call to Perplexity through the
+    BrowserSessionHost (citations required); pass ``purpose=None`` when the
+    client is a bare PerplexityClient without routing.
+    """
     prompt = (
         f"Survey the most relevant recent research on: {query}. "
         f"List up to {max_papers} works. For each: authors/title/year, venue, "
         "key contribution, and results with numbers if available. "
         "Finish with a short synthesis of the state of the art and open gaps."
     )
-    resp = await client.ask(prompt, mode="academic", system=SEARCH_SYSTEM)
+    kw = {"purpose": purpose} if purpose else {}
+    resp = await client.ask(prompt, mode="academic", system=SEARCH_SYSTEM, **kw)
     if not resp.ok:
         log.warning("paper search returned empty answer for: %s", query[:80])
     return resp

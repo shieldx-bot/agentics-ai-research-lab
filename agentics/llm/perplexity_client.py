@@ -120,11 +120,13 @@ class PerplexityClient:
         mode: str = "academic",
         system: str | None = None,
         frontend_uuid: str | None = None,
+        purpose: str | None = None,
     ) -> LLMResponse:
         """Send one query; returns final answer + citations.
 
         mode: "academic" biases Perplexity towards scholarly sources (good for
         paper search); "concise" is faster for coding/writing tasks.
+        purpose: routing hint consumed by BrowserSessionHost; ignored here.
         """
         started = time.monotonic()
         uuid = frontend_uuid or _fake_uuid()

@@ -116,7 +116,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
     mem.activate_tools(9)
     seen = {}
 
-    def fake_llm(ctx, prompt, mode="concise"):
+    def fake_llm(ctx, prompt, mode="concise", purpose="general"):
         seen["prompt"] = prompt
         return json.dumps(
             {
@@ -148,7 +148,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
 def test_evolution_plan_prompt_states_the_allowed_paths(mem, monkeypatch):
     seen = {}
 
-    def fake_llm(ctx, prompt, mode="concise"):
+    def fake_llm(ctx, prompt, mode="concise", purpose="general"):
         seen["p"] = prompt
         return "{}", []
 

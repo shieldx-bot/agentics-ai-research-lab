@@ -259,8 +259,12 @@ class QwenClient:
         *,
         mode: str = "concise",
         system: str | None = None,
+        purpose: str | None = None,
     ) -> LLMResponse:
-        """Send one query; returns the final answer text (+ any link citations)."""
+        """Send one query; returns the final answer text (+ any link citations).
+
+        purpose: routing hint consumed by BrowserSessionHost; ignored here.
+        """
         started = time.monotonic()
         timeout = aiohttp.ClientTimeout(total=self.timeout + 30)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
