@@ -219,3 +219,42 @@ Plan rỗng file (task thu hồi tài liệu vào memory) không bị kiểm tra
 
 Đầy đủ kiến trúc Local Mode và đáp án 2 giả thuyết nghiên cứu:
 [LOCAL_MODE.md](LOCAL_MODE.md).
+
+---
+
+## P16 — Kiểm chứng thực nghiệm: verdict đến từ code thật, không từ lời nói LLM
+
+**Vấn đề:** mọi kết luận trong lab (tìm kiếm, đánh giá ý tưởng, verify) đều đi
+qua LLM — một agent có thể "khẳng định" giả thuyết đúng mà chưa chạy gì cả.
+Owner đặt 3 giả thuyết: (1) AI có thể dùng cmd/code/test như researcher thực
+thụ không; (2) AI có thể tự kiểm chứng giả thuyết của chính mình không;
+(3) kết quả kiểm chứng có chia sẻ cho mọi AI đều biết không.
+
+**Chính sách:** ý tưởng chỉ được gọi là đã kiểm chứng khi có **bằng chứng chạy
+thật** trong bảng `evidence` của memory dùng chung:
+
+1. **Preregistration** — `node_plan` khai báo `verify_cmds` trong JSON kế hoạch
+   (định nghĩa trước khi viết code: "exit 0 phải nghĩa là giả thuyết đúng").
+   Danh sách lệnh được công bố trong intent cho cả swarm thấy.
+2. **Chạy thật** — `node_implement` thực thi từng lệnh qua
+   `agentics/verify_ops.py` (`run_experiment`, nằm trên
+   `RepoWorkspace.run_command`: chỉ python đang chạy + module pytest/py_compile
+   + script trong workspace, môi trường scrubbed, giới hạn thời gian).
+3. **Verdict từ exit code, không từ model** — `0 → confirmed`,
+   `124/126 → inconclusive` (timeout / bị guard chặn), còn lại `→ refuted`.
+   `refuted` chặn push (agent phải sửa code hoặc re-plan);
+   `inconclusive` chỉ journal cảnh báo — reviewer quyết, pipeline không
+   kẹt vĩnh viễn vì một lệnh không chạy được.
+4. **Kiến thức chung** — mỗi lần chạy ghi 1 dòng vào bảng `evidence`
+   (task, agent, lệnh, exit, verdict, output ≤1500 ký tự) và broadcast tới
+   mọi agent (messages + journal). Reviewer nhận danh sách bằng chứng trong
+   prompt và trích dẫn histogram vào verdict. Owner xem toàn bộ qua card
+   "Kiểm chứng thực nghiệm" trên dashboard hoặc `agentics evidence
+   [task_id] [--search]`; agent khác tra cứu lại bằng
+   `memory.evidence_search(...)` thay vì hỏi lại LLM.
+5. **Re-verdict** — Reviewer/owner có thể hạ/tăng verdict một dòng bằng chứng
+   (`set_evidence_verdict`, kèm `note` + `verdict_by`) — bằng chứng cũng bị
+   review, không ai tự tôn vinh kết quả của mình.
+
+Test: `tests/test_verify_ops.py`, `tests/test_evidence_memory.py`,
+`tests/test_nodes_integration.py` (phần P16), `tests/test_dashboard_api.py`.
