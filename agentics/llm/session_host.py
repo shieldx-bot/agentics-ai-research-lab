@@ -121,7 +121,15 @@ class BrowserSessionHost:
     def _client_for(self, provider: str, account: CookieAccount | QwenAccount):
         key = (provider, account.name)
         if key not in self._clients:
-            self._clients[key] = self._pool(provider).client_for(account)
+            if (
+                provider == "perplexity"
+                and (self.settings.browser_backend or "local").lower() == "hyperbrowser"
+            ):
+                from agentics.llm.hyperbrowser_client import HyperbrowserClient
+
+                self._clients[key] = HyperbrowserClient(account, self.settings)
+            else:
+                self._clients[key] = self._pool(provider).client_for(account)
         return self._clients[key]
 
     def _lease(self, purpose: str) -> tuple[str, Any] | tuple[None, None]:

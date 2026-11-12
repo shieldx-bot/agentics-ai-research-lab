@@ -129,3 +129,33 @@ python scripts/hyperbrowser_smoke.py --accounts 1-3 --wait 60
   extracts the answer text and screenshots.
 * Requires `pip install hyperbrowser playwright` and `playwright install` for
   the local driver. Free Hyperbrowser plans run 1 session at a time.
+
+### Running the lab itself through Hyperbrowser (`BROWSER_BACKEND=hyperbrowser`)
+
+Set in the environment (or `configs/lab.yaml`):
+
+```bash
+BROWSER_BACKEND=hyperbrowser
+HB_API_KEY=...                  # Hyperbrowser API key
+HB_PROXY_COUNTRY=US             # default; residential proxy exit
+HB_TIMEOUT=900                  # session max lifetime, seconds
+```
+
+With this backend the Perplexity pool's clients become
+`agentics.llm.hyperbrowser_client.HyperbrowserClient` — the graph nodes are
+unchanged; only the transport under `BrowserSessionHost` swaps. Verified live
+2026-11-12 (full `research -> plan` cycle, real topic "ML for early failure
+prediction of NFV network functions"):
+
+| Node | Time | Result |
+| --- | --- | --- |
+| `node_research` | ~67 s | 6.9k-char academic survey, 7 verifiable citations (IMC'18, IEEE NetSoft'20, CNSM, ITU Journal…), concrete metrics (RF 93% precision / 99% AUC, XGBoost, SVR…) |
+| `node_plan` | ~48 s | valid JSON plan: 14 files + 7 concrete steps grounded in the surveyed papers |
+
+Constraints of cloud-browser mode (free plan):
+
+* exactly ONE active session — asks are globally serialized and a switching
+  account evicts the previous holder's session; run `MAX_AGENTS=1`
+* each `ask()` navigates a fresh Perplexity thread (~60–140 s round trip)
+* offline unit tests never create sessions; live check:
+  `HB_API_KEY=... python scripts/live_research_run.py`

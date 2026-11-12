@@ -77,6 +77,17 @@ class Settings:
         default_factory=lambda: _env("PPLX_ORIGIN", "https://www.perplexity.ai")
     )
     pplx_timeout: int = field(default_factory=lambda: _env_int("PPLX_TIMEOUT", 180))
+    # Browser backend for the Perplexity pool (see docs/LLM_PROVIDERS.md):
+    # "local" (default) = raw cookie WebSocket from THIS machine — works only
+    #   from residential IPs; Perplexity 403-blocks datacenter IPs.
+    # "hyperbrowser" = browser runs on Hyperbrowser cloud (stealth + US
+    #   residential proxy) via Playwright CDP; works from any VPS.
+    browser_backend: str = field(default_factory=lambda: _env("BROWSER_BACKEND", "local"))
+    hyperbrowser_api_key: str = field(default_factory=lambda: _env("HB_API_KEY"))
+    hyperbrowser_proxy_country: str = field(
+        default_factory=lambda: _env("HB_PROXY_COUNTRY", "US"))
+    hyperbrowser_timeout: int = field(
+        default_factory=lambda: _env_int("HB_TIMEOUT", 900))
 
     @property
     def owner(self) -> str:
