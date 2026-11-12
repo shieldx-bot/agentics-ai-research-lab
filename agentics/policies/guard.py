@@ -2,16 +2,21 @@
 
 Motivation (owner question 1): "Liệu các tác nhân có thể làm việc trực tiếp
 trong local mà không dẫn tới tình trạng AI sửa nhầm code agent?" — this guard
-is the answer's enforcement half. Three layers use it:
+is the answer's enforcement half. Four layers use it:
 
     1. RepoWorkspace.write_file  — a plan cannot even create/edit a protected file
     2. node_implement            — a diff that touches protected paths is yielded
     3. LocalMergeQueue.drain     — a merge of a protected-path branch is refused
+    4. the bare origin's pre-receive hook (local_ops.origin_hook_script) — a
+       raw push is judged at git receive-pack time by the same rulebook
 
 An exemption is granted ONLY by the owner, either per task
 (`python -m agentics.cli allow-protected <task_id>` — stored on the task row)
 or globally via the ALLOW_PROTECTED_PATHS=1 environment variable for the run.
-Everything else is rejected with a hard error.
+Sanctioned in-process pushes (Integrator merge, owner-exempted task) set
+INTEGRATOR_MERGE_ENV on that single git push; agents cannot forge it because
+their git subprocesses run with a scrubbed environment. Everything else is
+rejected with a hard error.
 """
 from __future__ import annotations
 
@@ -35,6 +40,12 @@ ALWAYS_PROTECTED: tuple[str, ...] = (
     "accounts/",          # cookies / credentials
     "configs/secrets.yaml",
 )
+
+# Env var marking the ONLY sanctioned pushes that may move main / carry
+# owner-exempt protected paths (Integrator merge, owner-exempted task).
+# Lives in this leaf module so both github_ops.repo_workspace and local_ops
+# can import it without an import cycle.
+INTEGRATOR_MERGE_ENV = "AGENTICS_INTEGRATOR_MERGE"
 
 
 class ProtectedPathsGuard:

@@ -424,6 +424,7 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     # P10 layer 2: a diff that touches the lab's own code is refused here —
     # an exemption comes from the task row (owner-granted), never from the agent.
     guard = getattr(getattr(ctx, "local", None), "guard", None)
+    allow_protected = False
     if guard is not None:
         violations = guard.check_task(
             ctx.memory, state.get("issue_number"), changed)
@@ -433,6 +434,11 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 f"P10 protected paths in diff: {violations[:5]} "
                 "(agent code is owner-only; the owner can exempt a task)",
             )
+        # owner-granted exemption on this task: the push must carry the same
+        # sanction so the P10 origin hook (layer 4) lets the branch through
+        task_id = state.get("issue_number")
+        task = ctx.memory.get_task(task_id) if task_id is not None else None
+        allow_protected = bool(task and task.get("exempt"))
 
     # P14 — the diff must stay inside the declared intent scope. An undeclared
     # file in the diff means the plan drifted; refuse and journal it.
@@ -484,6 +490,7 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             ctx.workspace.commit_and_push,
             branch, f"agent({ctx.agent_id}): {state.get('commit_message', 'work')} "
                     f"(#{state['issue_number']})",
+            allow_protected=allow_protected,
         )
     except RuntimeError as exc:
         state["error"] = str(exc)

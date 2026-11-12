@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import logging
 import re
+import stat
 import subprocess
 from pathlib import Path
 
 from agentics.config import PROJECT_ROOT, Settings
 from agentics.memory.shared_memory import SharedMemory
+from agentics.policies.guard import (
+    ALWAYS_PROTECTED, DEFAULT_PROTECTED_PATHS, INTEGRATOR_MERGE_ENV,
+)
 
 log = logging.getLogger("local.ops")
 
@@ -47,6 +51,76 @@ SURVEY_ANGLES: tuple[str, ...] = (
 )
 
 
+# ------------------------------------------------------------- P10 layer 4
+def origin_hook_script(
+    default_branch: str = "main",
+    protected: tuple[str, ...] | None = None,
+) -> str:
+    """The pre-receive hook for the bare origin — the git-protocol layer (4/4)
+    of the P10 guard. Layers 1-3 (write_file, node diff, run_command) run
+    inside the workspace; this one runs INSIDE the bare repo at receive-pack
+    time, so even a raw `git push` that bypassed the workspace API is judged
+    by the same rulebook:
+
+        * the owner always wins: any push whose new tip is not agent-authored
+          (committer email not starting with "agentics+") passes untouched;
+        * agents (email ``agentics+*``) may never move or delete the default
+          branch — main moves only through the Integrator's sanctioned merge
+          (``RepoWorkspace.merge_branch_to_main``, which sets
+          INTEGRATOR_MERGE_ENV) or an owner push;
+        * agent commits may not touch a protected path — checked PER COMMIT
+          (``git diff-tree``), so an agent branch rebased on top of fresh
+          owner commits cannot smuggle changes past the check;
+        * branch deletions other than the default branch are fine.
+
+    The patterns are generated from the same ProtectedPathsGuard lists
+    (DEFAULT_PROTECTED_PATHS + ALWAYS_PROTECTED) the in-process layers use,
+    so the layers cannot drift apart.
+    """
+    protected = tuple(protected) if protected else DEFAULT_PROTECTED_PATHS + ALWAYS_PROTECTED
+    pats = "|".join(p.rstrip("/") if p.endswith("/") else p for p in protected)
+    return f"""#!/bin/sh
+# agentics P10 origin guard — auto-generated from agentics/policies/guard.py.
+# DO NOT EDIT by hand: LocalRepo.ensure() re-installs it on every boot.
+[ "${INTEGRATOR_MERGE_ENV}" = "1" ] && exit 0   # sanctioned merge / exempt push
+ZERO=0000000000000000000000000000000000000000
+DEFAULT="refs/heads/{default_branch}"
+while read old new ref; do
+    if [ "$new" = "$ZERO" ]; then                       # branch deletion
+        if [ "$ref" = "$DEFAULT" ]; then
+            echo "guard P10: the default branch cannot be deleted" >&2
+            exit 1
+        fi
+        continue                                        # agent branches: fine
+    fi
+    # owner power: a push whose tip is owner-authored is the owner's business
+    if ! git log --format=%ce -1 "$new" | grep -q '^agentics+'; then
+        exit 0
+    fi
+    if [ "$ref" = "$DEFAULT" ]; then
+        echo "guard P10: agents cannot move '{default_branch}' — work goes through the MR flow" >&2
+        exit 1
+    fi
+    if [ "$old" = "$ZERO" ]; then                       # first push of a branch
+        base=$(git rev-parse --verify --quiet "$DEFAULT" || true)
+    else
+        base=$old
+    fi
+    [ -n "$base" ] || continue
+    blocked=$(git log --format='%H %ce' "$base..$new" \\
+        | awk '$2 ~ /^agentics+/ {{print $1}}' \\
+        | xargs -r git diff-tree --no-commit-id --name-only -r \\
+        | grep -E "^({pats})" || true)
+    if [ -n "$blocked" ]; then
+        echo "guard P10: agent commits touch protected paths:" >&2
+        echo "$blocked" | sed 's/^/  - /' >&2
+        exit 1
+    fi
+done
+exit 0
+"""
+
+
 class LocalRepo:
     """The shared bare repository that plays the role of "origin" locally."""
 
@@ -57,6 +131,7 @@ class LocalRepo:
     def ensure(self, src: Path | None = None) -> Path:
         """Seed the bare repo once from the running lab checkout."""
         if (self.path / "HEAD").exists():
+            self.ensure_guard()
             return self.path
         src = src or PROJECT_ROOT
         if not (src / ".git").exists():
@@ -78,7 +153,23 @@ class LocalRepo:
             ["git", "-C", str(self.path), "symbolic-ref", "HEAD", "refs/heads/main"],
             capture_output=True, text=True,
         )
+        self.ensure_guard()
         return self.path
+
+    def ensure_guard(self) -> None:
+        """Install (or upgrade) the P10 pre-receive hook on the bare origin.
+
+        Idempotent and self-healing: the hook is generated from the same
+        protected-path lists the in-process layers use, so a drifted or
+        hand-deleted hook is repaired on every boot."""
+        hook = self.path / "hooks" / "pre-receive"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        script = origin_hook_script()
+        if hook.exists() and hook.read_text(encoding="utf-8") == script:
+            return
+        hook.write_text(script, encoding="utf-8")
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        log.info("P10 pre-receive guard installed on %s", self.path)
 
     def main_head(self) -> str:
         proc = subprocess.run(

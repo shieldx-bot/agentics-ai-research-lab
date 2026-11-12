@@ -142,6 +142,9 @@ def test_merge_conflict_fails_gracefully_and_marks_mr_failed(lab):
     # owner silently advances main → the merge is no longer a fast-forward
     owner = _workspace(lab, "owner")
     owner.sync_main()
+    # the P10 origin hook binds to the committer email: a simulated owner must
+    # commit under an owner identity (real owner commits are not "agentics+")
+    owner._git("config", "user.email", "owner@local")
     owner.write_file("README.md", "owner edit\n")
     owner._git("add", "-A")
     owner._git("commit", "-m", "owner edit")
