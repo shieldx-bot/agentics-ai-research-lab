@@ -120,6 +120,32 @@ def metrics(
     memory.close()
 
 
+@app.command("memory-stats")
+def memory_stats() -> None:
+    """LifeMem memory health: traces, workflow clusters, distilled skills."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    st = memory.memory_stats()
+    console.print(
+        f"[bold]Traces:[/] {st['traces']} (clustered: {st['clustered']})   "
+        f"[bold]Clusters:[/] {st['clusters']}   "
+        f"[bold]Skills:[/] {st['active_skills']} active / "
+        f"{st['superseded_skills']} superseded"
+    )
+    if st["top_skills"]:
+        table = Table(title="Most-reused skills")
+        for col in ("uses", "category", "skill"):
+            table.add_column(col)
+        for s in st["top_skills"]:
+            table.add_row(str(s["uses"]), s["category"], s["text"])
+        console.print(table)
+    memory.close()
+
+
 @app.command()
 def test_llm(
     account: int = typer.Option(1, "--account", help="account index (1-based)"),

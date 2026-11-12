@@ -13,6 +13,7 @@ from typing import Callable
 
 from agentics.github_ops import pr_ops
 from agentics.github_ops.client import GitHubClient
+from agentics.memory import lifemem
 from agentics.memory.shared_memory import SharedMemory
 
 log = logging.getLogger("policy.mergeq")
@@ -69,8 +70,13 @@ class MergeQueue:
             )
             if ok:
                 self.memory.mq_mark(item.pr_number, "merged")
-                self.memory.set_trace_outcome(item.pr_number, "merged")
+                trace_ids = self.memory.set_trace_outcome(item.pr_number, "merged")
                 self.memory.activate_tools(item.pr_number)
+                try:      # LifeMem: merged work becomes a distilled skill for everyone
+                    lifemem.on_merge(self.memory, trace_ids)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("could not distill skills after merging PR #%s: %s",
+                                item.pr_number, exc)
                 self.memory.add_decision(
                     integrator_id, f"merge PR #{item.pr_number} by {item.author}", "merged")
                 merged += 1

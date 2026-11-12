@@ -7,6 +7,8 @@ Tables:
     claims      — issue claim registry (P1)
     heartbeats  — liveness of each agent (P6)
     traces      — evolutionary traces: what each agent tried, where it failed, outcome (GEA)
+    trace_clusters — LifeMem workflow clusters grouping similar traces
+    skills      — skills distilled from merged traces of each cluster (LifeMem)
     tool_registry — reusable tools any agent can discover (GEA: anti "innovation dying out")
     merge_queue — persistent, cross-agent merge queue (P4)
 """
@@ -93,6 +95,23 @@ CREATE TABLE IF NOT EXISTS merge_queue (
     attempts INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'queued'   -- queued | merged | failed
 );
+CREATE TABLE IF NOT EXISTS trace_clusters (
+    cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    created_ts REAL NOT NULL,
+    updated_ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clusters_cat ON trace_clusters(category);
+CREATE TABLE IF NOT EXISTS skills (
+    skill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id INTEGER NOT NULL REFERENCES trace_clusters(cluster_id),
+    text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',   -- active | superseded
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_skills_cluster ON skills(cluster_id, status);
 """
 
 
@@ -117,6 +136,10 @@ class SharedMemory:
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            try:      # migration for DBs created before LifeMem clustering
+                self._conn.execute("ALTER TABLE traces ADD COLUMN cluster_id INTEGER")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ------------------------------------------------------------ messages
     def post_message(self, agent: str, kind: str, content: str, issue: int | None = None) -> None:
@@ -277,7 +300,10 @@ class SharedMemory:
                 cur = self._conn.execute(
                     "UPDATE traces SET outcome=? WHERE pr_number=?", (outcome, pr_number)
                 )
-            return cur.rowcount
+            ids = [r[0] for r in self._conn.execute(
+                "SELECT id FROM traces WHERE pr_number=?", (pr_number,)
+            ).fetchall()]
+            return ids
 
     def recent_traces(
         self, limit: int = 20, issue: int | None = None,
@@ -400,6 +426,131 @@ class SharedMemory:
     def bump_tool_use(self, name: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE tool_registry SET uses = uses + 1 WHERE name=?", (name,))
+
+    # ------------------------------------------------------------ workflow clusters + skills (LifeMem)
+    def create_cluster(self, category: str, description: str = "") -> int:
+        now = time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO trace_clusters (category, description, created_ts, updated_ts) "
+                "VALUES (?,?,?,?)", (category, description[:200], now, now),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_cluster(self, cluster_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cluster_id, category, description, created_ts, updated_ts "
+                "FROM trace_clusters WHERE cluster_id=?", (cluster_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"cluster_id": row[0], "category": row[1], "description": row[2],
+                "created_ts": row[3], "updated_ts": row[4]}
+
+    def list_clusters(self, category: str | None = None) -> list[dict]:
+        with self._lock:
+            if category:
+                rows = self._conn.execute(
+                    "SELECT cluster_id, category, description, created_ts, updated_ts "
+                    "FROM trace_clusters WHERE category=? ORDER BY cluster_id", (category,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT cluster_id, category, description, created_ts, updated_ts "
+                    "FROM trace_clusters ORDER BY cluster_id",
+                ).fetchall()
+        return [{"cluster_id": r[0], "category": r[1], "description": r[2],
+                 "created_ts": r[3], "updated_ts": r[4]} for r in rows]
+
+    def set_trace_cluster(self, trace_id: int, cluster_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE traces SET cluster_id=? WHERE id=?", (cluster_id, trace_id),
+            )
+            self._conn.execute(
+                "UPDATE trace_clusters SET updated_ts=? WHERE cluster_id=?",
+                (time.time(), cluster_id),
+            )
+
+    def trace_cluster(self, trace_id: int) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cluster_id FROM traces WHERE id=?", (trace_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def cluster_members(self, cluster_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, outcome, attempted, failure, files FROM traces "
+                "WHERE cluster_id=? ORDER BY id", (cluster_id,),
+            ).fetchall()
+        return [{"id": r[0], "outcome": r[1], "attempted": r[2],
+                 "failure": r[3], "files": json.loads(r[4] or "[]")} for r in rows]
+
+    def get_trace(self, trace_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, category, outcome, attempted, failure, cluster_id "
+                "FROM traces WHERE id=?", (trace_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "category": row[1], "outcome": row[2],
+                "attempted": row[3], "failure": row[4], "cluster_id": row[5]}
+
+    def save_skill(self, cluster_id: int, text: str) -> None:
+        """Insert a new active skill for a cluster, superseding the previous one."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE skills SET status='superseded' WHERE cluster_id=? AND status='active'",
+                (cluster_id,),
+            )
+            self._conn.execute(
+                "INSERT INTO skills (cluster_id, text, status, ts) VALUES (?,?,'active',?)",
+                (cluster_id, text, time.time()),
+            )
+
+    def list_skills(self, category: str | None = None, limit: int = 40) -> list[dict]:
+        sql = (
+            "SELECT s.skill_id, s.cluster_id, s.text, s.uses, c.category, c.description "
+            "FROM skills s JOIN trace_clusters c ON s.cluster_id=c.cluster_id "
+            "WHERE s.status='active'"
+        )
+        args: list = []
+        if category:
+            sql += " AND c.category=?"
+            args.append(category)
+        sql += " ORDER BY s.skill_id DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [{"skill_id": r[0], "cluster_id": r[1], "text": r[2], "uses": r[3],
+                 "category": r[4], "description": r[5]} for r in rows]
+
+    def bump_skill_use(self, skill_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE skills SET uses=uses+1 WHERE skill_id=?", (skill_id,))
+
+    def memory_stats(self) -> dict:
+        """Counts for `agentics memory-stats` — how big/structured memory is."""
+        with self._lock:
+            def count(sql: str) -> int:
+                return int(self._conn.execute(sql).fetchone()[0])
+            top = self._conn.execute(
+                "SELECT s.text, s.uses, c.category FROM skills s "
+                "JOIN trace_clusters c ON s.cluster_id=c.cluster_id "
+                "WHERE s.status='active' ORDER BY s.uses DESC, s.skill_id DESC LIMIT 5"
+            ).fetchall()
+        return {
+            "traces": count("SELECT COUNT(*) FROM traces"),
+            "clustered": count("SELECT COUNT(*) FROM traces WHERE cluster_id IS NOT NULL"),
+            "clusters": count("SELECT COUNT(*) FROM trace_clusters"),
+            "active_skills": count("SELECT COUNT(*) FROM skills WHERE status='active'"),
+            "superseded_skills": count("SELECT COUNT(*) FROM skills WHERE status='superseded'"),
+            "top_skills": [{"category": r[2], "uses": r[1], "text": r[0][:120]} for r in top],
+        }
 
     # ------------------------------------------------------------ merge queue (P4)
     def mq_enqueue(self, pr_number: int, author: str) -> bool:

@@ -19,6 +19,7 @@ from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS, build_evolution_issue, tool_context, trace_context,
     evolution_path_allowed, valid_tool_name,
 )
+from agentics.memory import lifemem
 from agentics.github_ops import branch_ops, issue_ops, pr_ops
 from agentics.memory.vector_store import VectorStore
 from agentics.research import citations as cite_fmt
@@ -223,6 +224,9 @@ def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state.get("issue_title", ""), state.get("issue_body", ""))
     state["category"] = category
     traces_txt = trace_context(ctx.memory, ctx.agent_id, state.get("issue_number"), category)
+    skills_txt = lifemem.skill_context(
+        ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}",
+        category=category)
     tools_txt = tool_context(
         ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}")
     evolution_rule = (
@@ -236,6 +240,8 @@ def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"{state.get('papers', [{}])[0].get('answer', '')[:2500]}\n\n"
         f"Traces from other agents (learn from them, do not repeat their failures):\n"
         f"{traces_txt}\n\n"
+        f"Distilled skills from past workflows that led to merges (LifeMem tier — "
+        f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
         f"{tools_txt}\n{evolution_rule}\n"
         "Propose a concrete implementation plan for this repo. Reply ONLY with "
@@ -507,7 +513,7 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
     ctx.meta["personal"].add_lesson(lesson, state.get("issue_number"))
     ctx.memory.add_decision(ctx.agent_id, f"cycle {ctx.cycle} done", lesson[:200])
     if state.get("issue_number") and ctx.role in (Role.CODER, Role.WRITER):
-        ctx.memory.add_trace(
+        trace_id = ctx.memory.add_trace(
             ctx.agent_id, ctx.role.value, ctx.cycle, _trace_outcome(state),
             issue=state["issue_number"],
             category=state.get("category") or categorize_issue(
@@ -517,6 +523,12 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
             failure=state.get("error") or state.get("yield_reason") or "",
             files=state.get("changed_files", []),
         )
+        try:      # LifeMem: file this trajectory into its workflow cluster now,
+            lifemem.assign_trace(   # distillation happens later, on merge
+                ctx.memory, trace_id, state.get("category", "other"),
+                _plan_digest(state))
+        except Exception as exc:  # noqa: BLE001 — memory hiccups must not kill a cycle
+            log.warning("could not cluster trace #%s: %s", trace_id, exc)
     ctx.heartbeat("cycle-end")
     state["done"] = True
     return state
