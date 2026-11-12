@@ -529,7 +529,16 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
     if state.get("error"):
         lesson_bits.append(f"error: {state['error']}")
     lesson = "; ".join(lesson_bits) or "cycle completed"
-    ctx.meta["personal"].add_lesson(lesson, state.get("issue_number"))
+    # Any claimed issue that did not reach PR creation must be unlocked, including
+    # early exits (no LLM, duplicate research, invalid plan, failed tests).
+    issue_number = state.get("issue_number")
+    if issue_number and not state.get("pr_number"):
+        try:
+            ctx.claims.release(issue_number, ctx.agent_id, "cycle ended without a PR")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not release claim #%s for %s: %s",
+                        issue_number, ctx.agent_id, exc)
+    ctx.meta["personal"].add_lesson(lesson, issue_number)
     ctx.memory.add_decision(ctx.agent_id, f"cycle {ctx.cycle} done", lesson[:200])
     if state.get("issue_number") and ctx.role in (Role.CODER, Role.WRITER):
         trace_id = ctx.memory.add_trace(
