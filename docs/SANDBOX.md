@@ -44,7 +44,8 @@ The defaults are enabled and conservative:
 | `SANDBOX_TMPFS_MB` | `128` | Temporary filesystem size |
 
 The container has no network, a read-only root filesystem, dropped capabilities,
-no-new-privileges, private IPC, a PID limit, and bounded CPU/memory. Only the
+no-new-privileges, private IPC, a PID limit, bounded CPU/memory and swap, file-size
+limits, bounded captured output, and an execution timeout. Only the
 agent's own repository workspace is bind-mounted read-write. No GitHub token,
 Perplexity cookie, LLM key, host home directory, or Docker socket is mounted or
 passed into the container.
