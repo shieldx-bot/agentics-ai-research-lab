@@ -6,6 +6,7 @@ the container receives no host environment, credentials, Docker socket, or netwo
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -40,8 +41,8 @@ class DockerSandboxRunner:
         if not docker:
             raise SandboxError("Docker CLI not found; refusing host execution")
         image = self.settings.sandbox_image.strip()
-        if not image or any(ch.isspace() for ch in image):
-            raise SandboxError("SANDBOX_IMAGE must be a non-empty image reference")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}", image):
+            raise SandboxError("SANDBOX_IMAGE must be a valid image reference, not a Docker option")
         env = self._docker_environment()
         try:
             info = subprocess.run(
@@ -70,6 +71,9 @@ class DockerSandboxRunner:
     def build_command(
         self, docker: str, workspace: Path, command: Sequence[str], cidfile: Path,
     ) -> list[str]:
+        image = self.settings.sandbox_image.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}", image):
+            raise SandboxError("SANDBOX_IMAGE must be a valid image reference, not a Docker option")
         root = workspace.resolve()
         if "," in str(root):
             raise SandboxError("workspace path cannot contain commas for Docker bind mount")
