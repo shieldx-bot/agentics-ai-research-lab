@@ -4,7 +4,7 @@
 # --- Swarm ---------------------------------------------------------------
 max_agents: 10
 cycle_pause_seconds: 60
-auto_merge: true
+auto_merge: false
 claim_ttl_minutes: 45
 evolution_every_n_cycles: 10   # 0 = never open self-evolution issues
 
