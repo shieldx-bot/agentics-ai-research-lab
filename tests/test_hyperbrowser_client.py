@@ -100,3 +100,27 @@ def test_ask_signature_matches_host_contract(tmp_path):
     sig = inspect.signature(HyperbrowserClient.ask)
     for name in ("mode", "system", "purpose", "frontend_uuid"):
         assert name in sig.parameters
+
+
+# ------------------------------------------------------------ shutdown
+def test_close_all_tears_down_cached_clients(tmp_path):
+    """Orchestrator shutdown must stop cloud sessions (no leaked sessions)."""
+    s = _settings(tmp_path, browser_backend="hyperbrowser", hyperbrowser_api_key="hb_x")
+    host = BrowserSessionHost.from_settings(s)
+    closed = []
+
+    class FakeClient:
+        async def close(self):
+            closed.append(True)
+
+    host._clients[("perplexity", "account-01")] = FakeClient()
+    asyncio_run(host.close_all())
+    assert closed == [True] and not host._clients
+
+
+def test_close_all_tolerates_clients_without_close(tmp_path):
+    s = _settings(tmp_path)
+    host = BrowserSessionHost.from_settings(s)
+    host._clients[("perplexity", "account-01")] = object()  # no close()
+    asyncio_run(host.close_all())                            # must not raise
+    assert not host._clients

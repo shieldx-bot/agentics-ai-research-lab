@@ -170,6 +170,7 @@ class Orchestrator:
         try:
             await asyncio.gather(*tasks)
         finally:
+            await self.host.close_all()   # stop cloud sessions / sockets
             self.memory.close()
 
     def status(self) -> str:

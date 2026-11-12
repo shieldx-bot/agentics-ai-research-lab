@@ -195,6 +195,21 @@ class BrowserSessionHost:
         provider, acc = self._last
         self._pool(provider).mark_failed(acc, error, cooldown_s)
 
+    async def close_all(self) -> None:
+        """Tear down every cached client (stops cloud sessions / sockets).
+
+        Called on orchestrator shutdown — without this, hyperbrowser sessions
+        would linger until their own timeout."""
+        for key, client in list(self._clients.items()):
+            closer = getattr(client, "close", None)
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("client teardown for %s failed: %s", key, exc)
+        self._clients.clear()
+
     def __len__(self) -> int:
         """How many agent identities can be pinned (largest enabled pool)."""
         if not self.qwen_enabled:
