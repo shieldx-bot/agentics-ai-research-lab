@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agentics.config import Settings
 from agentics.llm.perplexity_client import CookieAccount, PerplexityClient
+from agentics.llm.qwen_client import QwenAccount, QwenClient, load_qwen_account
 
 log = logging.getLogger("llm.pool")
 
@@ -58,18 +59,21 @@ class AccountPool:
         self._load_accounts()
 
     def _load_accounts(self) -> None:
-        files = sorted(self.settings.accounts_dir.glob("account-*.json"))
+        provider = (self.settings.llm_provider or "perplexity").lower()
+        pattern = "qwen-*.json" if provider == "qwen" else "account-*.json"
+        files = sorted(self.settings.accounts_dir.glob(pattern))
+        loader = load_qwen_account if provider == "qwen" else load_account_file
         for f in files:
             try:
-                acc = load_account_file(f)
-                if acc.cookies:
+                acc = loader(f)
+                if getattr(acc, "cookies", None):
                     self.accounts.append(acc)
                     self.health[acc.name] = AccountHealth()
                 else:
-                    log.warning("account file %s has no perplexity cookies", f.name)
+                    log.warning("account file %s has no %s cookies", f.name, provider)
             except Exception as exc:  # noqa: BLE001
                 log.error("cannot parse account file %s: %s", f.name, exc)
-        log.info("loaded %d cookie accounts", len(self.accounts))
+        log.info("loaded %d %s cookie accounts", len(self.accounts), provider)
 
     def __len__(self) -> int:
         return len(self.accounts)
@@ -100,7 +104,9 @@ class AccountPool:
         h.cooldown_until = time.time() + cooldown_s
         log.warning("account %s on cooldown %ds: %s", account.name, cooldown_s, h.last_error)
 
-    def client_for(self, account: CookieAccount) -> PerplexityClient:
+    def client_for(self, account: CookieAccount | QwenAccount):
+        if isinstance(account, QwenAccount):
+            return QwenClient(account, timeout=self.settings.pplx_timeout)
         return PerplexityClient(
             account,
             ws_url=self.settings.pplx_ws_url,

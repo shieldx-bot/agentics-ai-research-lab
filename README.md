@@ -58,6 +58,7 @@ nghiên cứu chỉ bằng một file cấu hình.
 │        └───────────────────────────────────────────────────────────────────────┘    │
 │                                                                                       │
 │   LLM Pool: Perplexity (cookie xoay vòng, mode "academic" cho search paper)           │
+│   hoặc Qwen chat.qwen.ai (LLM_PROVIDER=qwen, ví dụ qwen4.0-max-preview)              │
 │   GitHub Ops: PyGithub — issues · branches · PRs · auto-merge                         │
 │   Stop Controller: file STOP + SIGINT → graceful shutdown giữa chu kỳ                 │
 └───────────────────────────────────────────────────────────────────────────────────────┘
