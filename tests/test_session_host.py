@@ -29,6 +29,12 @@ def _settings(tmp_path: Path) -> Settings:
     }))
     s = Settings()
     s.accounts_dir = acc
+    return s                                  # default: perplexity-only mode
+
+
+def _hybrid_settings(tmp_path: Path) -> Settings:
+    s = _settings(tmp_path)
+    s.llm_provider = "qwen"                   # hybrid: research->pplx, code->qwen
     return s
 
 
@@ -37,23 +43,58 @@ def _resp(text: str = "ok") -> LLMResponse:
 
 
 # ------------------------------------------------------------- routing table
-def test_provider_for_purposes():
+def test_purpose_table_hybrid():
     assert PURPOSE_PROVIDER["research"] == "perplexity"
     for p in ("plan", "implement", "review", "distill", "general"):
         assert PURPOSE_PROVIDER[p] == "qwen"
-    assert BrowserSessionHost.provider_for(object(), "unknown-thing") == "qwen"
 
 
-def test_len_is_largest_pool(tmp_path):
+def test_perplexity_only_mode_routes_everything_to_pplx(tmp_path):
     host = BrowserSessionHost.from_settings(_settings(tmp_path))
-    assert len(host) == 2                      # 2 pplx vs 1 qwen
-    assert len(host.pools["perplexity"]) == 2
-    assert len(host.pools["qwen"]) == 1
+    assert host.qwen_enabled is False
+    for purpose in ("research", "plan", "implement", "review", "distill", "general"):
+        assert host.provider_for(purpose) == "perplexity"
+    prov, client = host._lease("implement")
+    assert prov == "perplexity" and isinstance(client, PerplexityClient)
+    prov, client = host._lease("plan")
+    assert prov == "perplexity" and isinstance(client, PerplexityClient)
+
+
+def test_perplexity_only_never_falls_back_to_qwen(tmp_path):
+    """Only qwen accounts exist + perplexity-only mode -> no Qwen, hard error."""
+    s = _settings(tmp_path)
+    for f in s.accounts_dir.glob("account-*.json"):
+        f.unlink()
+    host = BrowserSessionHost.from_settings(s)
+    assert host._lease("research") == (None, None)
+    with pytest.raises(RuntimeError, match="perplexity-only"):
+        asyncio.run(host.ask("x", purpose="research"))
+
+
+def test_hybrid_mode_routes_by_purpose(tmp_path):
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
+    assert host.qwen_enabled is True
+    assert host.provider_for("research") == "perplexity"
+    for p in ("plan", "implement", "review"):
+        assert host.provider_for(p) == "qwen"
+    prov, client = host._lease("research")
+    assert prov == "perplexity" and isinstance(client, PerplexityClient)
+    prov, client = host._lease("implement")
+    assert prov == "qwen" and isinstance(client, QwenClient)
+
+
+def test_len_respects_mode(tmp_path):
+    assert len(BrowserSessionHost.from_settings(_settings(tmp_path))) == 2      # pplx-only: 2
+    assert len(BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))) == 2  # max(2,1)
+    s = _hybrid_settings(tmp_path)
+    for f in s.accounts_dir.glob("account-*.json"):
+        f.unlink()
+    assert len(BrowserSessionHost.from_settings(s)) == 1                        # hybrid: qwen only
 
 
 # ------------------------------------------------------------- leasing
 def test_lease_routes_by_purpose(tmp_path):
-    host = BrowserSessionHost.from_settings(_settings(tmp_path))
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
     prov, client = host._lease("research")
     assert prov == "perplexity" and isinstance(client, PerplexityClient)
     prov, client = host._lease("implement")
@@ -63,7 +104,7 @@ def test_lease_routes_by_purpose(tmp_path):
 
 
 def test_view_pins_identity(tmp_path):
-    host = BrowserSessionHost.from_settings(_settings(tmp_path))
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
     _prov, c0 = host.view(prefer_index=0)._lease("research")
     _prov, c1 = host.view(prefer_index=1)._lease("research")
     assert c0.account.name == "account-01"
@@ -71,8 +112,8 @@ def test_view_pins_identity(tmp_path):
 
 
 def test_fallback_qwen_to_perplexity(tmp_path):
-    """No qwen accounts at all -> code purposes degrade to Perplexity."""
-    s = _settings(tmp_path)
+    """No qwen accounts at all -> code purposes degrade to Perplexity (hybrid)."""
+    s = _hybrid_settings(tmp_path)
     for f in s.accounts_dir.glob("qwen-*.json"):
         f.unlink()
     host = BrowserSessionHost.from_settings(s)
@@ -81,8 +122,8 @@ def test_fallback_qwen_to_perplexity(tmp_path):
 
 
 def test_fallback_perplexity_to_qwen(tmp_path):
-    """No pplx accounts -> research degrades to Qwen (citations may be lost)."""
-    s = _settings(tmp_path)
+    """No pplx accounts -> research degrades to Qwen (hybrid only)."""
+    s = _hybrid_settings(tmp_path)
     for f in s.accounts_dir.glob("account-*.json"):
         f.unlink()
     host = BrowserSessionHost.from_settings(s)
@@ -91,7 +132,7 @@ def test_fallback_perplexity_to_qwen(tmp_path):
 
 
 def test_lease_none_when_both_pools_empty(tmp_path):
-    s = _settings(tmp_path)
+    s = _hybrid_settings(tmp_path)
     for f in s.accounts_dir.glob("*.json"):
         f.unlink()
     host = BrowserSessionHost.from_settings(s)
@@ -102,7 +143,7 @@ def test_lease_none_when_both_pools_empty(tmp_path):
 
 # ------------------------------------------------------------- ask dispatch
 def test_ask_dispatch_and_purpose_passthrough(tmp_path, monkeypatch):
-    s = _settings(tmp_path)
+    s = _hybrid_settings(tmp_path)
     host = BrowserSessionHost.from_settings(s)
     seen: list[tuple[str, str]] = []              # (provider, purpose)
 
@@ -127,7 +168,7 @@ def test_ask_dispatch_and_purpose_passthrough(tmp_path, monkeypatch):
 
 
 def test_ask_marks_failure_on_cooldown(tmp_path, monkeypatch):
-    host = BrowserSessionHost.from_settings(_settings(tmp_path))
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
 
     async def boom(self, query, **kwargs):
         raise RuntimeError("qwen chat HTTP 401: bad cookie")
@@ -174,16 +215,24 @@ def test_mark_failed_noop_without_call(tmp_path):
     host.mark_failed("nothing served yet")          # must not raise
 
 
-def test_status_lines_cover_both_pools(tmp_path):
+def test_status_lines_perplexity_only_marks_qwen_disabled(tmp_path):
     host = BrowserSessionHost.from_settings(_settings(tmp_path))
     lines = "\n".join(host.status_lines())
     assert "perplexity (research, citations)" in lines
+    assert "qwen: DISABLED" in lines
+    assert "account-01" in lines
+
+
+def test_status_lines_hybrid_covers_both_pools(tmp_path):
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
+    lines = "\n".join(host.status_lines())
+    assert "perplexity (research, citations)" in lines
     assert "qwen (plan/implement/review" in lines
-    assert "account-01" in lines and "qwen-01" in lines
+    assert "qwen-01" in lines
 
 
 def test_client_cache_reuses_instances(tmp_path):
-    host = BrowserSessionHost.from_settings(_settings(tmp_path))
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
     view = host.view(prefer_index=0)
     _p, c1 = view._lease("research")
     _p, c2 = view._lease("research")

@@ -54,6 +54,15 @@ PROVIDERS = ("perplexity", "qwen")
 class BrowserSessionHost:
     """Routes LLM calls by purpose across Perplexity and Qwen session pools.
 
+    Modes (``LLM_PROVIDER``):
+
+    * ``perplexity`` (default) — Perplexity-only: every purpose goes to the
+      Perplexity cookie pool and Qwen is never called (its pool is still
+      loaded for CLI diagnostics but marked disabled in status).
+    * ``qwen`` — hybrid: research -> Perplexity (citations),
+      plan/implement/review/distill -> Qwen ``qwen4.0-max-preview``, with
+      cross-provider fallback when a pool is empty or cooling down.
+
     Use :meth:`from_settings` for standalone tooling (CLI), or build once with
     explicit pools and hand out :meth:`view` per agent thread (orchestrator).
     """
@@ -66,6 +75,7 @@ class BrowserSessionHost:
         prefer_index: int | None = None,
     ) -> None:
         self.settings = settings
+        self.qwen_enabled = (settings.llm_provider or "perplexity").lower() == "qwen"
         if pplx_pool is None or qwen_pool is None:
             both = _build_pools(settings)
             pplx_pool = pplx_pool or both[0]
@@ -95,7 +105,15 @@ class BrowserSessionHost:
 
     # ------------------------------------------------------------ routing
     def provider_for(self, purpose: str) -> str:
+        if not self.qwen_enabled:
+            return "perplexity"             # perplexity-only mode: no Qwen routing
         return PURPOSE_PROVIDER.get(purpose, PURPOSE_PROVIDER["general"])
+
+    def _fallback_order(self, primary: str) -> list[str]:
+        """Other provider as fallback — only in hybrid mode."""
+        if not self.qwen_enabled:
+            return []
+        return [p for p in PROVIDERS if p != primary]
 
     def _pool(self, provider: str) -> AccountPool:
         return self.pools[provider]
@@ -107,9 +125,10 @@ class BrowserSessionHost:
         return self._clients[key]
 
     def _lease(self, purpose: str) -> tuple[str, Any] | tuple[None, None]:
-        """Lease a client for a purpose; falls back to the other provider."""
+        """Lease a client for a purpose; falls back to the other provider
+        (hybrid mode only)."""
         primary = self.provider_for(purpose)
-        order = [primary] + [p for p in PROVIDERS if p != primary]
+        order = [primary] + self._fallback_order(primary)
         for provider in order:
             pool = self._pool(provider)
             if not len(pool):
@@ -132,8 +151,9 @@ class BrowserSessionHost:
         provider, client = self._lease(purpose)
         if client is None:
             raise RuntimeError(
-                "no usable browser-session account in either pool "
-                "(accounts/ has no healthy perplexity or qwen sessions)")
+                f"no usable browser-session account for purpose '{purpose}' "
+                f"(mode: {'hybrid' if self.qwen_enabled else 'perplexity-only'}; "
+                "check accounts/ and account cooldowns)")
         if provider != self.provider_for(purpose):
             log.warning("purpose '%s' falling back to %s (primary pool exhausted)",
                         purpose, provider)
@@ -168,14 +188,20 @@ class BrowserSessionHost:
         self._pool(provider).mark_failed(acc, error, cooldown_s)
 
     def __len__(self) -> int:
-        """How many agent identities can be pinned (largest pool wins)."""
+        """How many agent identities can be pinned (largest enabled pool)."""
+        if not self.qwen_enabled:
+            return len(self.pools["perplexity"])
         return max(len(self.pools["perplexity"]), len(self.pools["qwen"]))
 
     def status_lines(self) -> list[str]:
         lines = ["-- perplexity (research, citations) --"]
         lines.extend(self._pool("perplexity").status_lines() or ["(no accounts)"])
-        lines.append("-- qwen (plan/implement/review, qwen4.0-max-preview) --")
-        lines.extend(self._pool("qwen").status_lines() or ["(no accounts)"])
+        if not self.qwen_enabled:
+            lines.append("-- qwen: DISABLED (LLM_PROVIDER=perplexity; set LLM_PROVIDER=qwen "
+                         "to enable hybrid routing) --")
+        else:
+            lines.append("-- qwen (plan/implement/review, qwen4.0-max-preview) --")
+            lines.extend(self._pool("qwen").status_lines() or ["(no accounts)"])
         return lines
 
 

@@ -57,10 +57,10 @@ nghiên cứu chỉ bằng một file cấu hình.
 │        │        messages · findings · decisions · claims · heartbeats           │    │
 │        └───────────────────────────────────────────────────────────────────────┘    │
 │                                                                                       │
-│   LLM: BrowserSessionHost (định tuyến theo node, dùng song song 2 pool cookie)         │
-│   · research  -> Perplexity mode "academic" (bắt buộc citation giấy trắng mực đen)     │
-│   · plan/implement/review -> Qwen chat.qwen.ai (qwen4.0-max-preview, code mạnh nhất)  │
-│   · pool hết tài khoản/đang cooldown -> tự fallback sang provider còn lại             │
+│   LLM: BrowserSessionHost — MẶC ĐỊNH chỉ dùng Perplexity (LLM_PROVIDER=perplexity)     │
+│   · mọi node (research/plan/implement/review) đều qua pool cookie Perplexity           │
+│   · research dùng mode "academic" -> citation giấy trắng mực đen cho BibTeX            │
+│   · Qwen chat.qwen.ai bị tắt hoàn toàn; bật lại hybrid: LLM_PROVIDER=qwen              │
 │   GitHub Ops: PyGithub — issues · branches · PRs · auto-merge                         │
 │   Stop Controller: file STOP + SIGINT → graceful shutdown giữa chu kỳ                 │
 └───────────────────────────────────────────────────────────────────────────────────────┘

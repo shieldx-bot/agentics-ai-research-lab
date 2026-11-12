@@ -44,10 +44,21 @@ python -m agentics.cli test-llm          # uses the first qwen-* account
 python -m agentics.cli run
 ```
 
-## Recommendation (hybrid) — IMPLEMENTED: `BrowserSessionHost`
+## Modes — `LLM_PROVIDER` decides (default: perplexity-only)
 
-`agentics/llm/session_host.py` owns BOTH cookie pools side-by-side and routes
-per node (no more whole-lab `LLM_PROVIDER` switch for the run loop):
+`agentics/llm/session_host.py` owns the cookie pools and routes per call.
+
+### `LLM_PROVIDER=perplexity` (default) — Perplexity-only
+
+* Every purpose (`research`, `plan`, `implement`, `review`, `distill`,
+  `general`) goes to the Perplexity cookie pool (`mode="academic"` for
+  research, `"concise"` for code tasks).
+* Qwen is **never called**: no routing to it, no cross-provider fallback.
+  Its pool is still loaded for CLI diagnostics and shown as `DISABLED`
+  in `agentics status`.
+* Number of agent threads = number of Perplexity accounts.
+
+### `LLM_PROVIDER=qwen` — hybrid (both pools)
 
 | Purpose (graph node) | Primary provider | Why |
 | --- | --- | --- |
@@ -57,35 +68,16 @@ per node (no more whole-lab `LLM_PROVIDER` switch for the run loop):
 | `review` | **Qwen4-Max-Preview** | verdict quality needs judgement, not search |
 | `distill` / `general` | Qwen4-Max-Preview | LifeMem skill distillation, fallbacks |
 
-Details:
-
+* Cross-provider fallback: primary pool empty / all cooling down -> the other
+  provider serves the call (logged as a warning).
 * One agent thread = one pinned identity: `host.view(prefer_index=i)` pins
-  agent `i` to account `i` of each pool; when its own account cools down the
-  view leases any healthy sibling (same contract as the old `AccountPool`).
-* **Graceful degradation**: if the primary pool for a purpose is empty or all
-  its accounts are cooling down, the call falls back to the other provider
-  (logged as a warning — citations may be missing on the Qwen path).
+  agent `i` to account `i` of each pool; a cooled-down account is skipped and
+  a healthy sibling is leased instead.
 * Failure handling: `ask()` marks the serving account failed on any exception;
   the orchestrator's auth-error path calls `mark_failed()` on the agent's view.
   The host re-leases automatically at the next call.
-* `LLM_PROVIDER` still works for standalone tooling (CLI `test-llm`,
-  `AccountPool` direct use) but is no longer needed to run the lab.
 
-### Setup (hybrid, both pools)
-
-```bash
-# Perplexity cookies (research pool)
-cp accounts/account-01.json.example accounts/account-01.json   # repeat per cookie
-# Qwen session (code pool): cookies + refresh_token + access_token from a
-# live logged-in chat.qwen.ai session
-cp accounts/qwen-account.example.json accounts/qwen-01.json
-
-python -m agentics.cli test-llm --provider qwen     # smoke-test one pool
-python -m agentics.cli status                        # shows both pools
-python -m agentics.cli run                           # hybrid routing on
-```
-
-## Live verification notes (2026-11-12, datacenter sandbox)
+### Live verification notes (2026-11-12, datacenter sandbox)
 
 * In-page `fetch()` from a real Chrome session carrying injected cookies gets
   **HTTP 200 past the baxia WAF** (raw aiohttp from the same IP gets the WAF
@@ -99,7 +91,19 @@ python -m agentics.cli run                           # hybrid routing on
   (`{"code":"not found"}` on refresh) — exports go stale within hours if the
   browser session rotates tokens.
 
-**Operational conclusion:** run the Qwen pool from a residential machine with
-cookies exported *right after* solving the slider in a live browser (must
-include `tfstk`), or accept that research-only (Perplexity) works unattended
-while Qwen needs periodic manual re-verification.
+**Operational conclusion (why the default is perplexity-only):** Qwen needs a
+residential machine with cookies exported *right after* solving the slider in
+a live browser (must include `tfstk`); Perplexity works unattended. Switch to
+`LLM_PROVIDER=qwen` only when you can maintain a fresh Qwen session.
+
+### Setup
+
+```bash
+# Perplexity cookies (the only pool used in the default mode)
+cp accounts/account-01.json.example accounts/account-01.json   # repeat per cookie
+
+python -m agentics.cli test-llm                    # smoke-test perplexity
+python -m agentics.cli test-llm --provider qwen    # diagnostics only
+python -m agentics.cli status                      # shows pools + mode
+python -m agentics.cli run
+```

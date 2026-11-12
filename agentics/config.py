@@ -45,8 +45,11 @@ class Settings:
     claim_ttl_minutes: int = field(
         default_factory=lambda: _env_int("CLAIM_TTL_MINUTES", 45)
     )
-    # LLM backend: "perplexity" (cookie socket.io, web-search + citations) or
-    # "qwen" (chat.qwen.ai native web API — see docs/LLM_PROVIDERS.md).
+    # LLM backend mode (see docs/LLM_PROVIDERS.md):
+    # "perplexity" (default) = Perplexity-only: EVERY node uses the Perplexity
+    #   cookie pool (citations everywhere); Qwen is never called.
+    # "qwen" = hybrid: research -> Perplexity (citations); plan/implement/review
+    #   -> Qwen qwen4.0-max-preview, with cross-provider fallback.
     llm_provider: str = field(default_factory=lambda: _env("LLM_PROVIDER", "perplexity"))
     qwen_model: str = field(default_factory=lambda: _env("QWEN_MODEL", "qwen4.0-max-preview"))
     # Self-evolution: Supervisor opens an evidence-based "self-evolution" issue every
