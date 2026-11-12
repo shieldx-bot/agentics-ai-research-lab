@@ -94,7 +94,7 @@ cùng một repo mà không giẫm chân nhau.
   claim — rollback thất bại sẽ để lại label mồ côi khoá issue vĩnh viễn (đã gặp ở issue #19).
   Nhánh release/sweep của agent sở hữu sẽ dọn label sau.
 
-## P13 — Kiểm tra hai tầng
+## P15 — Kiểm tra hai tầng
 - Tầng 1 (tác giả, trước push): `py_compile` + `pytest -x`. Tầng 2 (Integrator, trước merge):
   test đầy đủ trên `main + PR`; fail → không merge, ghi failure trace + comment vào PR.
 
