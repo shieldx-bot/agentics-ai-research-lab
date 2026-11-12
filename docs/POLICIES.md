@@ -142,6 +142,22 @@ lại mỗi chu kỳ thứ 5; bất kỳ drift nào trở thành `integrity_aler
 Owner kiểm tra bất kỳ lúc nào bằng `python -m agentics.cli verify` (chấp nhận
 thay đổi đã review: `--refresh`).
 
+**Tầng git — pre-receive hook** *(bổ trợ, không thay thế các tầng trên)*
+(`data/lab.git/hooks/pre-receive`, sinh tự động bởi `LocalRepo.ensure()`):
+mọi push đi qua hook này, kể cả push nằm ngoài graph (quy trình lỗi, thao tác
+tay). Commit có committer email `agentics+*` bị từ chối nếu chạm vào các đường
+**không bao giờ được miễn**:
+
+```
+accounts/   configs/secrets.yaml   data/   logs/   STOP   .env
+```
+
+Danh sách cố ý hẹp hơn protected paths của guard trong-process: exemption theo
+task của owner (`allow-protected`) chỉ có tác dụng ở các tầng trong process,
+nên hook chỉ khóa cứng phần chính sách tuyên bố "không bao giờ miễn", cộng
+thêm runtime state của lab. Owner (mọi identity khác) không bị hạn chế. Hook
+cũng từ chối xóa `main` với identity agent.
+
 ---
 
 ## P10 bổ sung — whitelist ring "cấm tuyệt đối" + lớp 4b tự phục hồi workspace
@@ -197,3 +213,6 @@ intent chỉ là trưng bày.
 toàn bộ chu kỳ, journal `scope_violation` (kèm cả danh sách khai báo lẫn
 file vượt phạm vi) — owner thấy ngay sự lệch giữa **lời khai** và **việc làm**.
 Plan rỗng file (task thu hồi tài liệu vào memory) không bị kiểm tra này.
+
+Đầy đủ kiến trúc Local Mode và đáp án 2 giả thuyết nghiên cứu:
+[LOCAL_MODE.md](LOCAL_MODE.md).

@@ -39,6 +39,7 @@ def branch_name(agent_id: str, task_id: int, title: str) -> str:
     return f"agent/{agent_id}/task-{task_id}-{slug}"
 
 
+
 # Angles the Supervisor rotates through when the backlog runs dry, so the
 # infinite research loop always has somewhere to go.
 SURVEY_ANGLES: tuple[str, ...] = (

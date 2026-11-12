@@ -91,3 +91,7 @@ def test_orchestrator_startup_writes_the_integrity_baseline(tmp_path):
     orch = Orchestrator(settings)
     assert (tmp_path / "data" / "integrity" / "baseline.json").exists()
     assert orch.memory is not None
+    # the orchestrator can journal an integrity alert (consolidated API)
+    orch.memory.journal("orchestrator", "alert", {"what": "test"})
+    assert any(e["event"] == "alert"
+               for e in orch.memory.recent_journal(limit=5))
