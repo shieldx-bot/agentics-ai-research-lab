@@ -6,6 +6,7 @@ everyone). An issue may only be worked on when BOTH agree the claim is free.
 from __future__ import annotations
 
 import logging
+import time
 
 from agentics.github_ops import issue_ops
 from agentics.github_ops.client import GitHubClient
@@ -66,7 +67,7 @@ class ClaimPolicy:
 
     def sweep_stale(self, stale_after_s: float = 900.0) -> list[int]:
         """Release expired leases or claims whose owner heartbeat has gone stale."""
-        now = __import__("time").time()
+        now = time.time()
         alive = {a["agent"] for a in self.memory.active_agents(stale_after_s)}
         freed: list[int] = []
         for issue_no, claim in self.memory.all_active_claims().items():
