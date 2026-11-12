@@ -22,6 +22,17 @@ def test_git_credentials_are_not_embedded_in_remote_url_or_config(tmp_path, monk
     assert base64.b64decode(encoded).decode() == f"x-access-token:{token}"
 
 
+def test_existing_clone_remote_is_normalized_before_reuse(tmp_path, monkeypatch):
+    workspace = RepoWorkspace("agent-test", Settings(
+        github_token="old-secret", github_repo="owner/repo", data_dir=tmp_path
+    ))
+    (workspace.path / ".git").mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(workspace, "_git", lambda *args, **kwargs: calls.append(args))
+    workspace.ensure_cloned()
+    assert calls == [("remote", "set-url", "origin", "https://github.com/owner/repo.git")]
+
+
 def test_command_allowlist_accepts_only_project_validation_commands(tmp_path):
     workspace = RepoWorkspace("agent-test", Settings(data_dir=tmp_path))
     assert workspace._command_allowed([sys.executable, "-m", "pytest", "-q", "-x"])
