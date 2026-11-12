@@ -119,15 +119,20 @@ class Settings:
 
 
 def load_yaml_overrides(settings: Settings) -> Settings:
-    """Merge configs/lab.yaml over env-derived settings (yaml wins where present)."""
-    cfg_path = PROJECT_ROOT / "configs" / "lab.yaml"
-    if not cfg_path.exists():
-        return settings
-    with open(cfg_path, "r", encoding="utf-8") as fh:
-        data: dict[str, Any] = yaml.safe_load(fh) or {}
-    for key, value in data.items():
-        if hasattr(settings, key) and value is not None:
-            setattr(settings, key, value)
+    """Merge configs/lab.yaml over env-derived settings (yaml wins where present).
+
+    configs/secrets.yaml (gitignored) is merged last and wins over everything
+    else — it holds per-deployment credentials such as ``hyperbrowser_api_key``.
+    """
+    for name in ("lab.yaml", "secrets.yaml"):
+        cfg_path = PROJECT_ROOT / "configs" / name
+        if not cfg_path.exists():
+            continue
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            data: dict[str, Any] = yaml.safe_load(fh) or {}
+        for key, value in data.items():
+            if hasattr(settings, key) and value is not None:
+                setattr(settings, key, value)
     return settings
 
 

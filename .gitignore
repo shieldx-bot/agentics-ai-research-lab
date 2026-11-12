@@ -30,3 +30,6 @@ STOP
 .idea/
 .vscode/
 .DS_Store
+
+# deployment secrets (loaded by agentics.config after lab.yaml)
+configs/secrets.yaml

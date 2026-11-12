@@ -12,6 +12,11 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
 
 ---
 
+
+## Cloud browser backend (datacenter deployments)
+
+Perplexity 403-blocks raw cookie WebSocket access from datacenter IPs. Set `browser_backend: hyperbrowser` in `configs/lab.yaml` and put your key in `configs/secrets.yaml` (`hyperbrowser_api_key: "hb_..."`) — every node then runs through a stealth cloud browser automatically (see docs/LLM_PROVIDERS.md).
+
 ## 1. Triết lý thiết kế
 
 Agentics AI Research Lab được xây dựng theo nguyên lý **"đàn kiến nghiên cứu" (research swarm)**:

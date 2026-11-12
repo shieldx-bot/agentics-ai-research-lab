@@ -124,3 +124,32 @@ def test_close_all_tolerates_clients_without_close(tmp_path):
     host._clients[("perplexity", "account-01")] = object()  # no close()
     asyncio_run(host.close_all())                            # must not raise
     assert not host._clients
+
+
+# ------------------------------------------------------------ config flow
+def test_lab_yaml_and_secrets_yaml_merge(tmp_path, monkeypatch):
+    """The committed lab.yaml sets browser_backend; the gitignored
+    secrets.yaml supplies the API key — no env vars needed."""
+    import agentics.config as cfg
+
+    cfgs = tmp_path / "configs"
+    cfgs.mkdir()
+    (cfgs / "lab.yaml").write_text(
+        "browser_backend: hyperbrowser\nhyperbrowser_proxy_country: SG\n")
+    (cfgs / "secrets.yaml").write_text('hyperbrowser_api_key: "hb_test"\n')
+    monkeypatch.setattr(cfg, "PROJECT_ROOT", tmp_path)
+    s = cfg.get_settings()
+    assert s.browser_backend == "hyperbrowser"
+    assert s.hyperbrowser_api_key == "hb_test"
+    assert s.hyperbrowser_proxy_country == "SG"
+
+
+def test_lab_yaml_without_secrets_still_loads(tmp_path, monkeypatch):
+    import agentics.config as cfg
+
+    cfgs = tmp_path / "configs"
+    cfgs.mkdir()
+    (cfgs / "lab.yaml").write_text("browser_backend: local\n")
+    monkeypatch.setattr(cfg, "PROJECT_ROOT", tmp_path)
+    s = cfg.get_settings()
+    assert s.browser_backend == "local"

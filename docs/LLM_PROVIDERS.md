@@ -134,12 +134,23 @@ python scripts/hyperbrowser_smoke.py --accounts 1-3 --wait 60
 
 Set in the environment (or `configs/lab.yaml`):
 
-```bash
-BROWSER_BACKEND=hyperbrowser
-HB_API_KEY=...                  # Hyperbrowser API key
-HB_PROXY_COUNTRY=US             # default; residential proxy exit
-HB_TIMEOUT=900                  # session max lifetime, seconds
+Via `configs/lab.yaml` (committed, no secrets):
+
+```yaml
+browser_backend: hyperbrowser
+hyperbrowser_proxy_country: US
+hyperbrowser_timeout: 900
 ```
+
+and the API key in `configs/secrets.yaml` (gitignored; copy
+`configs/secrets.example.yaml`):
+
+```yaml
+hyperbrowser_api_key: "hb_..."
+```
+
+Equivalent env vars: `BROWSER_BACKEND`, `HB_API_KEY`, `HB_PROXY_COUNTRY`,
+`HB_TIMEOUT`. YAML wins over env; `secrets.yaml` wins over everything.
 
 With this backend the Perplexity pool's clients become
 `agentics.llm.hyperbrowser_client.HyperbrowserClient` — the graph nodes are

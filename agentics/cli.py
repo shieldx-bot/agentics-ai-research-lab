@@ -175,13 +175,21 @@ def test_llm(
     client = host._client_for(prov, acc)
 
     async def _run():
-        resp = await client.ask(query, mode="academic")
-        console.print(f"elapsed: {resp.elapsed_s}s | citations: {len(resp.citations)}")
-        console.print(resp.answer[:1200])
-        if resp.citations:
-            console.print("[dim]citations:[/]")
-            for c in resp.citations[:5]:
-                console.print(f"  - {c}")
+        try:
+            resp = await client.ask(query, mode="academic")
+            console.print(f"elapsed: {resp.elapsed_s}s | citations: {len(resp.citations)}")
+            console.print(resp.answer[:1200])
+            if resp.citations:
+                console.print("[dim]citations:[/]")
+                for c in resp.citations[:5]:
+                    console.print(f"  - {c}")
+        finally:
+            closer = getattr(client, "close", None)   # hyperbrowser clients
+            if closer is not None:
+                try:
+                    await closer()                    # stop the cloud session
+                except Exception:  # noqa: BLE001
+                    pass
 
     asyncio.run(_run())
     pool.mark_ok(acc)

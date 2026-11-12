@@ -35,3 +35,15 @@ ownership:
 
 # --- Perplexity ------------------------------------------------------------
 pplx_timeout: 180
+
+# --- Browser backend --------------------------------------------------------
+# "hyperbrowser" = Perplexity cookie sessions run on a Hyperbrowser cloud
+# browser (stealth + residential proxy) — required on datacenter IPs, where
+# the raw cookie WebSocket is 403-blocked. "local" = raw WebSocket from this
+# machine (residential networks only).
+browser_backend: hyperbrowser
+hyperbrowser_proxy_country: US
+hyperbrowser_timeout: 900
+# The API key lives in configs/secrets.yaml (gitignored) as
+#   hyperbrowser_api_key: hb_...
+# or in the HB_API_KEY environment variable. It is NEVER committed here.
