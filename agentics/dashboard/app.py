@@ -5,14 +5,21 @@ every 2.5 s. Shows, per agent: current node, status, current task, and the
 PUBLISHED INTENT (goal / why / steps / expected files) — plus the task board,
 the MR pipeline, the merge queue, memory health and the activity journal.
 
+Owner control: POST /stop writes the same STOP file as `agentics stop`
+(graceful: agents finish the node, release claims, exit) — disable with
+DASHBOARD_ALLOW_STOP=0 for non-localhost deployments.
+
 Run: python -m agentics.cli dashboard          (default http://127.0.0.1:8080)
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from agentics.config import Settings
 from agentics.memory.shared_memory import SharedMemory
+
+log = logging.getLogger("dashboard")
 
 
 def _state(memory: SharedMemory, settings: Settings) -> dict:
@@ -65,6 +72,11 @@ _HTML = """<!doctype html>
            display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
   header h1 { font-size:17px; margin:0; }
   header .sub { color:var(--dim); font-size:12px; }
+  #stopbtn { margin-left:auto; font-size:12px; padding:4px 12px; cursor:pointer;
+             color:var(--bad); background:var(--panel); border:1px solid var(--edge);
+             border-radius:6px; }
+  #stopbtn:hover { border-color:var(--bad); }
+  #stopbtn:disabled { opacity:.5; cursor:default; }
   main { padding:16px 20px 40px; display:grid; gap:16px;
          grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); }
   .card { background:var(--card); border:1px solid var(--edge); border-radius:10px;
@@ -110,6 +122,7 @@ _HTML = """<!doctype html>
 <header>
   <h1>Agentics Lab — mắt owner</h1>
   <span class="sub" id="meta">đang tải…</span>
+  <button id="stopbtn" title="Dừng mềm: agents hoàn tất node hiện tại, nhả claim và thoát">⏹ Dừng lab</button>
 </header>
 <main>
   <div class="card" style="grid-column:1/-1"><h2>Agents — đang làm gì, vì sao</h2>
@@ -204,6 +217,22 @@ async function tick(){
       '<span class="err">mất kết nối tới dashboard API</span>';
   }
 }
+document.getElementById("stopbtn").addEventListener("click", async () => {
+  const btn = document.getElementById("stopbtn");
+  if (!confirm("Dừng toàn bộ lab? Agents sẽ hoàn tất node hiện tại, nhả claim và thoát.")) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch("/stop", { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    document.getElementById("meta").textContent =
+      r.ok ? (j.note || "đã yêu cầu dừng") : (j.error || `dừng thất bại (${r.status})`);
+  } catch(e) {
+    document.getElementById("meta").innerHTML =
+      '<span class="err">dừng thất bại: ' + esc(String(e)) + '</span>';
+  } finally {
+    btn.disabled = false;
+  }
+});
 tick(); setInterval(tick, 2500);
 </script>
 </body>
@@ -227,5 +256,30 @@ def create_app(memory: SharedMemory, settings: Settings):
             return JSONResponse(_state(memory, settings))
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.post("/stop")
+    def stop():
+        """Owner control: graceful stop — cùng cơ chế STOP file với CLI.
+
+        Writes the same STOP file as `python -m agentics.cli stop`: every agent
+        finishes its current node, releases its claims and exits between
+        cycles — nothing is killed hard. Disable for non-localhost deployments
+        with DASHBOARD_ALLOW_STOP=0."""
+        import os
+
+        if os.environ.get("DASHBOARD_ALLOW_STOP", "1").strip().lower() in {
+                "0", "false", "no", "off"}:
+            return JSONResponse(
+                {"error": "endpoint dừng bị vô hiệu (DASHBOARD_ALLOW_STOP=0)"},
+                status_code=403)
+        from agentics.stop import request_stop
+
+        request_stop()
+        log.info("STOP requested from the dashboard")
+        return JSONResponse({
+            "stopped": True,
+            "note": "Đã ghi file STOP — agents hoàn tất node hiện tại, "
+                    "nhả claim và dừng giữa chu kỳ.",
+        })
 
     return app

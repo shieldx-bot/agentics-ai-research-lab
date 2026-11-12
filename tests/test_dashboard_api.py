@@ -82,3 +82,49 @@ def test_report_keeps_previous_fields_when_not_given(mem):
     assert a["node"] == "plan" and a["cycle"] == 2
     assert a["task_id"] == 5 and a["task_title"] == "T"
     assert a["intent"] == {"goal": "g"}
+
+
+def test_stop_endpoint_writes_stop_file_gracefully(mem, settings, monkeypatch):
+    """POST /stop = same STOP-file mechanism as `agentics stop` (graceful)."""
+    from fastapi.testclient import TestClient
+
+    from agentics import stop as stop_mod
+
+    stop_path = settings.data_dir / "STOP"
+    monkeypatch.setattr(stop_mod, "stop_file_path", lambda: stop_path)
+    stop_mod._STOP_EVENT.clear()
+
+    client = TestClient(create_app(mem, settings))
+    resp = client.post("/stop")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["stopped"] is True
+    assert stop_path.exists()
+    assert stop_mod.should_stop()            # agents exit gracefully between cycles
+    stop_path.unlink()
+    stop_mod._STOP_EVENT.clear()
+
+
+def test_stop_endpoint_can_be_disabled(mem, settings, monkeypatch):
+    """DASHBOARD_ALLOW_STOP=0 -> 403, nothing written (non-localhost deployments)."""
+    from fastapi.testclient import TestClient
+
+    from agentics import stop as stop_mod
+
+    stop_path = settings.data_dir / "STOP"
+    monkeypatch.setattr(stop_mod, "stop_file_path", lambda: stop_path)
+    monkeypatch.setenv("DASHBOARD_ALLOW_STOP", "0")
+    stop_mod._STOP_EVENT.clear()
+
+    client = TestClient(create_app(mem, settings))
+    resp = client.post("/stop")
+    assert resp.status_code == 403
+    assert not stop_path.exists()
+    assert not stop_mod.should_stop()
+
+
+def test_stop_button_present_in_dashboard_html(mem, settings):
+    from fastapi.testclient import TestClient
+
+    html = TestClient(create_app(mem, settings)).get("/").text
+    assert "stopbtn" in html and "/stop" in html      # button + handler wired
