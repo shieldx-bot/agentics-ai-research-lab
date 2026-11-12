@@ -165,6 +165,23 @@ CREATE TABLE IF NOT EXISTS file_locks (
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    task_id INTEGER,
+    hypothesis TEXT NOT NULL DEFAULT '',
+    method TEXT NOT NULL DEFAULT 'run_command',
+    cmd TEXT NOT NULL,
+    exit_code INTEGER NOT NULL,
+    verdict TEXT NOT NULL,                  -- confirmed | refuted | inconclusive
+    output TEXT NOT NULL DEFAULT '',
+    duration_s REAL NOT NULL DEFAULT 0,
+    artifact TEXT NOT NULL DEFAULT '',      -- workspace path of the check script
+    note TEXT NOT NULL DEFAULT '',          -- reviewer re-verdict / context
+    verdict_by TEXT NOT NULL DEFAULT ''     -- who set/confirmed the verdict
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id, id);
 """
 
 
@@ -252,6 +269,104 @@ class SharedMemory:
              "title": r[4], "content": r[5], "citations": json.loads(r[6])}
             for r in reversed(rows)
         ]
+
+    # ------------------------------------------------------------ evidence (P16)
+    def record_evidence(
+        self, agent: str, task_id: int | None, cmd: str, exit_code: int,
+        verdict: str, hypothesis: str = "", method: str = "run_command",
+        output: str = "", duration_s: float = 0.0, artifact: str = "",
+        broadcast: bool = True,
+    ) -> int:
+        """Store one empirical verification result — a REAL run's outcome.
+
+        This is the shared, structured answer to "did anyone actually check
+        this idea, and what happened?" Every record is broadcast to all agents
+        (messages + journal) so verdicts are common knowledge, not private
+        model opinion."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO evidence (ts, agent, task_id, hypothesis, method, "
+                "cmd, exit_code, verdict, output, duration_s, artifact) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), agent, task_id, hypothesis[:300], method,
+                 cmd[:400], int(exit_code), verdict, output[-1500:],
+                 float(duration_s), artifact[:300]),
+            )
+            ev_id = int(cur.lastrowid or 0)
+        if broadcast:
+            self.post_message(
+                agent, "evidence",
+                f"[{verdict.upper()}] task #{task_id}: `{cmd[:120]}` "
+                f"(exit {exit_code}) — {hypothesis[:120]}",
+                issue=task_id,
+            )
+            self.journal(agent, "evidence", {
+                "id": ev_id, "task": task_id, "cmd": cmd[:160],
+                "exit": int(exit_code), "verdict": verdict,
+            })
+        return ev_id
+
+    def set_evidence_verdict(self, ev_id: int, verdict: str,
+                             note: str = "", by: str = "") -> bool:
+        """Re-verdict an evidence row (e.g. a Reviewer cross-checks the run
+        or an owner rejects a green check). Appends to the note trail."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE evidence SET verdict=?, note=?, verdict_by=? WHERE id=?",
+                (verdict, note[:600], by[:64], ev_id),
+            )
+            return cur.rowcount > 0
+
+    def _evidence_row(self, r) -> dict:
+        return {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
+                "hypothesis": r[4], "method": r[5], "cmd": r[6],
+                "exit_code": r[7], "verdict": r[8], "output": r[9],
+                "duration_s": r[10], "artifact": r[11], "note": r[12],
+                "verdict_by": r[13]}
+
+    _EVIDENCE_COLS = ("id, ts, agent, task_id, hypothesis, method, cmd, "
+                      "exit_code, verdict, output, duration_s, artifact, "
+                      "note, verdict_by")
+
+    def evidence_for_task(self, task_id: int | None) -> list[dict]:
+        """All evidence recorded for one task, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
+                "WHERE task_id IS ? ORDER BY id", (task_id,)
+            ).fetchall()
+        return [self._evidence_row(r) for r in rows]
+
+    def latest_evidence(self, limit: int = 30) -> list[dict]:
+        """Newest evidence across every agent — the shared verdict feed
+        (newest first: the dashboard and agents care about the latest)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
+                "ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._evidence_row(r) for r in rows]
+
+    def evidence_search(self, term: str, limit: int = 30) -> list[dict]:
+        """Cross-agent lookup: prior verdicts mentioning a term (hypothesis,
+        command, output, artifact) — an agent can reuse what others verified."""
+        like = f"%{term[:120]}%"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
+                "WHERE hypothesis LIKE ? OR cmd LIKE ? OR output LIKE ? "
+                "OR artifact LIKE ? ORDER BY id DESC LIMIT ?",
+                (like, like, like, like, limit),
+            ).fetchall()
+        return [self._evidence_row(r) for r in rows]
+
+    def evidence_counts(self) -> dict[str, int]:
+        """Verdict histogram — the dashboard's 'is this lab self-checking?' dial."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT verdict, COUNT(*) FROM evidence GROUP BY verdict"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     # ------------------------------------------------------------ decisions
     def add_decision(self, agent: str, decision: str, reason: str = "") -> None:
