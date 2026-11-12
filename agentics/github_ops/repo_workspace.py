@@ -53,6 +53,9 @@ class RepoWorkspace:
 
     def ensure_cloned(self) -> None:
         if (self.path / ".git").exists():
+            # Migrate workspaces created by older versions whose origin URL may
+            # contain a token; always normalize it before any fetch or push.
+            self._git("remote", "set-url", "origin", self._remote)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         log.info("[%s] cloning repo…", self.agent_id)
