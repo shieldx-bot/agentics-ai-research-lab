@@ -34,7 +34,9 @@ class RepoWorkspace:
         """Return a per-process Git auth environment; never persist credentials."""
         allowed = {"PATH", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL"}
         env = {key: value for key, value in os.environ.items() if key in allowed}
-        env["HOME"] = str(self.path / ".agent-home")
+        home = self.path / ".agent-home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)
         env["GIT_TERMINAL_PROMPT"] = "0"
         token = self.settings.github_token
         if token:
