@@ -5,6 +5,7 @@ LLM and paper-search nodes are async and await their providers directly.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -195,12 +196,16 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
 
     title = f"Findings: {topic}"
     content = f"{resp.answer[:6000]}\n\n## BibTeX\n\n{state['bibtex'][:3000]}"
-    fid = ctx.memory.add_finding(
-        ctx.agent_id, title, content, resp.citations, state.get("issue_number")
+    fid = await asyncio.to_thread(
+        ctx.memory.add_finding,
+        ctx.agent_id, title, content, resp.citations, state.get("issue_number"),
     )
-    ctx.vector.add(content, {"agent": ctx.agent_id, "finding_id": fid,
-                             "issue": state.get("issue_number")})
-    ctx.memory.post_message(
+    await asyncio.to_thread(
+        ctx.vector.add, content,
+        {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
+    )
+    await asyncio.to_thread(
+        ctx.memory.post_message,
         ctx.agent_id, "broadcast",
         f"New finding #{fid} on '{topic}' with {len(resp.citations)} citations.",
         state.get("issue_number"),
@@ -291,14 +296,14 @@ def _tier1(ctx: AgentContext, changed: list[str]) -> tuple[bool, str]:
 async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: create branch, write code from plan, run tests, push (P2/P3)."""
     branch = state["branch"]
-    ctx.workspace.sync_main()
-    branch_ops.create_branch(ctx.gh.repo, branch)
-    ctx.workspace.checkout_new_branch(branch)
+    await asyncio.to_thread(ctx.workspace.sync_main)
+    await asyncio.to_thread(branch_ops.create_branch, ctx.gh.repo, branch)
+    await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
     plan = json.loads(state.get("plan") or "{}")
     for spec in plan.get("files", []):
         path, change = spec.get("path", ""), spec.get("change", "new")
-        current = ctx.workspace.read_file(path) if change == "edit" else ""
+        current = await asyncio.to_thread(ctx.workspace.read_file, path) if change == "edit" else ""
         prompt = (
             f"Issue: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
@@ -308,11 +313,11 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         answer, _ = await _llm_ask(ctx, prompt, mode="concise")
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
-            ctx.workspace.write_file(path, content)
+            await asyncio.to_thread(ctx.workspace.write_file, path, content)
 
     # NOTE: must be the working-tree status — `diff_files_vs_main()` compares
     # commits and is empty before the commit, which silently disabled P3.
-    changed = ctx.workspace.changed_files()
+    changed = await asyncio.to_thread(ctx.workspace.changed_files)
     state["changed_files"] = changed
 
     # Guard: self-evolution PRs may only touch the allow-listed paths.
@@ -322,17 +327,17 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             return _yield(ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}")
 
     # P3: ownership check against other active roles
+    active_agents = await asyncio.to_thread(ctx.memory.active_agents, stale_after_s=300)
     active_roles = {
-        a["role"] for a in ctx.memory.active_agents(stale_after_s=300)
-        if a["agent"] != ctx.agent_id
+        a["role"] for a in active_agents if a["agent"] != ctx.agent_id
     }
-    ok, foreign = ctx.ownership.evaluate(ctx.role.value, changed, active_roles)
+    ok, foreign = await asyncio.to_thread(ctx.ownership.evaluate, ctx.role.value, changed, active_roles)
     if not ok:
         return _yield(ctx, state, f"foreign files {foreign[:5]}")
 
     # Tier 1 (author, before push): compile + fast tests. Tier 2 (full suite on
     # main+PR) runs later, in the Integrator, right before merge.
-    t1_ok, verification = _tier1(ctx, changed)
+    t1_ok, verification = await asyncio.to_thread(_tier1, ctx, changed)
     state["verification"] = verification
     if not t1_ok:
         state["error"] = verification
@@ -340,9 +345,10 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         return state
 
     try:
-        pushed = ctx.workspace.commit_and_push(
+        pushed = await asyncio.to_thread(
+            ctx.workspace.commit_and_push,
             branch, f"agent({ctx.agent_id}): {state.get('commit_message', 'work')} "
-                    f"(#{state['issue_number']})"
+                    f"(#{state['issue_number']})",
         )
     except RuntimeError as exc:
         state["error"] = str(exc)
@@ -412,10 +418,11 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Reviewer: pick an open PR not authored by me, review it (P5)."""
     repo = ctx.gh.repo
     candidate = None
-    for pr in repo.get_pulls(state="open"):
+    pulls = await asyncio.to_thread(lambda: list(repo.get_pulls(state="open")))
+    for pr in pulls:
         if pr.user and pr.user.login == "shieldx-bot" and f"[{ctx.agent_id}]" in pr.title:
             continue  # never review own PR
-        labels = {lb.name for lb in pr.get_labels()}
+        labels = {lb.name for lb in await asyncio.to_thread(pr.get_labels)}
         if "reviewed" in labels:
             continue
         candidate = pr
@@ -425,7 +432,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["done"] = True
         return state
 
-    diff = candidate.get_files()
+    diff = await asyncio.to_thread(lambda: list(candidate.get_files()))
     files_desc = "\n".join(f"- {f.filename} (+{f.additions}/-{f.deletions})" for f in diff[:30])
     prompt = (
         f"Review PR #{candidate.number}: {candidate.title}\n{candidate.body or ''}\n\n"
@@ -438,21 +445,21 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")
 
-    pr_to_review = ctx.gh.repo.get_pull(candidate.number)
+    pr_to_review = await asyncio.to_thread(ctx.gh.repo.get_pull, candidate.number)
     if verdict == "approve":
-        pr_ops.approve_review(pr_to_review, comment)
+        await asyncio.to_thread(pr_ops.approve_review, pr_to_review, comment)
         author = candidate.title.split("]")[0].lstrip("[") or "agent"
-        ctx.merge_queue.enqueue(candidate.number, author=author)
-        ctx.memory.set_trace_outcome(candidate.number, "approved")
+        await asyncio.to_thread(ctx.merge_queue.enqueue, candidate.number, author=author)
+        await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "approved")
         state["review_verdict"] = "approve"
     else:
-        pr_to_review.create_issue_comment(f"Review ({ctx.agent_id}): {comment}")
+        await asyncio.to_thread(pr_to_review.create_issue_comment, f"Review ({ctx.agent_id}): {comment}")
         # the reviewer's reason becomes a failure trace every agent can learn from
-        ctx.memory.set_trace_outcome(candidate.number, "rejected", comment)
-        ctx.memory.drop_tools(candidate.number)
+        await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "rejected", comment)
+        await asyncio.to_thread(ctx.memory.drop_tools, candidate.number)
         state["review_verdict"] = "request_changes"
     try:                                   # without this the same PR is re-reviewed every cycle
-        candidate.add_to_labels("reviewed")
+        await asyncio.to_thread(candidate.add_to_labels, "reviewed")
     except Exception as exc:  # noqa: BLE001
         log.warning("could not label PR #%s reviewed: %s", candidate.number, exc)
     state["review_comment"] = comment
