@@ -44,7 +44,9 @@ def _memory_context(ctx: AgentContext) -> dict:
     }
 
 
-async def _llm_ask(ctx: AgentContext, prompt: str, mode: str = "concise") -> tuple[str, list[str]]:
+async def _llm_ask(
+    ctx: AgentContext, prompt: str, mode: str = "concise"
+) -> tuple[str, list[str]]:
     """Await the provider directly; never create or nest an event loop in a graph worker."""
     if ctx.llm is None:
         return "", []
@@ -303,7 +305,10 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     plan = json.loads(state.get("plan") or "{}")
     for spec in plan.get("files", []):
         path, change = spec.get("path", ""), spec.get("change", "new")
-        current = await asyncio.to_thread(ctx.workspace.read_file, path) if change == "edit" else ""
+        current = (
+            await asyncio.to_thread(ctx.workspace.read_file, path)
+            if change == "edit" else ""
+        )
         prompt = (
             f"Issue: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
@@ -433,7 +438,9 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
 
     diff = await asyncio.to_thread(lambda: list(candidate.get_files()))
-    files_desc = "\n".join(f"- {f.filename} (+{f.additions}/-{f.deletions})" for f in diff[:30])
+    files_desc = "\n".join(
+        f"- {f.filename} (+{f.additions}/-{f.deletions})" for f in diff[:30]
+    )
     prompt = (
         f"Review PR #{candidate.number}: {candidate.title}\n{candidate.body or ''}\n\n"
         f"Files:\n{files_desc}\n\n"
@@ -453,7 +460,10 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "approved")
         state["review_verdict"] = "approve"
     else:
-        await asyncio.to_thread(pr_to_review.create_issue_comment, f"Review ({ctx.agent_id}): {comment}")
+        await asyncio.to_thread(
+            pr_to_review.create_issue_comment,
+            f"Review ({ctx.agent_id}): {comment}",
+        )
         # the reviewer's reason becomes a failure trace every agent can learn from
         await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "rejected", comment)
         await asyncio.to_thread(ctx.memory.drop_tools, candidate.number)
