@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from agentics.config import Settings
+from agentics.github_ops.sandbox import DockerSandboxRunner, SandboxError
 
 log = logging.getLogger("gh.workspace")
 
@@ -155,10 +156,10 @@ class RepoWorkspace:
         raise ValueError("allowed commands: python -m pytest, python -m py_compile, or workspace .py scripts")
 
     def run_command(self, cmd: list[str], timeout: int = 120) -> tuple[int, str]:
-        """Run approved Python checks with a scrubbed environment and bounded lifetime.
+        """Run approved checks in a rootless Docker sandbox by default.
 
-        This is a host-process guardrail, not an OS/container security boundary.
-        Use a rootless container sandbox for untrusted code in production.
+        Set SANDBOX_ENABLED=false only for trusted local development; this is an
+        explicit opt-out, never an automatic fallback when Docker is unavailable.
         """
         if not isinstance(timeout, int) or timeout < 1 or timeout > 3600:
             return 126, "timeout must be an integer between 1 and 3600 seconds"
@@ -166,6 +167,16 @@ class RepoWorkspace:
             self._validate_command(cmd)
         except (ValueError, OSError) as exc:
             return 126, f"command rejected: {exc}"
+        if self.settings.sandbox_enabled:
+            try:
+                return DockerSandboxRunner(self.settings).run(self.path, cmd, timeout)
+            except SandboxError as exc:
+                log.error("[%s] sandbox refused execution: %s", self.agent_id, exc)
+                return 126, f"sandbox unavailable; execution refused: {exc}"
+        return self._run_command_on_host(cmd, timeout)
+
+    def _run_command_on_host(self, cmd: list[str], timeout: int) -> tuple[int, str]:
+        """Trusted-development opt-out only; not a security boundary."""
         proc = subprocess.Popen(
             cmd, cwd=self.path, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
