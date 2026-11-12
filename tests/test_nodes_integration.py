@@ -72,7 +72,7 @@ def _ctx(mem, role=Role.CODER, claims=None, evolution_n=10, cycle=1,
 
 def _llm_json(monkeypatch, payload_by_purpose=None, payload=None):
     """Route _llm_ask to canned JSON answers."""
-    async def fake_llm(ctx, prompt, mode="concise", purpose="general"):
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
         if payload_by_purpose and purpose in payload_by_purpose:
             return json.dumps(payload_by_purpose[purpose]), []
         return json.dumps(payload if payload is not None else {}), []
@@ -147,7 +147,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
     mem.activate_tools(9)
     seen = {}
 
-    async def fake_llm(ctx, prompt, mode="concise", purpose="general"):
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
         seen["prompt"] = prompt
         return json.dumps(
             {"files": [], "steps": ["s1"], "commit_message": "m",
@@ -173,7 +173,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
 def test_evolution_plan_prompt_states_the_allowed_paths(mem, monkeypatch):
     seen = {}
 
-    async def fake_llm(ctx, prompt, mode="concise", purpose="general"):
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
         seen["p"] = prompt
         return "{}", []
 

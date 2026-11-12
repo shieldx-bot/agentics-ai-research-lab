@@ -51,17 +51,32 @@ def _memory_context(ctx: AgentContext) -> dict:
 
 
 async def _llm_ask(
-    ctx: AgentContext, prompt: str, mode: str = "concise", purpose: str = "general"
+    ctx: AgentContext, prompt: str, mode: str = "concise", purpose: str = "general",
+    state: ResearchState | None = None,
 ) -> tuple[str, list[str]]:
     """Await the BrowserSessionHost directly; never create or nest an event
     loop in a graph worker. Purpose tags the call for provider routing
-    (research wants citations; plan/implement/review want the code model)."""
+    (research wants citations; plan/implement/review want the code model).
+
+    Resilience: a provider failure (cookie cooldown, challenge page, WAF,
+    exhausted pool) must NOT kill the LangGraph task — it is recorded in
+    ``state["error"]`` so the cycle degrades to `reflect` (claim released,
+    trace + personal lesson written) and the swarm retries next cycle.
+    """
     if ctx.llm is None:
+        if state is not None:
+            state["error"] = "no LLM account available"
         return "", []
-    resp = await ctx.llm.ask(
-        prompt, mode=mode, purpose=purpose, system=build_system_prompt(
-            ctx.agent_id, ctx.role, ctx.settings.research_topic)
-    )
+    try:
+        resp = await ctx.llm.ask(
+            prompt, mode=mode, purpose=purpose, system=build_system_prompt(
+                ctx.agent_id, ctx.role, ctx.settings.research_topic)
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
+        log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
+        if state is not None and not state.get("error"):
+            state["error"] = f"llm {purpose} call failed: {exc}"
+        return "", []
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     return resp.answer, resp.citations
@@ -313,7 +328,13 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         state["error"] = "no LLM account available"
         state["done"] = True
         return state
-    resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
+    try:
+        resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
+    except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
+        log.warning("[%s] research llm call failed: %s", ctx.agent_id, exc)
+        state["error"] = f"research llm call failed: {exc}"
+        state["done"] = True
+        return state
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     state["papers"] = [{"title": topic, "answer": resp.answer}]
@@ -386,10 +407,10 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "is how your idea gets VERIFIED by running real code instead of an LLM's "
         "opinion — declare at least one check for a code task.)"
     )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan")
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
     if not parsed:
-        state["error"] = "plan parsing failed"
+        state["error"] = state.get("error") or "plan parsing failed"
         state["done"] = True
         return state
     state["plan"] = json.dumps(parsed, ensure_ascii=False)[:8000]
@@ -504,6 +525,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
 
     plan = json.loads(state.get("plan") or "{}")
     for spec in plan.get("files", []):
+        if state.get("error"):           # LLM died mid-plan: push nothing
+            state["done"] = True
+            return state
         path, change = spec.get("path", ""), spec.get("change", "new")
         # `or ""`: read_file returns None for a hallucinated path (the plan
         # says "edit" but the file does not exist in the workspace) — treat
@@ -518,7 +542,8 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
-        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="implement")
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="implement",
+                                   state=state)
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
             try:
@@ -795,7 +820,10 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         'Reply ONLY JSON: {"verdict": "approve|request_changes", '
         '"comment": "..."}'
     )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review")
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
+    if state.get("error"):                 # reviewer unreachable — retry next cycle
+        state["done"] = True
+        return state
     parsed = parse_json_block(answer)
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")
