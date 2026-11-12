@@ -57,13 +57,11 @@ def test_changed_files_lists_each_new_file_not_the_directory(ws):
 
 
 def test_verify_merge_runs_checks_on_main_plus_pr_and_cleans_up(ws):
-    _push_branch(ws, "feat-ok", {"feature.txt": "hello\n"})
-    probe = [
-        sys.executable,
-        "-c",
-        "import pathlib,sys; sys.exit(0 if pathlib.Path('feature.txt').exists() else 1)",
-    ]
-    ok, note = ws.verify_merge("feat-ok", cmd=probe)
+    _push_branch(w, "feat-ok", {
+        "feature.txt": "hello\\n",
+        "probe.py": "import pathlib, sys; sys.exit(0 if pathlib.Path('feature.txt').exists() else 1)\\n",
+    })
+    ok, note = w.verify_merge("feat-ok", cmd=[sys.executable, "probe.py"])
     assert ok, note  # the PR's file was present in the merged tree
     cur = subprocess.run(
         ["git", "branch", "--show-current"], cwd=ws.path, capture_output=True, text=True
@@ -73,8 +71,11 @@ def test_verify_merge_runs_checks_on_main_plus_pr_and_cleans_up(ws):
 
 
 def test_verify_merge_reports_failing_checks(ws):
-    _push_branch(ws, "feat-bad", {"feature.txt": "hello\n"})
-    ok, note = ws.verify_merge("feat-bad", cmd=[sys.executable, "-c", "raise SystemExit(3)"])
+    _push_branch(w, "feat-bad", {
+        "feature.txt": "hello\\n",
+        "fail.py": "raise SystemExit(3)\\n",
+    })
+    ok, note = w.verify_merge("feat-bad", cmd=[sys.executable, "fail.py"])
     assert not ok and "exit 3" in note
 
 
