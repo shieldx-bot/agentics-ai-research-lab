@@ -27,6 +27,19 @@ from agentics.stop import should_stop
 log = logging.getLogger("orchestrator")
 
 
+def _effective_agent_count(settings: Settings, available_accounts: int) -> int:
+    """Respect the Hyperbrowser client's single-session architecture."""
+    count = min(max(0, available_accounts), max(0, settings.max_agents))
+    if (settings.browser_backend or "local").lower() == "hyperbrowser" and count > 1:
+        log.warning(
+            "BROWSER_BACKEND=hyperbrowser currently supports one active session; "
+            "limiting this process to 1 agent (requested %d).",
+            count,
+        )
+        return 1
+    return count
+
+
 def _role_map(settings: Settings) -> dict[int, str]:
     cfg_path = PROJECT_ROOT / "configs" / "lab.yaml"
     role_map: dict[int, str] = {}
@@ -52,7 +65,7 @@ class Orchestrator:
 
     # ------------------------------------------------------------ assembly
     def build_contexts(self) -> list[AgentContext]:
-        n = min(len(self.host), self.settings.max_agents) or 0
+        n = _effective_agent_count(self.settings, len(self.host))
         if n == 0:
             raise RuntimeError(
                 "No browser-session accounts found. Put account-01.json… "
