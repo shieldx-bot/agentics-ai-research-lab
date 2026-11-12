@@ -167,7 +167,7 @@ class FakeWS:
     def changed_files(self):
         return list(self._changed)
 
-    def commit_and_push(self, branch, message):
+    def commit_and_push(self, branch, message, allow_protected=False):
         return True
 
 
