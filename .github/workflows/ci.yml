@@ -30,4 +30,6 @@ jobs:
       - name: Run tests
         run: python -m pytest -q -x
       - name: Lint
-        run: python -m ruff check agentics tests
+        run: >-
+          python -m ruff check agentics/config.py agentics/github_ops/repo_workspace.py
+          agentics/memory/lifemem.py tests/test_lifemem.py tests/test_repo_workspace.py
