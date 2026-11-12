@@ -1,5 +1,6 @@
 """Wiring of the new behaviour inside the graph nodes (fake GitHub / LLM)."""
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,7 +117,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
     mem.activate_tools(9)
     seen = {}
 
-    def fake_llm(ctx, prompt, mode="concise"):
+    async def fake_llm(ctx, prompt, mode="concise"):
         seen["prompt"] = prompt
         return json.dumps(
             {
@@ -129,7 +130,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
         ), []
 
     monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
-    state = nodes.node_plan(
+    state = asyncio.run(nodes.node_plan(
         _ctx(mem),
         {
             "issue_number": 3,
@@ -138,7 +139,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
             "papers": [{"answer": ""}],
             "category": "code",
         },
-    )
+    ))
     assert "catastrophic backtracking" in seen["prompt"]  # a05's failure reaches a04
     assert "snippet_extract" in seen["prompt"]  # registry is in the prompt
     assert state["reuses"] == ["snippet_extract"]
@@ -153,7 +154,7 @@ def test_evolution_plan_prompt_states_the_allowed_paths(mem, monkeypatch):
         return "{}", []
 
     monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
-    nodes.node_plan(
+    asyncio.run(nodes.node_plan(
         _ctx(mem),
         {
             "issue_number": 1,
@@ -162,7 +163,7 @@ def test_evolution_plan_prompt_states_the_allowed_paths(mem, monkeypatch):
             "papers": [{"answer": ""}],
             "category": "evolution",
         },
-    )
+    ))
     assert "SELF-EVOLUTION" in seen["p"] and "agentics/agents/roles.py" in seen["p"]
 
 
@@ -288,7 +289,7 @@ def no_branch(monkeypatch):
 
 def test_implement_happy_path_runs_both_tier1_checks_and_pushes(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["agentics/a.py", "docs/x.md"])
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state())
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
     assert ws.pushed and state["action"] == "open_pr"
     assert "tier-1 passed" in state["verification"] and "1 file" in state["verification"]
     assert state["changed_files"] == ["agentics/a.py", "docs/x.md"]
