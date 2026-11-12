@@ -33,6 +33,24 @@ def test_git_auth_is_process_scoped_and_not_plaintext(tmp_path):
     assert "distinct-secret" not in env["GIT_CONFIG_VALUE_0"]
 
 
+def test_existing_clone_rewrites_legacy_credential_bearing_remote(tmp_path):
+    ws = _workspace(tmp_path, token="new-secret")
+    ws.path.mkdir(parents=True)
+    subprocess.run(["git", "init", str(ws.path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin",
+         "https://x-access-token:old-secret@github.com/owner/repo.git"],
+        cwd=ws.path, check=True, capture_output=True,
+    )
+    ws.ensure_cloned()
+    remote = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=ws.path, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert remote == "https://github.com/owner/repo.git"
+    assert "old-secret" not in remote
+
+
 def test_clone_uses_clean_url_and_environment_auth(tmp_path, monkeypatch):
     ws = _workspace(tmp_path, token="clone-secret")
     calls = []
