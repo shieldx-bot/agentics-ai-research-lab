@@ -115,15 +115,21 @@ runtime, hoặc tệ hơn là chạm vào cookie/credentials.
 agentics/   configs/   accounts/   scripts/   .github/
 ```
 
-Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`):
+Thực thi ở **4 tầng độc lập** (`agentics/policies/guard.py`):
 
 1. **Ghi file** — `RepoWorkspace.write_file` từ chối ngay khi plan yêu cầu
    tạo/sửa một file protected (ValueError → cycle yield).
 2. **Diff trước push** — `node_implement` quét toàn bộ changed files; vi phạm
    → yield, không commit, không push.
-3. **Cửa review + cửa merge** — Reviewer hạ mọi verdict "approve" thành
-   "request_changes" nếu diff chạm protected paths; `LocalMergeQueue.drain`
-   từ chối merge MR vi phạm kể cả khi đã được duyệt.
+3. **Cửa review — re-scan nhánh thật (tầng 4)** — Reviewer tự quét lại branch
+   đã push trong workspace của chính mình (`branch_files_vs_main`) thay vì tin
+   danh sách file do workspace của tác giả ghi lại lúc mở MR; vi phạm →
+   "request_changes" ngay, không tốn một lần gọi LLM nào. Prompt review cũng
+   dùng đúng danh sách file thật của branch.
+4. **Cửa merge — re-scan nhánh thật (tầng 4)** — `LocalMergeQueue.drain` nhận
+   callback `scan_branch`: verdict của guard dựa trên diff thật của branch
+   trong workspace của Integrator; một branch "đầu độc" kèm danh sách file
+   sạch vẫn bị từ chối merge (mỗi workspace là một trust domain riêng).
 
 **Exception duy nhất thuộc về owner:**
 

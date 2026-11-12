@@ -779,8 +779,10 @@ def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
 async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Reviewer: pick an open MR not authored by me, review it (P5).
 
-    P10 layer 3: an MR whose diff touches protected paths can never be
-    approved, no matter what the reviewing LLM says."""
+    P10 layers 3+4: before any LLM cost is spent, the reviewer re-scans the
+    branch that was ACTUALLY pushed (in its own workspace) and hard-rejects
+    any MR whose real diff touches protected paths — no matter what the file
+    list recorded by the author's workspace claims."""
     candidate = None
     for mr in ctx.memory.open_reviews():
         if mr["author"] == ctx.agent_id:
@@ -800,48 +802,66 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 "why": "P5: no self-approval", "steps": []},
     )
 
-    files_desc = "\n".join(f"- {f}" for f in candidate.get("files", [])[:30])
+    # P10 layer 4 (defense in depth): each workspace is a separate trust
+    # domain, so the reviewer re-scans the pushed branch itself instead of
+    # trusting the file list the author's workspace recorded at open_mr time.
+    diff_files = candidate.get("files", [])
+    scan = getattr(getattr(ctx, "workspace", None), "branch_files_vs_main", None)
+    if scan is not None:
+        try:
+            scanned = await asyncio.to_thread(scan, candidate["branch"])
+            if scanned:
+                diff_files = scanned
+        except RuntimeError as exc:
+            log.warning("[%s] layer-4 re-scan of %s failed: %s",
+                        ctx.agent_id, candidate["branch"], exc)
+
     # P16: show the reviewer the REAL runs recorded for this task (shared
     # evidence), so the verdict weighs measurements, not just author claims.
     ev_rows = ctx.memory.evidence_for_task(candidate.get("task_id"))
-    ev_desc = ""
-    if ev_rows:
-        ev_lines = [
-            f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
-            f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
-            for e in ev_rows[-6:]
-        ]
-        ev_desc = "\n\nEmpirical evidence recorded for this task (P16):\n" + "\n".join(ev_lines)
-    prompt = (
-        f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
-        f"Files:\n{files_desc}\n\n"
-        f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
-        f"{ev_desc}\n\n"
-        'Reply ONLY JSON: {"verdict": "approve|request_changes", '
-        '"comment": "..."}'
-    )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
-    if state.get("error"):                 # reviewer unreachable — retry next cycle
-        state["done"] = True
-        return state
-    parsed = parse_json_block(answer)
-    verdict = parsed.get("verdict", "request_changes")
-    comment = parsed.get("comment", "auto review")
-    if ev_rows:
-        counts: dict[str, int] = {}
-        for e in ev_rows:
-            counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
-        comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
 
-    # P10 layer 3: protected paths never reach main via any MR.
+    # P10 layers 3+4: protected paths never reach main via any MR — rejected
+    # here, before the LLM is even asked.
     guard = getattr(getattr(ctx, "local", None), "guard", None)
-    if guard is not None and verdict == "approve":
-        violations = guard.check_task(ctx.memory, candidate.get("task_id"),
-                                      candidate.get("files", []))
-        if violations:
-            verdict = "request_changes"
-            comment = (f"P10 protected paths in diff: {violations[:5]} "
-                       "— cannot be approved (owner-only code)")
+    violations = (
+        guard.check_task(ctx.memory, candidate.get("task_id"), diff_files)
+        if guard is not None else []
+    )
+    if violations:
+        verdict = "request_changes"
+        comment = (f"P10 protected paths in diff (branch re-scan): {violations[:5]} "
+                   "— cannot be approved (owner-only code)")
+    else:
+        files_desc = "\n".join(f"- {f}" for f in diff_files[:30])
+        ev_desc = ""
+        if ev_rows:
+            ev_lines = [
+                f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
+                f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
+                for e in ev_rows[-6:]
+            ]
+            ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
+                       + "\n".join(ev_lines))
+        prompt = (
+            f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
+            f"Files:\n{files_desc}\n\n"
+            f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
+            f"{ev_desc}\n\n"
+            'Reply ONLY JSON: {"verdict": "approve|request_changes", '
+            '"comment": "..."}'
+        )
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
+        if state.get("error"):             # reviewer unreachable — retry next cycle
+            state["done"] = True
+            return state
+        parsed = parse_json_block(answer)
+        verdict = parsed.get("verdict", "request_changes")
+        comment = parsed.get("comment", "auto review")
+        if ev_rows:                        # P16: make the evidence trail explicit
+            counts: dict[str, int] = {}
+            for e in ev_rows:
+                counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
+            comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
 
     if verdict == "approve":
         await asyncio.to_thread(
@@ -892,9 +912,18 @@ def node_integrate(ctx: AgentContext, state: ResearchState) -> ResearchState:
             f"merge MR #{mr_id} ({review['author']}) — task #{review.get('task_id')}",
         )
 
+    def _scan_branch(branch: str) -> list[str]:
+        # P10 layer 4: the Integrator re-scans the pushed branch in its own
+        # workspace — the queue's guard verdict then rests on the real diff,
+        # not on the file list the author's workspace recorded.
+        return ctx.workspace.branch_files_vs_main(branch)
+
     ctx.report(node="integrate",
                intent={"goal": "Drain the merge queue (serial, tier-2 first)", "steps": []})
-    merged = ctx.merge_queue.drain(ctx.agent_id, verify=_verify, merge=_merge)
+    scan = getattr(ctx.workspace, "branch_files_vs_main", None)
+    merged = ctx.merge_queue.drain(
+        ctx.agent_id, verify=_verify, merge=_merge,
+        scan_branch=_scan_branch if scan is not None else None)
     state["summary"] = f"merged {merged} MR(s)"
     state["done"] = True
     return state

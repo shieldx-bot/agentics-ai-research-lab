@@ -302,6 +302,21 @@ class RepoWorkspace:
         proc = self._git("diff", "--name-only", "origin/main...HEAD", check=False)
         return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
 
+    def branch_files_vs_main(self, branch: str) -> list[str]:
+        """Files a pushed branch ACTUALLY changes relative to origin/main.
+
+        P10 layer 4 helper (defense in depth): each agent's workspace is a
+        separate trust domain, so the Reviewer and the Integrator re-scan the
+        branch themselves instead of trusting the file list the author's
+        workspace recorded at open_pr time. Returns [] when the branch cannot
+        be fetched (missing ref, network-free bare repo race)."""
+        self.sync_main()
+        self._git("fetch", "origin", branch, check=False)
+        proc = self._git(
+            "diff", "--name-only",
+            f"origin/main...origin/{branch}", check=False)
+        return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+
     # ------------------------------------------------------------ verification
     def verify_merge(
         self, branch: str, cmd: list[str] | None = None, timeout: int = 300,
