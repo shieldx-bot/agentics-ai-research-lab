@@ -270,9 +270,11 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def _yield(ctx: AgentContext, state: ResearchState, reason: str) -> ResearchState:
-    ctx.claims.release(state["issue_number"], ctx.agent_id, f"yield: {reason}")
-    ctx.workspace.sync_main()          # discard local changes
+async def _yield(ctx: AgentContext, state: ResearchState, reason: str) -> ResearchState:
+    await asyncio.to_thread(
+        ctx.claims.release, state["issue_number"], ctx.agent_id, f"yield: {reason}"
+    )
+    await asyncio.to_thread(ctx.workspace.sync_main)  # discard local changes
     state["yield_reason"] = reason
     state["done"] = True
     ctx.memory.add_decision(ctx.agent_id, "yield", f"issue #{state['issue_number']}: {reason}")
@@ -329,7 +331,7 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     if state.get("category") == "evolution":
         out_of_bounds = [f for f in changed if not evolution_path_allowed(f)]
         if out_of_bounds:
-            return _yield(ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}")
+            return await _yield(ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}")
 
     # P3: ownership check against other active roles
     active_agents = await asyncio.to_thread(ctx.memory.active_agents, stale_after_s=300)
@@ -340,7 +342,7 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         ctx.ownership.evaluate, ctx.role.value, changed, active_roles
     )
     if not ok:
-        return _yield(ctx, state, f"foreign files {foreign[:5]}")
+        return await _yield(ctx, state, f"foreign files {foreign[:5]}")
 
     # Tier 1 (author, before push): compile + fast tests. Tier 2 (full suite on
     # main+PR) runs later, in the Integrator, right before merge.
@@ -429,7 +431,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     for pr in pulls:
         if pr.user and pr.user.login == "shieldx-bot" and f"[{ctx.agent_id}]" in pr.title:
             continue  # never review own PR
-        labels = {lb.name for lb in await asyncio.to_thread(pr.get_labels)}
+        labels = {lb.name for lb in await asyncio.to_thread(lambda: list(pr.get_labels()))}
         if "reviewed" in labels:
             continue
         candidate = pr
