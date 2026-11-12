@@ -51,6 +51,35 @@ def test_existing_clone_rewrites_legacy_credential_bearing_remote(tmp_path):
     assert "old-secret" not in remote
 
 
+def test_local_git_commands_do_not_receive_github_credentials(tmp_path, monkeypatch):
+    ws = _workspace(tmp_path, token="local-command-secret")
+    ws.path.mkdir(parents=True)
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ws._git("status", check=False)
+    assert "GIT_CONFIG_VALUE_0" not in seen.get("env", {})
+
+
+def test_network_git_commands_receive_credentials_only_in_environment(tmp_path, monkeypatch):
+    ws = _workspace(tmp_path, token="network-secret")
+    ws.path.mkdir(parents=True)
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ws._git("fetch", "origin", "main")
+    assert "network-secret" not in " ".join(seen.get("args", []))
+    assert "GIT_CONFIG_VALUE_0" in seen["env"]
+
+
 def test_clone_uses_clean_url_and_environment_auth(tmp_path, monkeypatch):
     ws = _workspace(tmp_path, token="clone-secret")
     calls = []
