@@ -331,7 +331,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     if state.get("category") == "evolution":
         out_of_bounds = [f for f in changed if not evolution_path_allowed(f)]
         if out_of_bounds:
-            return await _yield(ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}")
+            return await _yield(
+                ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}"
+            )
 
     # P3: ownership check against other active roles
     active_agents = await asyncio.to_thread(ctx.memory.active_agents, stale_after_s=300)
