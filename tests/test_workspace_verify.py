@@ -88,3 +88,46 @@ def test_verify_merge_detects_conflict_with_current_main(ws):
     ok, note = ws.verify_merge("feat-conflict", cmd=[sys.executable, "-c", "pass"])
     assert not ok and "conflict" in note
     assert (ws.path / "a.txt").read_text() == "from main\n"  # workspace left clean
+
+
+
+def test_workspace_rejects_path_traversal(ws):
+    with pytest.raises(ValueError):
+        ws.write_file("../outside.txt", "nope")
+    with pytest.raises(ValueError):
+        ws.read_file("/etc/passwd")
+
+
+def test_workspace_rejects_symlink_escape(ws, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ws.path / "escape").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError):
+        ws.write_file("escape/pwned.txt", "nope")
+
+
+def test_run_command_strips_credentials_from_environment(ws, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-leak")
+    monkeypatch.setenv("PPLX_COOKIE", "must-not-leak")
+    ws.write_file("env_probe.py", (
+        "import os, sys\n"
+        "sys.exit(1 if os.getenv('GITHUB_TOKEN') or os.getenv('PPLX_COOKIE') else 0)\n"
+    ))
+    code, output = ws.run_command([sys.executable, "env_probe.py"])
+    assert code == 0, output
+
+
+def test_run_command_rejects_inline_python(ws):
+    code, output = ws.run_command([sys.executable, "-c", "raise SystemExit(0)"])
+    assert code == 126 and "rejected" in output
+
+
+def test_run_command_kills_timed_out_process(ws):
+    ws.write_file("sleep.py", "import time; time.sleep(10)\n")
+    code, output = ws.run_command([sys.executable, "sleep.py"], timeout=1)
+    assert code == 124 and "timeout" in output
+
+
+def test_agent_id_cannot_escape_workspace(ws):
+    with pytest.raises(ValueError):
+        RepoWorkspace("../outside", ws.settings)
