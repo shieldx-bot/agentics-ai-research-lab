@@ -45,15 +45,35 @@ class ClaimPolicy:
         except Exception as exc:  # noqa: BLE001
             log.warning("github release failed on #%s: %s", issue_number, exc)
 
+    def renew_agent_claims(self, agent_id: str) -> list[int]:
+        """Renew all live leases owned by an agent; return leases already lost."""
+        lost: list[int] = []
+        for issue_no, claim in self.memory.claims_for_agent(agent_id).items():
+            if not self.memory.renew_claim(issue_no, agent_id, self.ttl_s):
+                self.release(issue_no, agent_id, "lease expired before heartbeat renewal")
+                lost.append(issue_no)
+        return lost
+
+    def release_agent_claims(self, agent_id: str, reason: str = "agent stopped") -> list[int]:
+        """Release all active claims for an agent, including expired local leases."""
+        issue_numbers = list(self.memory.claims_for_agent(agent_id))
+        for issue_no in issue_numbers:
+            self.release(issue_no, agent_id, reason)
+        return issue_numbers
+
     def complete(self, issue_number: int, agent_id: str, branch: str) -> None:
         self.memory.complete_claim(issue_number, agent_id, branch)
 
     def sweep_stale(self, stale_after_s: float = 900.0) -> list[int]:
-        """P6: free claims held by agents without fresh heartbeat."""
+        """Release expired leases or claims whose owner heartbeat has gone stale."""
+        now = __import__("time").time()
         alive = {a["agent"] for a in self.memory.active_agents(stale_after_s)}
         freed: list[int] = []
-        for issue_no, claim in self.memory.active_claims().items():
-            if claim.agent not in alive:
-                self.release(issue_no, claim.agent, "stale: agent lost heartbeat")
+        for issue_no, claim in self.memory.all_active_claims().items():
+            expired = claim.expires_at <= now
+            heartbeat_lost = claim.agent not in alive
+            if expired or heartbeat_lost:
+                reason = "stale: lease expired" if expired else "stale: agent lost heartbeat"
+                self.release(issue_no, claim.agent, reason)
                 freed.append(issue_no)
         return freed
