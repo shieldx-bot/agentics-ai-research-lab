@@ -6,7 +6,6 @@ invoked from within async nodes).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
@@ -45,12 +44,13 @@ def _memory_context(ctx: AgentContext) -> dict:
     }
 
 
-def _llm_ask(ctx: AgentContext, prompt: str, mode: str = "concise") -> tuple[str, list[str]]:
+async def _llm_ask(ctx: AgentContext, prompt: str, mode: str = "concise") -> tuple[str, list[str]]:
+    """Await the provider directly; never create or nest an event loop in a graph worker."""
     if ctx.llm is None:
         return "", []
-    resp = asyncio.get_event_loop().run_until_complete(
-        ctx.llm.ask(prompt, mode=mode, system=build_system_prompt(
-            ctx.agent_id, ctx.role, ctx.settings.research_topic))
+    resp = await ctx.llm.ask(
+        prompt, mode=mode, system=build_system_prompt(
+            ctx.agent_id, ctx.role, ctx.settings.research_topic)
     )
     ctx.meta["account"] = ctx.llm.account.name
     return resp.answer, resp.citations
@@ -170,7 +170,7 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings."""
     topic = state.get("issue_title") or ctx.settings.research_topic
     query = (
@@ -178,9 +178,7 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "Focus on methods, benchmarks, reproducible results."
     )
     # P7: dedup — skip if the swarm already covered this
-    known = asyncio.get_event_loop().run_until_complete(
-        papers_mod.dedup_query(ctx.vector, topic)
-    )
+    known = await papers_mod.dedup_query(ctx.vector, topic)
     if len(known) >= 3:
         state["summary"] = f"topic already covered by {len(known)} findings; skipping"
         state["done"] = True
@@ -190,9 +188,7 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["error"] = "no LLM account available"
         state["done"] = True
         return state
-    resp = asyncio.get_event_loop().run_until_complete(
-        papers_mod.search_papers(ctx.llm, query)
-    )
+    resp = await papers_mod.search_papers(ctx.llm, query)
     ctx.meta["account"] = ctx.llm.account.name
     state["papers"] = [{"title": topic, "answer": resp.answer}]
     state["citations"] = list(resp.citations)
@@ -218,7 +214,7 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: turn research into an implementation plan (LLM, JSON)."""
     category = state.get("category") or categorize_issue(
         state.get("issue_title", ""), state.get("issue_body", ""))
@@ -253,7 +249,7 @@ def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
         "'reusable_tools' if it is a genuinely reusable utility.)"
     )
-    answer, _ = _llm_ask(ctx, prompt, mode="concise")
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise")
     parsed = parse_json_block(answer)
     if not parsed:
         state["error"] = "plan parsing failed"
@@ -293,7 +289,7 @@ def _tier1(ctx: AgentContext, changed: list[str]) -> tuple[bool, str]:
     return True, f"tier-1 passed: compiled {len(py_files)} file(s), pytest exit {code}"
 
 
-def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: create branch, write code from plan, run tests, push (P2/P3)."""
     branch = state["branch"]
     ctx.workspace.sync_main()
@@ -310,7 +306,7 @@ def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
-        answer, _ = _llm_ask(ctx, prompt, mode="concise")
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise")
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
             ctx.workspace.write_file(path, content)
