@@ -12,6 +12,7 @@ import random
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, assign_roles
 from agentics.config import Settings, load_yaml_overrides, PROJECT_ROOT
+from agentics.github_ops import issue_ops
 from agentics.github_ops.client import GitHubClient
 from agentics.github_ops.repo_workspace import RepoWorkspace
 from agentics.llm.session_host import BrowserSessionHost
@@ -66,6 +67,8 @@ class Orchestrator:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or load_yaml_overrides(Settings())
         self.settings.ensure_dirs()
+        # Apply the YAML/env scan-cache TTL to the shared issue cache.
+        issue_ops.set_scan_cache_ttl(getattr(self.settings, "gh_scan_cache_ttl", 60))
         self.memory = SharedMemory(self.settings.db_path)
         self.vector = VectorStore(self.settings.chroma_path)
         self.host = BrowserSessionHost.from_settings(self.settings)
@@ -166,11 +169,10 @@ class Orchestrator:
                         )
                     except Exception as release_exc:  # noqa: BLE001
                         log.warning("[%s] claim cleanup failed: %s", tag, release_exc)
-                    # cookie trouble -> cooldown the account that served the
-                    # call; the host re-leases a healthy one automatically at
-                    # the next ask
-                    if ctx.llm is not None and ("4" in str(exc)[:2] or "auth" in str(exc).lower()):
-                        ctx.llm.mark_failed(str(exc))
+                    # NOTE: no per-account cooldown here — the session host
+                    # already cooldowns whichever account served a failed ask,
+                    # and graph-node errors now degrade to state["error"]
+                    # instead of raising, so only real bugs land in this branch.
                 pause = self.settings.cycle_pause_seconds + random.uniform(0, 15)
                 for _ in range(int(pause)):
                     if should_stop():

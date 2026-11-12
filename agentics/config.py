@@ -71,6 +71,14 @@ def _env_bool(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(key: str, default: float) -> float:
+    _load_dotenv()
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class Settings:
     # GitHub
@@ -106,6 +114,15 @@ class Settings:
             "AI/ML for Network Function Virtualization (NFV) and 5G core automation",
         )
     )
+    # GitHub rate-limit safety: process-wide minimum interval between API
+    # calls (all agent threads share one PAT) and TTL for the shared issue
+    # scan cache. 0 disables pacing (not recommended for >2 agents).
+    gh_min_api_interval: float = field(
+        default_factory=lambda: _env_float("GH_MIN_API_INTERVAL", 1.0)
+    )
+    gh_scan_cache_ttl: float = field(
+        default_factory=lambda: _env_float("GH_SCAN_CACHE_TTL", 60)
+    )
     # Paths
     data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
     accounts_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "accounts")
@@ -130,6 +147,10 @@ class Settings:
         default_factory=lambda: _env("HB_PROXY_COUNTRY", "US"))
     hyperbrowser_timeout: int = field(
         default_factory=lambda: _env_int("HB_TIMEOUT", 900))
+    # How long the cloud browser waits for the Perplexity composer to become
+    # visible before failing an ask with a diagnostic error (challenge page,
+    # logged-out wall, or a UI markup change).
+    hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
 
     @property
     def owner(self) -> str:
