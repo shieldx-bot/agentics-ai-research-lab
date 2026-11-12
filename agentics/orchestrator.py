@@ -95,13 +95,18 @@ class Orchestrator:
         interval = max(1.0, min(ctx.claims.ttl_s / 3.0, 30.0))
         while True:
             await asyncio.sleep(interval)
-            ctx.heartbeat("working")
-            lost = await asyncio.to_thread(ctx.claims.renew_agent_claims, ctx.agent_id)
-            if lost:
-                ctx.memory.post_message(
-                    ctx.agent_id, "alert",
-                    f"Lost expired claim lease(s): {lost}",
+            try:
+                ctx.heartbeat("working")
+                lost = await asyncio.to_thread(
+                    ctx.claims.renew_agent_claims, ctx.agent_id
                 )
+                if lost:
+                    ctx.memory.post_message(
+                        ctx.agent_id, "alert",
+                        f"Lost expired claim lease(s): {lost}",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] lease heartbeat failed: %s", ctx.agent_id, exc)
 
     async def _agent_loop(self, ctx: AgentContext) -> None:
         tag = f"{ctx.agent_id}/{ctx.role.value}"
