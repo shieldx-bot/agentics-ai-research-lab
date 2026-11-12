@@ -209,3 +209,27 @@ def test_backend_circuit_rejects_new_account_sessions(tmp_path, monkeypatch):
     with pytest.raises(hb.HyperbrowserBackendUnavailable, match="circuit open"):
         asyncio_run(client.ask("test"))
     assert client._session_id is None
+
+
+
+def test_provider_ui_outage_does_not_cool_down_cookie_account(tmp_path, monkeypatch):
+    from agentics.llm.hyperbrowser_client import HyperbrowserBackendUnavailable
+
+    host = BrowserSessionHost.from_settings(_settings(tmp_path))
+    account = host.pools["perplexity"].accounts[0]
+    calls = []
+
+    class BrokenClient:
+        account = account
+
+        async def ask(self, *_args, **_kwargs):
+            raise HyperbrowserBackendUnavailable("verification page")
+
+    pool = host.pools["perplexity"]
+    monkeypatch.setattr(pool, "mark_failed", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(host, "_lease", lambda _purpose: ("perplexity", BrokenClient()))
+
+    with pytest.raises(HyperbrowserBackendUnavailable):
+        asyncio_run(host.ask("test", purpose="research"))
+    assert calls == []
+    assert not pool.health[account.name].in_cooldown()
