@@ -423,5 +423,258 @@ def assign_roles() -> None:
         console.print(f"{acc.name:<14} -> [bold cyan]{role.value}[/]")
 
 
+# ---------------------------------------------------------------- owner TUI
+def _fmt_age(seconds: float) -> str:
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def _render_watch(settings, memory, now: float) -> None:
+    import time as _t
+
+    agents = memory.active_agents(stale_after_s=86400)
+    console.print(f"[bold]Agentics watch[/] — local lab  "
+                  f"{_t.strftime('%H:%M:%S', _t.localtime(now))}  "
+                  "[dim](Ctrl+C to exit)[/]")
+    table = Table(title="Agents — what is each AI doing and why")
+    for col in ("agent", "role", "cycle", "status", "age", "node", "task",
+                "intent (goal — why)"):
+        table.add_column(col, overflow="fold")
+    for a in agents:
+        intent = a.get("intent") or {}
+        why = intent.get("why") or intent.get("goal") or ""
+        goal = intent.get("goal") or ""
+        if goal and why and why != goal:
+            purpose = f"{goal[:52]} — [dim]{why[:60]}[/]"
+        else:
+            purpose = goal[:70] or "[dim](no live intent)[/]"
+        table.add_row(
+            a["agent"], a["role"], str(a["cycle"]), a["status"],
+            _fmt_age(now - a["last_ts"]), a.get("node") or "-",
+            f"#{a['task_id']} {a.get('task_title', '')[:24]}" if a.get("task_id") else "-",
+            purpose,
+        )
+    console.print(table)
+
+    claims = memory.active_claims()
+    if claims:
+        line = ", ".join(f"#{t}→{c.agent}" for t, c in claims.items())
+        console.print(f"[bold]Active claims:[/] {line}")
+    queue = memory.mq_pending()
+    if queue:
+        line = ", ".join(f"MR#{q['pr_number']}({q['author']}, try {q['attempts']})"
+                         for q in queue)
+        console.print(f"[bold]Merge queue:[/] {line}")
+    counts = memory.task_counts()
+    if counts:
+        console.print("[bold]Backlog:[/] " + ", ".join(
+            f"{k}={v}" for k, v in sorted(counts.items())))
+    if not settings.auto_merge and queue:
+        console.print("[yellow]AUTO_MERGE off — approved MRs wait for "
+                      "`agentics mr merge <#>`[/]")
+
+    journal = memory.recent_journal(limit=10)
+    if journal:
+        feed = Table(title="Live activity (journal)")
+        for col in ("time", "agent", "event", "detail"):
+            feed.add_column(col, overflow="fold")
+        for e in reversed(journal):
+            feed.add_row(
+                _t.strftime("%H:%M:%S", _t.localtime(e["ts"])), e["agent"],
+                e["event"], str(e["detail"])[:80],
+            )
+        console.print(feed)
+
+
+@app.command()
+def watch(
+    interval: float = typer.Option(2.0, "--interval", "-i", help="poll seconds"),
+    once: bool = typer.Option(False, "--once", help="render one frame and exit"),
+) -> None:
+    """Owner terminal view: what every agent is doing and why (offline, SQLite).
+
+    Complements `agentics dashboard` (web) for SSH / terminal-only access —
+    same shared-memory tables: live intents, claims, merge queue, backlog,
+    and the activity journal. `--once` renders a single frame for scripts."""
+    import time as _t
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    from agentics.memory.shared_memory import SharedMemory
+
+    memory = SharedMemory(settings.db_path)
+    try:
+        if once:
+            _render_watch(settings, memory, _t.time())
+            return
+        while True:
+            console.clear()
+            _render_watch(settings, memory, _t.time())
+            _t.sleep(max(0.5, interval))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        memory.close()
+
+
+# ---------------------------------------------------------------- owner MR gate
+mr_app = typer.Typer(help="Owner: local MR pipeline — list / approve / merge")
+app.add_typer(mr_app, name="mr")
+
+
+@mr_app.command("list")
+def mr_list(
+    limit: int = typer.Option(20, "--limit"),
+) -> None:
+    """Owner: review the MR pipeline (author, status, approver, task)."""
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    from agentics.memory.shared_memory import SharedMemory
+
+    memory = SharedMemory(settings.db_path)
+    try:
+        mrs = memory.recent_reviews(limit=limit)
+        if not mrs:
+            console.print("[yellow]no MRs yet — agents open them after implementing a task[/]")
+            return
+        table = Table(title=f"Local MRs ({len(mrs)})")
+        for col in ("MR#", "status", "author", "reviewer", "task", "title"):
+            table.add_column(col, overflow="fold")
+        for m in mrs:
+            table.add_row(
+                str(m["id"]), m["status"], m["author"], m.get("reviewer") or "-",
+                f"#{m['task_id']}" if m.get("task_id") else "-",
+                m["title"][:56],
+            )
+        console.print(table)
+        queue = memory.mq_pending()
+        if settings.auto_merge:
+            console.print("[dim]AUTO_MERGE=on: the Integrator agent merges approved MRs.[/]")
+        elif queue:
+            ready = [m for m in mrs if m["status"] == "approved"]
+            if ready:
+                console.print(f"[yellow]{len(ready)} approved MR(s) awaiting YOUR "
+                              "merge — `agentics mr merge <#>`[/]")
+    finally:
+        memory.close()
+
+
+@mr_app.command("approve")
+def mr_approve(
+    mr_id: int = typer.Argument(...),
+    note: str = typer.Option("", "--note", help="visible review comment"),
+) -> None:
+    """Owner: approve an MR yourself (counts as a cross-review, enqueues it)."""
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    from agentics.memory.shared_memory import SharedMemory
+
+    memory = SharedMemory(settings.db_path)
+    try:
+        review = memory.get_review(mr_id)
+        if review is None:
+            console.print(f"[red]MR #{mr_id} not found[/]")
+            raise typer.Exit(1)
+        if review.get("author") == "owner":
+            console.print("[red]owner cannot approve their own MR (P5)[/]")
+            raise typer.Exit(1)
+        memory.set_review_verdict(mr_id, "approved", "owner", note or "owner approval")
+        memory.mq_enqueue(mr_id, review["author"])
+        memory.journal("owner", "review", {
+            "mr": mr_id, "verdict": "approve", "comment": note[:200],
+            "task": review.get("task_id"),
+        })
+        console.print(f"[green]MR #{mr_id} approved by owner[/] — "
+                      "queued; merge with `agentics mr merge "
+                      f"{mr_id}` (AUTO_MERGE={settings.auto_merge})")
+    finally:
+        memory.close()
+
+
+@mr_app.command("merge")
+def mr_merge(
+    mr_id: int = typer.Argument(...),
+) -> None:
+    """Owner: merge an approved MR into local main.
+
+    Mirrors the Integrator's drain path exactly: P10 guard (the task must
+    carry the owner exemption for protected paths), tier-2 verification on
+    main+MR, then the local merge — plus every memory side effect."""
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    from agentics.github_ops.repo_workspace import RepoWorkspace
+    from agentics.memory import lifemem
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.policies.guard import ProtectedPathsGuard
+
+    memory = SharedMemory(settings.db_path)
+    try:
+        review = memory.get_review(mr_id)
+        if review is None:
+            console.print(f"[red]MR #{mr_id} not found[/]")
+            raise typer.Exit(1)
+        if review["status"] not in ("approved", "open", "changes_requested"):
+            console.print(f"[red]MR #{mr_id} is already {review['status']}[/]")
+            raise typer.Exit(1)
+        if review["status"] != "approved":
+            console.print(f"[red]MR #{mr_id} is {review['status']} — approve it "
+                          "first (`agentics mr approve`)[/]")
+            raise typer.Exit(1)
+
+        # P10: same gate the Integrator runs — `allow-protected` exempts a task.
+        violations = ProtectedPathsGuard().check_task(
+            memory, review.get("task_id"), review.get("files", []))
+        if violations:
+            console.print(f"[red]P10 protected paths in this MR: {violations[:5]}[/] "
+                          "— flag the task with `agentics allow-protected "
+                          f"{review.get('task_id')}` if this is intended")
+            raise typer.Exit(1)
+
+        workspace = RepoWorkspace("owner-cli", settings, guard=None)
+        ok, note_text = workspace.verify_merge(review["branch"])
+        if not ok:
+            console.print(f"[red]tier-2 verification failed: {note_text}[/]")
+            memory.mq_mark(mr_id, "failed")
+            memory.set_review_verdict(mr_id, "failed", "owner", note_text[:300])
+            raise typer.Exit(1)
+        merged_ok = workspace.merge_branch_to_main(
+            review["branch"],
+            f"merge MR #{mr_id} ({review['author']}, owner-approved) — "
+            f"task #{review.get('task_id')}",
+        )
+        if not merged_ok:
+            console.print("[red]merge failed (conflict with main) — MR left queued[/]")
+            memory.mq_mark(mr_id, "queued", bump_attempt=True)
+            raise typer.Exit(1)
+
+        # identical bookkeeping to LocalMergeQueue.drain's success path
+        memory.mq_mark(mr_id, "merged")
+        memory.set_review_verdict(mr_id, "merged", "owner")
+        trace_ids = memory.set_trace_outcome(mr_id, "merged")
+        memory.activate_tools(mr_id)
+        try:
+            lifemem.on_merge(memory, trace_ids)
+        except Exception:  # noqa: BLE001
+            pass
+        if review.get("task_id"):
+            memory.set_task_status(review["task_id"], "merged")
+        memory.add_decision("owner", f"merge MR #{mr_id} by {review['author']}",
+                            "owner-approved interactive merge")
+        memory.journal("owner", "merge", {
+            "mr": mr_id, "author": review["author"], "task": review.get("task_id"),
+        })
+        console.print(f"[green]MR #{mr_id} merged into local main[/] "
+                      "(task status → merged, traces + tools updated)")
+    finally:
+        memory.close()
+
+
 if __name__ == "__main__":
     app()
