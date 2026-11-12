@@ -84,3 +84,17 @@ ghi vào cả personal lẫn shared memory → kiến thức tích luỹ qua cá
 - Dừng: file `STOP` ở thư mục gốc (tạo bằng `agentics stop` hoặc `touch STOP`) →
   mọi agent kết thúc node hiện tại rồi dừng; trạng thái claim được giải phóng.
 - `SIGINT` (Ctrl+C) được chuyển thành graceful shutdown tương tự.
+
+
+## 6. Execution isolation
+
+- Each agent's test/verification command is validated by `RepoWorkspace` and sent to
+  `DockerSandboxRunner` by default.
+- The runner requires a rootless Docker daemon and a prebuilt local image
+  (`agentics-sandbox:py311`); it never pulls images or falls back to host execution.
+- Containers have no network, a read-only root filesystem, only the agent workspace
+  mounted read-write, no Linux capabilities, no-new-privileges, private IPC, and
+  bounded CPU, memory/swap, PIDs, tmpfs, file size, output and execution time.
+- Host credentials and provider cookies remain in the trusted orchestrator process.
+  The container receives only fixed non-secret runtime variables.
+- Build and operational instructions: [SANDBOX.md](SANDBOX.md).
