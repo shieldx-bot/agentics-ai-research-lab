@@ -179,9 +179,28 @@ CREATE TABLE IF NOT EXISTS evidence (
     duration_s REAL NOT NULL DEFAULT 0,
     artifact TEXT NOT NULL DEFAULT '',      -- workspace path of the check script
     note TEXT NOT NULL DEFAULT '',          -- reviewer re-verdict / context
-    verdict_by TEXT NOT NULL DEFAULT ''     -- who set/confirmed the verdict
+    verdict_by TEXT NOT NULL DEFAULT '',    -- who set/confirmed the verdict
+    hypothesis_id INTEGER,                  -- link to the pre-registered claim (P16bis)
+    metrics TEXT NOT NULL DEFAULT '{}',     -- JSON measured metrics (protocol method)
+    runs TEXT NOT NULL DEFAULT '[]'         -- JSON per-run detail (reproducibility)
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id, id);
+CREATE TABLE IF NOT EXISTS hypotheses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    task_id INTEGER,
+    finding_id INTEGER,
+    claim TEXT NOT NULL,                    -- the hypothesis statement itself
+    criterion TEXT NOT NULL DEFAULT '{}',   -- JSON {metric, op, target, tolerance}
+    protocol_path TEXT DEFAULT '',          -- workspace-relative script that tests it
+    status TEXT NOT NULL DEFAULT 'proposed',
+        -- proposed | testing | supported | refuted | inconclusive
+    verdict_note TEXT DEFAULT '',           -- machine note (measured X vs criterion)
+    evidence_id INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
 """
 
 
@@ -219,6 +238,10 @@ class SharedMemory:
                 "ALTER TABLE heartbeats ADD COLUMN task_id INTEGER",
                 "ALTER TABLE heartbeats ADD COLUMN task_title TEXT DEFAULT ''",
                 "ALTER TABLE heartbeats ADD COLUMN intent TEXT DEFAULT '{}'",
+                # P16bis: protocol metrics + pre-registered hypothesis link
+                "ALTER TABLE evidence ADD COLUMN hypothesis_id INTEGER",
+                "ALTER TABLE evidence ADD COLUMN metrics TEXT NOT NULL DEFAULT '{}'",
+                "ALTER TABLE evidence ADD COLUMN runs TEXT NOT NULL DEFAULT '[]'",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -322,11 +345,15 @@ class SharedMemory:
                 "hypothesis": r[4], "method": r[5], "cmd": r[6],
                 "exit_code": r[7], "verdict": r[8], "output": r[9],
                 "duration_s": r[10], "artifact": r[11], "note": r[12],
-                "verdict_by": r[13]}
+                "verdict_by": r[13],
+                # P16bis: protocol metrics + pre-registered hypothesis link
+                "hypothesis_id": r[14],
+                "metrics": json.loads(r[15] or "{}"),
+                "runs": json.loads(r[16] or "[]")}
 
     _EVIDENCE_COLS = ("id, ts, agent, task_id, hypothesis, method, cmd, "
                       "exit_code, verdict, output, duration_s, artifact, "
-                      "note, verdict_by")
+                      "note, verdict_by, hypothesis_id, metrics, runs")
 
     def evidence_for_task(self, task_id: int | None) -> list[dict]:
         """All evidence recorded for one task, oldest first."""
@@ -367,6 +394,126 @@ class SharedMemory:
                 "SELECT verdict, COUNT(*) FROM evidence GROUP BY verdict"
             ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------- hypotheses (P16bis)
+    def add_hypothesis(
+        self, agent: str, claim: str, criterion: dict,
+        task_id: int | None = None, finding_id: int | None = None,
+        protocol_path: str = "", status: str = "proposed",
+    ) -> int:
+        """Register a hypothesis BEFORE the protocol runs (pre-registration).
+
+        `criterion` is the structured acceptance test {"metric", "op",
+        "target"[, "tolerance"]} — the machine verdict compares the measured
+        number against it, so the goalposts cannot move after the run."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
+                "criterion, protocol_path, status) VALUES (?,?,?,?,?,?,?,?)",
+                (time.time(), agent, task_id, finding_id, claim[:500],
+                 json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
+                 status),
+            )
+            return int(cur.lastrowid or 0)
+
+    def update_hypothesis(
+        self, hyp_id: int, status: str, evidence_id: int | None = None,
+        note: str = "", protocol_path: str | None = None,
+    ) -> bool:
+        """Move the hypothesis through its lifecycle:
+        proposed -> testing -> supported | refuted | inconclusive."""
+        with self._lock, self._conn:
+            sets = ["status=?", "attempts=attempts+1"]
+            args: list = [status]
+            if evidence_id is not None:
+                sets.append("evidence_id=?")
+                args.append(evidence_id)
+            if note:
+                sets.append("verdict_note=?")
+                args.append(note[:600])
+            if protocol_path is not None:
+                sets.append("protocol_path=?")
+                args.append(protocol_path[:300])
+            args.append(hyp_id)
+            cur = self._conn.execute(
+                f"UPDATE hypotheses SET {', '.join(sets)} WHERE id=?", args)
+            return cur.rowcount > 0
+
+    def get_hypothesis(self, hyp_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, agent, task_id, finding_id, claim, criterion, "
+                "protocol_path, status, verdict_note, evidence_id, attempts "
+                "FROM hypotheses WHERE id=?", (hyp_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._hypothesis_row(row)
+
+    def list_hypotheses(self, limit: int = 50, status: str | None = None,
+                        task_id: int | None = None) -> list[dict]:
+        sql = ("SELECT id, ts, agent, task_id, finding_id, claim, criterion, "
+               "protocol_path, status, verdict_note, evidence_id, attempts "
+               "FROM hypotheses")
+        clauses, args = [], []
+        if status:
+            clauses.append("status=?")
+            args.append(status)
+        if task_id is not None:
+            clauses.append("task_id IS ?")
+            args.append(task_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
+
+    @staticmethod
+    def _hypothesis_row(r) -> dict:
+        return {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
+                "finding_id": r[4], "claim": r[5],
+                "criterion": json.loads(r[6] or "{}"),
+                "protocol_path": r[7], "status": r[8], "verdict_note": r[9],
+                "evidence_id": r[10], "attempts": r[11]}
+
+    def hypothesis_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM hypotheses GROUP BY status"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def attach_protocol_outcome(
+        self, ev_id: int, metrics: dict, runs: list,
+        hypothesis_id: int | None = None,
+    ) -> None:
+        """Attach the protocol's measured metrics / per-run detail / hypothesis
+        link onto an evidence row created via record_evidence (their insert
+        path stays untouched; this is the protocol-method enrichment)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE evidence SET metrics=?, runs=?, hypothesis_id=? WHERE id=?",
+                (json.dumps(metrics, ensure_ascii=False),
+                 json.dumps(runs, ensure_ascii=False), hypothesis_id, ev_id),
+            )
+
+    def verified_knowledge(self, limit: int = 20) -> list[dict]:
+        """The swarm's verified knowledge (H3): settled hypotheses newest first.
+
+        Injected into EVERY agent's memory context — refuted claims stop
+        being repeated, supported claims become reusable common ground."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, claim, status, verdict_note, criterion, evidence_id "
+                "FROM hypotheses WHERE status IN ('supported','refuted') "
+                "ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [{"id": r[0], "claim": r[1], "status": r[2], "note": r[3],
+                 "criterion": json.loads(r[4] or "{}"), "evidence_id": r[5]}
+                for r in rows]
+
 
     # ------------------------------------------------------------ decisions
     def add_decision(self, agent: str, decision: str, reason: str = "") -> None:
