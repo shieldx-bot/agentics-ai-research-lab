@@ -88,6 +88,8 @@ pip install -r requirements.txt
 # 1) Token GitHub (chỉ cần quyền repo) — KHÔNG commit token vào repo
 cp .env.example .env
 #    sửa .env: GITHUB_TOKEN=ghp_xxx  GITHUB_REPO=shieldx-bot/agentics-ai-research-lab
+#    LƯU Ý: agentics/config.py TỰ NẠP .env khi khởi động (không cần `source .env`
+#    hay export tay). Biến môi trường thật trong shell vẫn luôn thắng file .env.
 
 # 2) Cookie accounts — mỗi file là 1 agent thread
 #    export cookie từ trình duyệt (extension "Cookie-Editor" → Export JSON)

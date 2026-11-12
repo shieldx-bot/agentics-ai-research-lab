@@ -1,4 +1,4 @@
-"""Central configuration: env vars + configs/lab.yaml."""
+"""Central configuration: .env file + env vars + configs/lab.yaml."""
 from __future__ import annotations
 
 import os
@@ -11,11 +11,52 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+_ENV_MTIME: float | None = None
+
+
+def _load_dotenv() -> None:
+    """Load ${PROJECT_ROOT}/.env into os.environ (idempotent, mtime-cached).
+
+    Precedence: real environment variables ALWAYS win over .env values, so
+    exporting GITHUB_TOKEN=... in the shell still overrides the file.
+    Called from _env/_env_int/_env_bool so it always runs BEFORE the field
+    defaults of ``Settings`` are evaluated (dataclass default factories run
+    before ``__post_init__``).
+    """
+    global _ENV_MTIME
+    env_file = PROJECT_ROOT / ".env"
+    if not env_file.is_file():
+        return
+    try:
+        mtime = env_file.stat().st_mtime
+    except OSError:
+        return
+    if _ENV_MTIME is not None and mtime == _ENV_MTIME:
+        return
+    try:
+        from dotenv import load_dotenv  # type: ignore
+
+        load_dotenv(env_file, override=False)
+    except ImportError:
+        # Fallback: minimal KEY=VALUE parser (no dependency required).
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    _ENV_MTIME = mtime
+
+
 def _env(key: str, default: str = "") -> str:
+    _load_dotenv()
     return os.environ.get(key, default)
 
 
 def _env_int(key: str, default: int) -> int:
+    _load_dotenv()
     try:
         return int(os.environ.get(key, default))
     except (TypeError, ValueError):
@@ -23,6 +64,7 @@ def _env_int(key: str, default: int) -> int:
 
 
 def _env_bool(key: str, default: bool) -> bool:
+    _load_dotenv()
     raw = os.environ.get(key)
     if raw is None:
         return default
