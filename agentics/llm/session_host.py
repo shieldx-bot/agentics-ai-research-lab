@@ -168,9 +168,30 @@ class BrowserSessionHost:
         try:
             resp = await client.ask(query, mode=mode, system=system, purpose=purpose)
         except Exception as exc:
+            # Browser challenge/frontend failures affect the provider, not
+            # the cookie identity. The Hyperbrowser circuit breaker prevents
+            # every agent from rotating through accounts against the same
+            # unavailable page. Only account-specific auth failures cool an
+            # individual account.
+            try:
+                from agentics.llm.hyperbrowser_client import (
+                    HyperbrowserBackendUnavailable,
+                    HyperbrowserUIError,
+                )
+                provider_outage = isinstance(
+                    exc, (HyperbrowserBackendUnavailable, HyperbrowserUIError)
+                )
+            except ImportError:  # pragma: no cover - optional backend
+                provider_outage = False
             acc = getattr(client, "account", None)
-            if acc is not None:
+            if acc is not None and not provider_outage:
                 self._pool(provider).mark_failed(acc, str(exc)[:200])
+            elif provider_outage:
+                log.warning(
+                    "provider %s temporarily unavailable; account %s was not "
+                    "cooled down: %s",
+                    provider, getattr(acc, "name", "unknown"), str(exc)[:200],
+                )
             raise
         acc = getattr(client, "account", None)
         if acc is not None:
