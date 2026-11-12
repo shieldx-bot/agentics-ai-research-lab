@@ -1,4 +1,9 @@
-"""Local git workspace per agent — clone once, sync per cycle, push to own branch."""
+"""Local git workspace per agent — clone once, sync per cycle, push to own branch.
+
+Local-only mode: "origin" is the shared bare repo at data/lab.git (seeded from
+this checkout by the orchestrator) — no credentials, no network. All git ops
+via subprocess so credentials never enter the repo config.
+"""
 from __future__ import annotations
 
 import base64
@@ -11,6 +16,7 @@ import sys
 from pathlib import Path
 
 from agentics.config import Settings
+from agentics.policies.guard import ProtectedPathsGuard
 
 log = logging.getLogger("gh.workspace")
 
@@ -19,15 +25,18 @@ class RepoWorkspace:
     """A local clone owned by exactly one agent. All git ops via subprocess so
     credentials never enter the repo config."""
 
-    def __init__(self, agent_id: str, settings: Settings) -> None:
+    def __init__(
+        self, agent_id: str, settings: Settings,
+        guard: ProtectedPathsGuard | None = None,
+    ) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id):
             raise ValueError("agent_id must be a simple 1-64 character identifier")
         self.agent_id = agent_id
         self.settings = settings
+        self.guard = guard
         self.path = settings.workspaces_dir / agent_id
-        # Keep credentials out of the remote URL and .git/config. Git receives
-        # the authorization header through a child-process environment variable.
-        self._remote = f"https://github.com/{settings.github_repo}.git"
+        # Local-only mode: origin is the on-disk bare repo. No token, no network.
+        self._remote = str(settings.local_repo_path)
 
     # ------------------------------------------------------------ plumbing
     def _git_env(self) -> dict[str, str]:
@@ -64,13 +73,12 @@ class RepoWorkspace:
 
     def ensure_cloned(self) -> None:
         if (self.path / ".git").exists():
-            # Repair legacy clones that may have stored credentials in origin.
             self._git("remote", "set-url", "origin", self._remote)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        log.info("[%s] cloning repo…", self.agent_id)
+        log.info("[%s] cloning workspace from %s", self.agent_id, self._remote)
         subprocess.run(
-            ["git", "clone", "--filter=blob:none", self._remote, str(self.path)],
+            ["git", "clone", str(self._remote), str(self.path)],
             check=True, capture_output=True, text=True, env=self._git_env(),
         )
         self._git("config", "user.name", f"agentics[{self.agent_id}]")
@@ -100,6 +108,13 @@ class RepoWorkspace:
         return target
 
     def write_file(self, rel_path: str, content: str) -> None:
+        # P10 layer 1: the lab's own code cannot even be written into a
+        # workspace (regardless of what the plan says).
+        if self.guard is not None and self.guard.is_protected(rel_path):
+            raise ValueError(
+                f"P10 protected path: '{rel_path}' is lab code — agents must "
+                "not modify it (owner can exempt a task: agentics.cli allow-protected)"
+            )
         target = self._resolve_workspace_path(rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         # Re-resolve after mkdir to catch a symlink introduced in a parent path.
@@ -221,6 +236,35 @@ class RepoWorkspace:
             raise RuntimeError(f"push failed: {push.stderr[:400]}")
         log.info("[%s] pushed branch %s", self.agent_id, branch)
         return True
+
+    def merge_branch_to_main(self, branch: str, message: str) -> bool:
+        """Local replacement for GitHub's rebase-merge (P4, Integrator only).
+
+        Merges origin/<branch> into a throw-away branch based on origin/main,
+        then pushes that as a fast-forward of main on the shared bare repo.
+        Returns False when the merge is not possible (conflict)."""
+        self.sync_main()
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "merge/tmp", "origin/main")
+            merge = self._git("merge", "--no-edit", "--no-ff", f"origin/{branch}",
+                              "-m", message, check=False)
+            if merge.returncode != 0:
+                self._git("merge", "--abort", check=False)
+                return False
+            push = self._git("push", "origin", "merge/tmp:main", check=False)
+            if push.returncode != 0:
+                # someone moved main between fetch and push -> not a fast-forward
+                log.warning("[%s] push merge/tmp:main failed: %s",
+                            self.agent_id, push.stderr[:200])
+                return False
+            return True
+        except RuntimeError as exc:
+            log.warning("[%s] local merge failed: %s", self.agent_id, exc)
+            return False
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "merge/tmp", check=False)
 
     def diff_files_vs_main(self) -> list[str]:
         proc = self._git("diff", "--name-only", "origin/main...HEAD", check=False)

@@ -94,13 +94,15 @@ def test_reflect_releases_claim_when_cycle_finishes_without_pr():
             release=lambda *args: released.append(args),
         ),
         meta={"personal": SimpleNamespace(add_lesson=lambda *args: None)},
-        memory=SimpleNamespace(add_decision=lambda *args: None),
+        memory=SimpleNamespace(add_decision=lambda *args: None,
+                               journal=lambda *args, **kwargs: None),
         heartbeat=lambda status: None,
+        report=lambda **kw: None,
     )
 
     node_reflect(ctx, {"issue_number": 23, "summary": "planning failed"})
 
-    assert released == [(23, "agent-a", "cycle ended without a PR")]
+    assert released == [(23, "agent-a", "cycle ended without an MR")]
 
 
 def test_reflect_does_not_release_completed_pr_claim():
@@ -111,11 +113,13 @@ def test_reflect_does_not_release_completed_pr_claim():
         cycle=4,
         claims=SimpleNamespace(release=lambda *args: released.append(args)),
         meta={"personal": SimpleNamespace(add_lesson=lambda *args: None)},
-        memory=SimpleNamespace(add_decision=lambda *args: None),
+        memory=SimpleNamespace(add_decision=lambda *args: None,
+                               journal=lambda *args, **kwargs: None),
         heartbeat=lambda status: None,
+        report=lambda **kw: None,
     )
 
-    node_reflect(ctx, {"issue_number": 24, "pr_number": 8, "summary": "PR opened"})
+    node_reflect(ctx, {"issue_number": 24, "pr_number": 8, "summary": "MR opened"})
 
     assert released == []
 

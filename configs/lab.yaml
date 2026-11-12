@@ -26,12 +26,27 @@ role_map:
   # 10: auto
 
 # --- Ownership matrix (P3 in docs/POLICIES.md) -----------------------------
+# Writable research surface per role. The lab's own code (agentics/, configs/,
+# accounts/, scripts/, .github/) is OUT OF BOUNDS for every role — see
+# protected_paths below (P10).
 ownership:
-  coder:    ["agentics/", "tests/", "scripts/"]
+  coder:    ["experiments/", "tests/", "benchmarks/"]
   researcher: ["research_notes/"]
   writer:   ["docs/", "README.md", "README*"]
-  integrator: [".github/"]
-  supervisor: ["configs/"]
+  integrator: ["reports/"]
+  supervisor: []
+
+# --- P10 protected paths (anti "AI sửa nhầm code agent") --------------------
+# Hard-blocked for ALL agents at write time, diff time and merge time.
+# Owner exception per task: python -m agentics.cli allow-protected <task_id>
+# Run-wide emergency switch: ALLOW_PROTECTED_PATHS=1 (still blocks accounts/
+# and configs/secrets.yaml — credentials are never writable).
+protected_paths:
+  - agentics/
+  - configs/
+  - accounts/
+  - scripts/
+  - .github/
 
 # --- Perplexity ------------------------------------------------------------
 pplx_timeout: 180

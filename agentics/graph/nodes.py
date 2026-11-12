@@ -1,7 +1,9 @@
 """Graph nodes — each node is a step of one agent's research cycle.
 
-GitHub/Git/SQLite operations are synchronous and run in LangGraph's executor.
-LLM and paper-search nodes are async and await their providers directly.
+Local-only mode: tasks/reviews/claims live in shared memory, git lives in the
+shared bare repo (data/lab.git) — this module performs ZERO network calls.
+Sync Git/SQLite operations run in LangGraph's executor; LLM and paper-search
+nodes are async and await their providers directly.
 """
 from __future__ import annotations
 
@@ -18,8 +20,8 @@ from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS, build_evolution_issue, tool_context, trace_context,
     evolution_path_allowed, valid_tool_name,
 )
+from agentics.local_ops import branch_name
 from agentics.memory import lifemem
-from agentics.github_ops import branch_ops, issue_ops, pr_ops
 from agentics.memory.vector_store import VectorStore
 from agentics.research import citations as cite_fmt
 from agentics.research import papers as papers_mod
@@ -86,91 +88,113 @@ def node_start(ctx: AgentContext, state: ResearchState) -> ResearchState:
         Role.REVIEWER: "review",
         Role.INTEGRATOR: "integrate",
     }.get(ctx.role, "idle")
+    ctx.report(
+        node="start", status="working",
+        intent={"goal": f"{out['action']} cycle as {ctx.role.value}", "steps": []},
+    )
     return out
 
 
 def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Supervisor: sweep stale claims, broadcast backlog status."""
+    """Supervisor: sweep stale claims, keep the local backlog fed."""
     state["action"] = "scan"
     freed = ctx.claims.sweep_stale()
-    issues = issue_ops.scan_open_issues(ctx.gh.repo)
+    tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
             ctx.agent_id, "alert",
             f"Freed {len(freed)} stale claim(s): {freed}"
         )
+    topped_up = 0
+    tasks_src = getattr(getattr(ctx, "local", None), "tasks", None)
+    if not tasks and tasks_src is not None:
+        topped_up = tasks_src.supervisor_top_up()
+        tasks = ctx.memory.scan_open_tasks(limit=30)
     summary = (
-        f"Backlog scan: {len(issues)} open unclaimed issue(s). "
-        + (f"Stale claims freed: {freed}." if freed else "")
+        f"Backlog scan: {len(tasks)} open unclaimed task(s)."
+        + (f" Stale claims freed: {freed}." if freed else "")
+        + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     state["summary"] = summary
-    _maybe_open_evolution_issue(ctx, state)
+    _maybe_open_evolution_task(ctx, state)
     state["done"] = True
     return state
 
 
-def _maybe_open_evolution_issue(ctx: AgentContext, state: ResearchState) -> None:
-    """Every N supervisor cycles, open ONE evidence-based self-evolution issue.
-    It is worked like any other issue (claim -> PR -> cross-review -> merge)."""
+def _maybe_open_evolution_task(ctx: AgentContext, state: ResearchState) -> None:
+    """Every N supervisor cycles, open ONE evidence-based self-evolution task.
+
+    In local mode a self-evolution task may only touch agent code when the
+    OWNER explicitly grants a protected-paths exemption
+    (`agentics.cli allow-protected <task_id>`) — the guard (P10) enforces it
+    at write time, at diff time and again before the merge."""
     n = int(getattr(ctx.settings, "evolution_every_n_cycles", 0) or 0)
     if n <= 0 or ctx.cycle % n != 0:
         return
     if not ctx.memory.recent_traces(limit=1, failures_only=True):
         return                      # no failure evidence yet → nothing to evolve from
     title, body = build_evolution_issue(ctx.memory)
-    try:
-        issue = issue_ops.create_issue_if_absent(
-            ctx.gh.repo, title, body, labels=["kind/evolution"])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not open self-evolution issue: %s", exc)
-        return
-    if issue is not None:
-        ctx.memory.add_decision(ctx.agent_id, f"open self-evolution issue #{issue.number}",
-                                "periodic GEA-style prompt refinement")
-        state["summary"] += f" Opened self-evolution issue #{issue.number}."
+    task_id = ctx.memory.create_task_if_absent(
+        title, body=body, category="evolution", labels="kind/evolution",
+        agent=ctx.agent_id,
+    )
+    if task_id is not None:
+        ctx.memory.add_decision(
+            ctx.agent_id, f"open self-evolution task #{task_id}",
+            "periodic GEA-style prompt refinement (needs owner exemption to touch code)")
+        state["summary"] += f" Opened self-evolution task #{task_id}."
 
 
 def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Coder/Writer: claim an issue (P1), ranked by Performance–Novelty.
+    """Coder/Writer: claim a task (P1), ranked by Performance–Novelty.
 
-    Replaces "oldest first": each issue is scored with this agent's own merge
+    Replaces "oldest first": each task is scored with this agent's own merge
     history (see agentics/evolution/scoring.py); ties fall back to oldest-first.
-    Only the Coder may take self-evolution issues.
+    Only the Coder may take self-evolution tasks.
     """
-    issues = issue_ops.scan_open_issues(ctx.gh.repo)
+    tasks = ctx.memory.scan_open_tasks(limit=30)
     infos = [
         IssueInfo(
-            number=i.number, title=i.title, body=(i.body or "")[:800],
-            labels=tuple(lb.name for lb in i.labels),
-            created_ts=i.created_at.timestamp() if i.created_at else 0.0,
+            number=t["id"], title=t["title"], body=(t["body"] or "")[:800],
+            labels=tuple(t["labels"].split(",")) if t.get("labels") else (),
+            created_ts=t["ts"],
         )
-        for i in issues
+        for t in tasks
     ]
     if ctx.role != Role.CODER:
         infos = [i for i in infos if i.category != "evolution"]
     if not infos:
-        state["summary"] = "no unclaimed issues; resting this cycle"
+        state["summary"] = "no unclaimed tasks; resting this cycle"
         state["done"] = True
         return state
-    by_number = {i.number: i for i in issues}
+    by_id = {i.number: i for i in infos}
     profile = build_profile(ctx.memory.agent_outcomes().get(ctx.agent_id, []))
     for info, score in rank_issues(infos, profile)[:3]:      # lost race → next best
-        issue = by_number[info.number]
-        branch = branch_ops.branch_name(ctx.agent_id, issue.number, issue.title)
-        if not ctx.claims.try_claim(issue.number, ctx.agent_id, branch):
+        task = next(t for t in tasks if t["id"] == info.number)
+        branch = branch_name(ctx.agent_id, task["id"], task["title"])
+        if not ctx.claims.try_claim(task["id"], ctx.agent_id, branch):
             continue
-        state["issue_number"] = issue.number
-        state["issue_title"] = issue.title
-        state["issue_body"] = (issue.body or "")[:4000]
+        state["issue_number"] = task["id"]
+        state["issue_title"] = task["title"]
+        state["issue_body"] = (task["body"] or "")[:4000]
         state["branch"] = branch
         state["category"] = info.category
+        state["task_exempt"] = bool(task.get("exempt"))
         state["action"] = "research"
         ctx.memory.add_decision(
-            ctx.agent_id, f"claim #{issue.number}",
+            ctx.agent_id, f"claim task #{task['id']}",
             f"category={info.category} score={score:.2f} (alpha*sqrt(nov)*priority)")
+        ctx.report(
+            node="claim", task_id=task["id"], task_title=task["title"],
+            intent={
+                "goal": f"Complete task #{task['id']}: {task['title']}",
+                "why": f"category={info.category} score={score:.2f}",
+                "steps": [], "expected_files": [],
+            },
+        )
         return state
-    state["summary"] = "lost race for top-ranked issues; retry next cycle"
+    state["summary"] = "lost race for top-ranked tasks; retry next cycle"
     state["done"] = True
     return state
 
@@ -271,6 +295,15 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     state["reuses"] = reuses
     for name in reuses:
         ctx.memory.bump_tool_use(name)      # no-op if the name is not registered
+    ctx.report(
+        node="plan",
+        intent={
+            "goal": f"Implement task #{state.get('issue_number')}: {state.get('issue_title', '')}",
+            "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
+            "expected_files": [f.get("path", "") for f in (parsed.get("files") or [])][:15],
+            "why": f"category={state.get('category', 'other')}",
+        },
+    )
     return state
 
 
@@ -300,10 +333,9 @@ def _tier1(ctx: AgentContext, changed: list[str]) -> tuple[bool, str]:
 
 
 async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Coder: create branch, write code from plan, run tests, push (P2/P3)."""
+    """Coder: write code from plan into a local branch, run tests, push (P2/P3/P10)."""
     branch = state["branch"]
     await asyncio.to_thread(ctx.workspace.sync_main)
-    await asyncio.to_thread(branch_ops.create_branch, ctx.gh.repo, branch)
     await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
     plan = json.loads(state.get("plan") or "{}")
@@ -314,7 +346,7 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             if change == "edit" else ""
         )
         prompt = (
-            f"Issue: {state.get('issue_title')}\nPlan step for this file:\n"
+            f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
@@ -322,12 +354,31 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="implement")
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
-            await asyncio.to_thread(ctx.workspace.write_file, path, content)
+            try:
+                await asyncio.to_thread(ctx.workspace.write_file, path, content)
+            except ValueError as exc:      # P10 layer 1: protected path / traversal
+                return await _yield(ctx, state, str(exc))
+
+    ctx.report(node="implement", status="verifying",
+               intent={"goal": f"Verify and push branch {branch}", "steps": []})
 
     # NOTE: must be the working-tree status — `diff_files_vs_main()` compares
     # commits and is empty before the commit, which silently disabled P3.
     changed = await asyncio.to_thread(ctx.workspace.changed_files)
     state["changed_files"] = changed
+
+    # P10 layer 2: a diff that touches the lab's own code is refused here —
+    # an exemption comes from the task row (owner-granted), never from the agent.
+    guard = getattr(getattr(ctx, "local", None), "guard", None)
+    if guard is not None:
+        violations = guard.check_task(
+            ctx.memory, state.get("issue_number"), changed)
+        if violations:
+            return await _yield(
+                ctx, state,
+                f"P10 protected paths in diff: {violations[:5]} "
+                "(agent code is owner-only; the owner can exempt a task)",
+            )
 
     # Guard: self-evolution PRs may only touch the allow-listed paths.
     if state.get("category") == "evolution":
@@ -398,62 +449,74 @@ def _register_tools(ctx: AgentContext, state: ResearchState, pr_number: int) -> 
 
 
 def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    repo = ctx.gh.repo
-    pr = pr_ops.open_pr(
-        repo,
+    """Open a local MR (merge request) — the reviews table replaces GitHub PRs."""
+    mr_id = ctx.memory.open_review(
+        task_id=state.get("issue_number"),
         title=f"[{ctx.agent_id}] {state.get('issue_title', 'work')} (#{state['issue_number']})",
-        head=state["branch"],
-        base=repo.default_branch,
         body=(
-            f"Closes #{state['issue_number']}\n\n"
+            f"Closes task #{state['issue_number']}\n\n"
             f"Authored by agent `{ctx.agent_id}` (role: {ctx.role.value}).\n\n"
             f"## Verification\n{state.get('verification', '(not run)')}\n"
-            "Tier 2 (full tests on main+PR) runs in the Integrator before merge.\n\n"
+            "Tier 2 (full tests on main+MR) runs in the Integrator before merge.\n\n"
             f"## Changed files\n" + "\n".join(f"- {f}" for f in state.get("changed_files", []))
         ),
-        author_agent=ctx.agent_id,
+        author=ctx.agent_id,
+        branch=state["branch"],
+        files=list(state.get("changed_files", [])),
+        verification=state.get("verification", ""),
     )
-    state["pr_number"] = pr.number
-    state["pr_url"] = pr.html_url
-    # The issue is now handed off to the PR lifecycle; mark the lease complete
+    state["pr_number"] = mr_id
+    state["pr_url"] = f"local://mr/{mr_id}"
+    # The task is now handed off to the MR lifecycle; mark the lease complete
     # before any non-critical memory/notification work can fail.
     ctx.claims.complete(state["issue_number"], ctx.agent_id, state["branch"])
-    _register_tools(ctx, state, pr.number)
+    _register_tools(ctx, state, mr_id)
     ctx.memory.post_message(
         ctx.agent_id, "handoff",
-        f"PR #{pr.number} ready for cross-review: {pr.html_url}",
+        f"MR #{mr_id} ready for cross-review (branch {state['branch']})",
         state["issue_number"],
     )
+    ctx.memory.journal(ctx.agent_id, "open_mr", {
+        "mr": mr_id, "task": state.get("issue_number"),
+        "branch": state["branch"], "files": state.get("changed_files", [])[:20],
+    })
+    ctx.report(node="open_mr", status="handoff",
+               task_id=state.get("issue_number"),
+               intent={"goal": f"MR #{mr_id} awaiting cross-review", "steps": []})
     state["done"] = True
-    state["summary"] = f"opened PR #{pr.number}"
+    state["summary"] = f"opened MR #{mr_id}"
     return state
 
 
 async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Reviewer: pick an open PR not authored by me, review it (P5)."""
-    repo = ctx.gh.repo
+    """Reviewer: pick an open MR not authored by me, review it (P5).
+
+    P10 layer 3: an MR whose diff touches protected paths can never be
+    approved, no matter what the reviewing LLM says."""
     candidate = None
-    pulls = await asyncio.to_thread(lambda: list(repo.get_pulls(state="open")))
-    for pr in pulls:
-        if pr.user and pr.user.login == "shieldx-bot" and f"[{ctx.agent_id}]" in pr.title:
-            continue  # never review own PR
-        labels = {lb.name for lb in await asyncio.to_thread(lambda: list(pr.get_labels()))}
-        if "reviewed" in labels:
-            continue
-        candidate = pr
+    for mr in ctx.memory.open_reviews():
+        if mr["author"] == ctx.agent_id:
+            continue  # never review own MR
+        if mr["status"] != "open":
+            continue  # changes_requested awaits author rework, not re-review
+        candidate = mr
         break
     if candidate is None:
-        state["summary"] = "no PR awaiting review"
+        state["summary"] = "no MR awaiting review"
         state["done"] = True
         return state
-
-    diff = await asyncio.to_thread(lambda: list(candidate.get_files()))
-    files_desc = "\n".join(
-        f"- {f.filename} (+{f.additions}/-{f.deletions})" for f in diff[:30]
+    mr_id = candidate["id"]
+    ctx.report(
+        node="review",
+        intent={"goal": f"Cross-review MR #{mr_id} by {candidate['author']}",
+                "why": "P5: no self-approval", "steps": []},
     )
+
+    files_desc = "\n".join(f"- {f}" for f in candidate.get("files", [])[:30])
     prompt = (
-        f"Review PR #{candidate.number}: {candidate.title}\n{candidate.body or ''}\n\n"
+        f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
         f"Files:\n{files_desc}\n\n"
+        f"Verification recorded by the author: {candidate.get('verification') or '(none)'}\n\n"
         'Reply ONLY JSON: {"verdict": "approve|request_changes", '
         '"comment": "..."}'
     )
@@ -462,47 +525,69 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")
 
-    pr_to_review = await asyncio.to_thread(ctx.gh.repo.get_pull, candidate.number)
+    # P10 layer 3: protected paths never reach main via any MR.
+    guard = getattr(getattr(ctx, "local", None), "guard", None)
+    if guard is not None and verdict == "approve":
+        violations = guard.check_task(ctx.memory, candidate.get("task_id"),
+                                      candidate.get("files", []))
+        if violations:
+            verdict = "request_changes"
+            comment = (f"P10 protected paths in diff: {violations[:5]} "
+                       "— cannot be approved (owner-only code)")
+
     if verdict == "approve":
-        # Shared-PAT mode: GitHub rejects self-APPROVE; approve_review falls
-        # back to COMMENT + `approved-by/<agent>` label and returns the event.
         await asyncio.to_thread(
-            pr_ops.approve_review, pr_to_review, comment, ctx.agent_id
+            ctx.memory.set_review_verdict, mr_id, "approved", ctx.agent_id, comment
         )
-        author = candidate.title.split("]")[0].lstrip("[") or "agent"
-        await asyncio.to_thread(ctx.merge_queue.enqueue, candidate.number, author=author)
-        await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "approved")
+        await asyncio.to_thread(ctx.merge_queue.enqueue, mr_id,
+                                author=candidate["author"])
+        await asyncio.to_thread(ctx.memory.set_trace_outcome, mr_id, "approved")
         state["review_verdict"] = "approve"
     else:
         await asyncio.to_thread(
-            pr_to_review.create_issue_comment,
-            f"Review ({ctx.agent_id}): {comment}",
+            ctx.memory.set_review_verdict, mr_id, "changes_requested",
+            ctx.agent_id, comment,
         )
         # the reviewer's reason becomes a failure trace every agent can learn from
-        await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "rejected", comment)
-        await asyncio.to_thread(ctx.memory.drop_tools, candidate.number)
+        await asyncio.to_thread(ctx.memory.set_trace_outcome, mr_id, "rejected", comment)
+        await asyncio.to_thread(ctx.memory.drop_tools, mr_id)
         state["review_verdict"] = "request_changes"
-    try:                                   # without this the same PR is re-reviewed every cycle
-        await asyncio.to_thread(candidate.add_to_labels, "reviewed")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not label PR #%s reviewed: %s", candidate.number, exc)
+    ctx.memory.post_message(
+        ctx.agent_id, "broadcast",
+        f"Review of MR #{mr_id}: {verdict} — {comment[:200]}",
+        candidate.get("task_id"),
+    )
+    ctx.memory.journal(ctx.agent_id, "review", {
+        "mr": mr_id, "verdict": verdict, "comment": comment[:300],
+        "task": candidate.get("task_id"),
+    })
     state["review_comment"] = comment
-    state["summary"] = f"reviewed PR #{candidate.number}: {verdict}"
+    state["summary"] = f"reviewed MR #{mr_id}: {verdict}"
     state["done"] = True
     return state
 
 
 def node_integrate(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Integrator: drain the merge queue serially (P4)."""
-    def _verify(pr_number: int) -> tuple[bool, str]:
-        try:
-            head = ctx.gh.repo.get_pull(pr_number).head.ref
-        except Exception as exc:  # noqa: BLE001
-            return False, f"cannot read PR head: {exc}"
-        return ctx.workspace.verify_merge(head)
+    """Integrator: drain the merge queue serially (P4) — local merges only."""
+    def _verify(mr_id: int) -> tuple[bool, str]:
+        review = ctx.memory.get_review(mr_id)
+        if review is None:
+            return False, f"MR #{mr_id} not found"
+        return ctx.workspace.verify_merge(review["branch"])
 
-    merged = ctx.merge_queue.drain(ctx.agent_id, verify=_verify)
-    state["summary"] = f"merged {merged} PR(s)"
+    def _merge(mr_id: int) -> bool:
+        review = ctx.memory.get_review(mr_id)
+        if review is None:
+            return False
+        return ctx.workspace.merge_branch_to_main(
+            review["branch"],
+            f"merge MR #{mr_id} ({review['author']}) — task #{review.get('task_id')}",
+        )
+
+    ctx.report(node="integrate",
+               intent={"goal": "Drain the merge queue (serial, tier-2 first)", "steps": []})
+    merged = ctx.merge_queue.drain(ctx.agent_id, verify=_verify, merge=_merge)
+    state["summary"] = f"merged {merged} MR(s)"
     state["done"] = True
     return state
 
@@ -536,18 +621,24 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
         lesson_bits.append(state["summary"])
     if state.get("error"):
         lesson_bits.append(f"error: {state['error']}")
+    if state.get("yield_reason"):
+        lesson_bits.append(f"yielded: {state['yield_reason']}")
     lesson = "; ".join(lesson_bits) or "cycle completed"
-    # Any claimed issue that did not reach PR creation must be unlocked, including
+    # Any claimed task that did not reach MR creation must be unlocked, including
     # early exits (no LLM, duplicate research, invalid plan, failed tests).
     issue_number = state.get("issue_number")
     if issue_number and not state.get("pr_number"):
         try:
-            ctx.claims.release(issue_number, ctx.agent_id, "cycle ended without a PR")
+            ctx.claims.release(issue_number, ctx.agent_id, "cycle ended without an MR")
         except Exception as exc:  # noqa: BLE001
             log.warning("could not release claim #%s for %s: %s",
                         issue_number, ctx.agent_id, exc)
     ctx.meta["personal"].add_lesson(lesson, issue_number)
     ctx.memory.add_decision(ctx.agent_id, f"cycle {ctx.cycle} done", lesson[:200])
+    ctx.memory.journal(ctx.agent_id, "cycle_done", {
+        "cycle": ctx.cycle, "summary": lesson[:300],
+        "outcome": _trace_outcome(state),
+    })
     if state.get("issue_number") and ctx.role in (Role.CODER, Role.WRITER):
         trace_id = ctx.memory.add_trace(
             ctx.agent_id, ctx.role.value, ctx.cycle, _trace_outcome(state),
@@ -565,6 +656,8 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 _plan_digest(state))
         except Exception as exc:  # noqa: BLE001 — memory hiccups must not kill a cycle
             log.warning("could not cluster trace #%s: %s", trace_id, exc)
+    ctx.report(node="reflect", status="cycle-end",
+               intent={"goal": "cycle complete", "steps": []})
     ctx.heartbeat("cycle-end")
     state["done"] = True
     return state

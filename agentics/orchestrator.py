@@ -2,6 +2,9 @@
 
 Each task = one agent thread = one LLM identity, running its LangGraph
 research cycle forever (or until the owner's STOP file appears).
+
+Local-only mode: everything runs on this machine — tasks/reviews in SQLite,
+git in a shared bare repo at data/lab.git, zero GitHub calls.
 """
 from __future__ import annotations
 
@@ -12,14 +15,12 @@ import random
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, assign_roles
 from agentics.config import Settings, load_yaml_overrides, PROJECT_ROOT
-from agentics.github_ops.client import GitHubClient
 from agentics.github_ops.repo_workspace import RepoWorkspace
 from agentics.llm.session_host import BrowserSessionHost
+from agentics.local_ops import LocalClaimPolicy, LocalMergeQueue, LocalOps
 from agentics.memory.personal_memory import PersonalMemory
 from agentics.memory.shared_memory import SharedMemory
 from agentics.memory.vector_store import VectorStore
-from agentics.policies.claims import ClaimPolicy
-from agentics.policies.merge_queue import MergeQueue
 from agentics.policies.ownership import OwnershipPolicy
 from agentics.graph.research_graph import run_cycle
 from agentics.stop import should_stop
@@ -69,7 +70,8 @@ class Orchestrator:
         self.memory = SharedMemory(self.settings.db_path)
         self.vector = VectorStore(self.settings.chroma_path)
         self.host = BrowserSessionHost.from_settings(self.settings)
-        self.gh = GitHubClient(self.settings)
+        self.local = LocalOps(self.memory, self.settings)
+        self.local.setup()          # seed data/lab.git + the starter backlog
         self.ownership = OwnershipPolicy.from_config(None)
         self.agents: list[AgentContext] = []
 
@@ -97,25 +99,30 @@ class Orchestrator:
                 agent_id=agent_id,
                 role=roles[i],
                 settings=self.settings,
-                gh=self.gh,
                 memory=self.memory,
                 vector=self.vector,
                 llm=pinned,
-                workspace=RepoWorkspace(agent_id, self.settings),
-                claims=ClaimPolicy(self.gh, self.memory, self.settings.claim_ttl_minutes),
+                workspace=RepoWorkspace(agent_id, self.settings, guard=self.local.guard),
                 ownership=self.ownership,
-                merge_queue=MergeQueue(self.gh, self.memory, self.settings.auto_merge),
+                local=self.local,
+                claims=LocalClaimPolicy(self.memory, self.settings.claim_ttl_minutes),
+                merge_queue=LocalMergeQueue(
+                    self.memory, self.settings.auto_merge, guard=self.local.guard),
                 meta={"account": getattr(first, "name", "shared"), "personal": personal},
             )
             contexts.append(ctx)
         self.agents = contexts
-        # announce roles once so agents "know each other"
+        # announce roles once so agents "know each other" — and so the owner
+        # can see who is who from second zero (dashboard / journal)
         for ctx in contexts:
             self.memory.post_message(
                 "orchestrator", "broadcast",
                 f"{ctx.agent_id} started as {ctx.role.value} "
                 f"(account: {ctx.meta['account']})"
             )
+            self.memory.journal(ctx.agent_id, "startup", {
+                "role": ctx.role.value, "account": ctx.meta["account"],
+            })
         return contexts
 
     # ------------------------------------------------------------ runtime
@@ -233,13 +240,17 @@ class Orchestrator:
     def status(self) -> str:
         lines = ["== agents =="]
         for a in self.memory.active_agents(stale_after_s=86400):
+            task = f" task #{a['task_id']}: {a['task_title'][:40]}" if a.get("task_id") else ""
             lines.append(
                 f"{a['agent']:<6} role={a['role']:<12} cycle={a['cycle']:<4} "
-                f"status={a['status']}"
+                f"status={a['status']:<12} node={a['node'] or '-':<10}{task}"
             )
+        lines.append("== tasks ==")
+        counts = self.memory.task_counts()
+        lines.append("counts: " + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"))
+        lines.append("== claims ==")
+        for task_id, c in self.memory.active_claims().items():
+            lines.append(f"task #{task_id} -> {c.agent} (branch {c.branch})")
         lines.append("== accounts ==")
         lines.extend(self.host.status_lines())
-        lines.append("== claims ==")
-        for issue_no, c in self.memory.active_claims().items():
-            lines.append(f"issue #{issue_no} -> {c.agent} (branch {c.branch})")
         return "\n".join(lines) or "(no data yet)"

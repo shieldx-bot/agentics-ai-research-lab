@@ -109,6 +109,14 @@ class Settings:
     # Paths
     data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
     accounts_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "accounts")
+    # P10 — the lab's own code that agents must never modify. Owner can extend
+    # via configs/lab.yaml (protected_paths:) or ALLOW_PROTECTED_PATHS=1 env
+    # to grant a run-wide override (see agentics/policies/guard.py).
+    protected_paths: list[str] = field(default_factory=lambda: [
+        p for p in _env("PROTECTED_PATHS",
+                        "agentics/,configs/,accounts/,scripts/,.github/").split(",")
+        if p.strip()
+    ])
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(
@@ -154,6 +162,15 @@ class Settings:
     @property
     def workspaces_dir(self) -> Path:
         return self.data_dir / "workspaces"
+
+    @property
+    def local_repo_path(self) -> Path:
+        """The bare repo that plays the role of "origin" in local-only mode."""
+        return self.data_dir / "lab.git"
+
+    @property
+    def dashboard_port(self) -> int:
+        return _env_int("DASHBOARD_PORT", 8080)
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.chroma_path, self.workspaces_dir):

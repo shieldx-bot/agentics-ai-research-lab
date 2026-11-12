@@ -1,4 +1,8 @@
-"""Agentics CLI — run / stop / status / metrics / test-llm / assign-roles."""
+"""Agentics CLI — run / stop / status / dashboard / task / test-llm.
+
+Local-only mode: the lab runs entirely on this machine — no GITHUB_TOKEN
+needed, nothing leaves the box except the LLM provider traffic.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -38,7 +42,10 @@ def run(
     install_signal_handlers(loop)
     console.print(f"[bold green]Agentics v{__version__}[/] — {len(orch.host)} browser-session "
                   f"identities (perplexity: {len(orch.host.pools['perplexity'])}, "
-                  f"qwen: {len(orch.host.pools['qwen'])}), repo {settings.github_repo}")
+                  f"qwen: {len(orch.host.pools['qwen'])}) — [bold]local-only mode[/] "
+                  f"(origin: {settings.local_repo_path})")
+    console.print("Owner visibility: [bold]python -m agentics.cli dashboard[/] "
+                  "→ http://127.0.0.1:8080")
     if should_stop():
         from agentics.stop import clear_stop
         clear_stop()
@@ -61,36 +68,119 @@ def stop() -> None:
 
 @app.command()
 def status() -> None:
-    """Show agents, accounts, claims from local memory (works offline)."""
+    """Show agents (node + intent), tasks, claims from local memory (works offline)."""
     settings = _settings()
     setup_logging("ERROR")
-    from agentics.orchestrator import Orchestrator
-
-    orch = Orchestrator.__new__(Orchestrator)  # avoid GitHub connection
     from agentics.memory.shared_memory import SharedMemory
     from agentics.llm.session_host import BrowserSessionHost
-    from agentics.memory.vector_store import VectorStore
 
     settings.ensure_dirs()
     memory = SharedMemory(settings.db_path)
     host = BrowserSessionHost.from_settings(settings)
-    table = Table(title="Agents (heartbeat)")
-    for col in ("agent", "role", "cycle", "status", "last seen"):
-        table.add_column(col)
+    table = Table(title="Agents (live state)")
+    for col in ("agent", "role", "cycle", "status", "node", "task", "intent (goal)"):
+        table.add_column(col, overflow="fold")
     import time as _t
     for a in memory.active_agents(stale_after_s=86400):
-        table.add_row(a["agent"], a["role"], str(a["cycle"]), a["status"],
-                      _t.strftime("%H:%M:%S", _t.localtime(a["last_ts"])))
+        goal = (a["intent"] or {}).get("goal", "")
+        table.add_row(
+            a["agent"], a["role"], str(a["cycle"]), a["status"], a["node"] or "-",
+            f"#{a['task_id']} {a['task_title'][:36]}" if a.get("task_id") else "-",
+            goal[:60],
+        )
     console.print(table)
+    counts = memory.task_counts()
+    if counts:
+        console.print("[bold]Task counts:[/] " + ", ".join(
+            f"{k}={v}" for k, v in sorted(counts.items())))
     claims = memory.active_claims()
     if claims:
         console.print("[bold]Active claims:[/]")
-        for issue_no, c in claims.items():
-            console.print(f"  issue #{issue_no} -> {c.agent} ({c.branch})")
+        for task_id, c in claims.items():
+            console.print(f"  task #{task_id} -> {c.agent} ({c.branch})")
     console.print(f"[bold]Browser-session identities loaded:[/] {len(host)} "
                   f"(perplexity: {len(host.pools['perplexity'])}, qwen: {len(host.pools['qwen'])})")
-    for line in host.status_lines():
-        console.print(f"  {line}")
+    memory.close()
+
+
+@app.command("dashboard")
+def dashboard(
+    port: int = typer.Option(None, "--port", help="HTTP port (default DASHBOARD_PORT or 8080)"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+) -> None:
+    """Owner: open the live web dashboard (agents, intent, tasks, MRs, journal)."""
+    settings = _settings()
+    setup_logging("ERROR")
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]Dashboard cần fastapi + uvicorn:[/] pip install fastapi uvicorn")
+        raise typer.Exit(1)
+    from agentics.dashboard.app import create_app
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    real_port = port or settings.dashboard_port
+    console.print(f"[bold]Dashboard:[/] http://{host}:{real_port} — Ctrl+C để thoát")
+    uvicorn.run(create_app(memory, settings), host=host, port=real_port, log_level="warning")
+
+
+@app.command("task")
+def task(
+    title: list[str] = typer.Argument(None, help="task title (owner adds work)"),
+    body: str = typer.Option("", "--body", "-b", help="task description"),
+    category: str = typer.Option("research", "--category", "-c",
+                                 help="research | code | docs | bugfix | other"),
+    list_all: bool = typer.Option(False, "--list", "-l", help="list recent tasks"),
+) -> None:
+    """Owner: add a task to the local backlog (or --list to view it)."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    if list_all or not title:
+        table = Table(title="Tasks")
+        for col in ("#", "status", "category", "claimed_by", "title"):
+            table.add_column(col, overflow="fold")
+        for t in memory.list_tasks(limit=25):
+            table.add_row(str(t["id"]), t["status"], t["category"],
+                          t["claimed_by"] or "-", t["title"])
+        console.print(table)
+        memory.close()
+        return
+    full_title = " ".join(title).strip()
+    task_id = memory.create_task(full_title, body=body, category=category, agent="owner")
+    console.print(f"[bold green]task #{task_id} created[/] — agents will pick it up "
+                  "in their next claim cycle.")
+    memory.close()
+
+
+@app.command("allow-protected")
+def allow_protected(
+    task_id: int = typer.Argument(..., help="task id allowed to touch agent code"),
+    revoke: bool = typer.Option(False, "--revoke", help="remove the exemption instead"),
+) -> None:
+    """Owner: grant (or --revoke) the ONLY path for a task to modify lab code.
+
+    Protected paths (agentics/, configs/, accounts/, scripts/, .github/) are
+    hard-blocked for agents. With an exemption, a task still may never touch
+    accounts/ or configs/secrets.yaml.
+    """
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    if memory.get_task(task_id) is None:
+        console.print(f"[red]task #{task_id} does not exist[/]")
+        raise typer.Exit(1)
+    memory.set_task_exempt(task_id, not revoke, agent="owner")
+    state = "EXEMPT (may touch agent code, except credentials)" if not revoke else "PROTECTED again"
+    console.print(f"[bold]task #{task_id}[/] → {state}")
     memory.close()
 
 

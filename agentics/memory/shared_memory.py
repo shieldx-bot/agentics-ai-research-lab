@@ -4,8 +4,13 @@ Tables:
     messages    — chat/broadcast between agents
     findings    — research results (title, content, citations)
     decisions   — durable decisions (who does what, why)
-    claims      — issue claim registry (P1)
-    heartbeats  — liveness of each agent (P6)
+    claims      — task claim registry (P1)
+    heartbeats  — liveness of each agent (P6) + live state for the dashboard
+                  (current node, task, published intent)
+    journal     — append-only activity feed (what/why each agent did) — the
+                  owner's window into the swarm (anti blackbox)
+    tasks       — LOCAL task queue (replaces GitHub issues in local-only mode)
+    reviews     — LOCAL review requests ("MR", replaces GitHub pull requests)
     traces      — evolutionary traces: what each agent tried, where it failed, outcome (GEA)
     trace_clusters — LifeMem workflow clusters grouping similar traces
     skills      — skills distilled from merged traces of each cluster (LifeMem)
@@ -59,7 +64,49 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     role TEXT DEFAULT '',
     last_ts REAL NOT NULL,
     cycle INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'idle'
+    status TEXT DEFAULT 'idle',
+    current_node TEXT DEFAULT '',
+    task_id INTEGER,
+    task_title TEXT DEFAULT '',
+    intent TEXT DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    event TEXT NOT NULL,
+    detail TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT DEFAULT '',
+    category TEXT DEFAULT 'research',
+    labels TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    -- open | claimed | in_review | merged | failed | closed
+    claimed_by TEXT DEFAULT '',
+    branch TEXT DEFAULT '',
+    exempt INTEGER NOT NULL DEFAULT 0,
+    -- 1 = owner granted a protected-paths exemption for this task only
+    closed_ts REAL
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    task_id INTEGER,
+    title TEXT NOT NULL,
+    body TEXT DEFAULT '',
+    author TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    files TEXT DEFAULT '[]',
+    verification TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    -- open | approved | changes_requested | merged | failed
+    reviewer TEXT DEFAULT '',
+    verdict_comment TEXT DEFAULT '',
+    approved_by TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS traces (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,10 +183,17 @@ class SharedMemory:
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
-            try:      # migration for DBs created before LifeMem clustering
-                self._conn.execute("ALTER TABLE traces ADD COLUMN cluster_id INTEGER")
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            for column in (
+                "ALTER TABLE traces ADD COLUMN cluster_id INTEGER",
+                "ALTER TABLE heartbeats ADD COLUMN current_node TEXT DEFAULT ''",
+                "ALTER TABLE heartbeats ADD COLUMN task_id INTEGER",
+                "ALTER TABLE heartbeats ADD COLUMN task_title TEXT DEFAULT ''",
+                "ALTER TABLE heartbeats ADD COLUMN intent TEXT DEFAULT '{}'",
+            ):                 # migrations for DBs created before LifeMem / dashboard
+                try:
+                    self._conn.execute(column)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     # ------------------------------------------------------------ messages
     def post_message(self, agent: str, kind: str, content: str, issue: int | None = None) -> None:
@@ -275,7 +329,7 @@ class SharedMemory:
             ).fetchall()
         return {r[0]: Claim(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows}
 
-    # ------------------------------------------------------------ heartbeats
+    # ------------------------------------------------------------ heartbeats + live state
     def heartbeat(self, agent: str, role: str, cycle: int, status: str = "idle") -> None:
         now = time.time()
         with self._lock, self._conn:
@@ -286,17 +340,261 @@ class SharedMemory:
                 (agent, role, now, cycle, status, role, now, cycle, status),
             )
 
+    def report(
+        self, agent: str, role: str, node: str = "", status: str = "working",
+        cycle: int = 0, task_id: int | None = None, task_title: str | None = None,
+        intent: dict | str | None = None,
+    ) -> None:
+        """Live agent state for the dashboard: node, task, and published intent.
+
+        ``None`` fields keep their previous value; pass ``""`` / ``{}`` to clear.
+        """
+        now = time.time()
+        if isinstance(intent, dict):
+            intent = json.dumps(intent, ensure_ascii=False)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO heartbeats (agent, role, last_ts, cycle, status,
+                                        current_node, task_id, task_title, intent)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(agent) DO UPDATE SET
+                    role=?, last_ts=?, cycle=?, status=?,
+                    current_node=CASE WHEN ?='' THEN current_node ELSE ? END,
+                    task_id=CASE WHEN ? IS NULL THEN task_id ELSE ? END,
+                    task_title=CASE WHEN ? IS NULL THEN task_title ELSE ? END,
+                    intent=CASE WHEN ? IS NULL THEN intent ELSE ? END
+                """,
+                (agent, role, now, cycle, status, node, task_id, task_title or "",
+                 intent or "{}",
+                 role, now, cycle, status, node, node, task_id, task_id,
+                 task_title, task_title, intent, intent),
+            )
+
     def active_agents(self, stale_after_s: float = 300.0) -> list[dict]:
         cutoff = time.time() - stale_after_s
         with self._lock:
             rows = self._conn.execute(
-                "SELECT agent, role, last_ts, cycle, status FROM heartbeats "
+                "SELECT agent, role, last_ts, cycle, status, current_node, task_id, "
+                "task_title, intent FROM heartbeats "
                 "WHERE last_ts > ? ORDER BY last_ts DESC", (cutoff,)
             ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                intent = json.loads(r[8] or "{}")
+            except json.JSONDecodeError:
+                intent = {"raw": str(r[8])[:200]}
+            out.append({
+                "agent": r[0], "role": r[1], "last_ts": r[2], "cycle": r[3],
+                "status": r[4], "node": r[5], "task_id": r[6], "task_title": r[7],
+                "intent": intent,
+            })
+        return out
+
+    # ------------------------------------------------------------ journal (anti blackbox)
+    def journal(self, agent: str, event: str, detail: str | dict = "") -> None:
+        if isinstance(detail, dict):
+            detail = json.dumps(detail, ensure_ascii=False)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO journal (ts, agent, event, detail) VALUES (?,?,?,?)",
+                (time.time(), agent, event, str(detail)[:2000]),
+            )
+
+    def recent_journal(self, limit: int = 50, agent: str | None = None) -> list[dict]:
+        sql = "SELECT id, ts, agent, event, detail FROM journal"
+        args: list = []
+        if agent:
+            sql += " WHERE agent=?"
+            args.append(agent)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
         return [
-            {"agent": r[0], "role": r[1], "last_ts": r[2], "cycle": r[3], "status": r[4]}
+            {"id": r[0], "ts": r[1], "agent": r[2], "event": r[3], "detail": r[4]}
+            for r in reversed(rows)
+        ]
+
+    # ------------------------------------------------------------ tasks (local issue queue)
+    def create_task(
+        self, title: str, body: str = "", category: str = "research",
+        labels: str = "", agent: str = "owner",
+    ) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO tasks (ts, title, body, category, labels) VALUES (?,?,?,?,?)",
+                (time.time(), title[:300], body[:8000], category, labels[:200]),
+            )
+            task_id = int(cur.lastrowid or 0)
+        self.journal(agent, "task_created", {"task": task_id, "title": title})
+        return task_id
+
+    def create_task_if_absent(
+        self, title: str, body: str = "", category: str = "research",
+        labels: str = "", agent: str = "owner",
+    ) -> int | None:
+        """Open a task unless an OPEN one with the same title already exists."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM tasks WHERE title=? AND status IN "
+                "('open','claimed','in_review')", (title,)
+            ).fetchone()
+        if row:
+            return None
+        return self.create_task(title, body, category, labels, agent)
+
+    def get_task(self, task_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, title, body, category, labels, status, claimed_by, "
+                "branch, exempt, closed_ts FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "ts": row[1], "title": row[2], "body": row[3],
+            "category": row[4], "labels": row[5], "status": row[6],
+            "claimed_by": row[7], "branch": row[8], "exempt": bool(row[9]),
+            "closed_ts": row[10],
+        }
+
+    def scan_open_tasks(self, limit: int = 30) -> list[dict]:
+        """Open, unclaimed tasks, oldest first (the local replacement for
+        scanning open unclaimed GitHub issues)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, title, body, category, labels, exempt FROM tasks "
+                "WHERE status='open' ORDER BY ts, id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {"id": r[0], "ts": r[1], "title": r[2], "body": r[3],
+             "category": r[4], "labels": r[5], "exempt": bool(r[6])}
             for r in rows
         ]
+
+    def list_tasks(self, limit: int = 30, status: str | None = None) -> list[dict]:
+        sql = (
+            "SELECT id, ts, title, body, category, labels, status, claimed_by, "
+            "branch, exempt, closed_ts FROM tasks"
+        )
+        args: list = []
+        if status:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"id": r[0], "ts": r[1], "title": r[2], "body": r[3], "category": r[4],
+             "labels": r[5], "status": r[6], "claimed_by": r[7], "branch": r[8],
+             "exempt": bool(r[9]), "closed_ts": r[10]}
+            for r in rows
+        ]
+
+    def set_task_status(
+        self, task_id: int, status: str, claimed_by: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        sets, args = ["status=?"], [status]
+        if claimed_by is not None:
+            sets.append("claimed_by=?")
+            args.append(claimed_by)
+        if branch is not None:
+            sets.append("branch=?")
+            args.append(branch)
+        if status in ("merged", "failed", "closed"):
+            sets.append("closed_ts=?")
+            args.append(time.time())
+        args.append(task_id)
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", args)
+
+    def set_task_exempt(self, task_id: int, exempt: bool, agent: str = "owner") -> None:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE tasks SET exempt=? WHERE id=?", (1 if exempt else 0, task_id)
+            )
+            changed = cur.rowcount
+        if changed:
+            self.journal(agent, "task_exempt_set" if exempt else "task_exempt_cleared",
+                         {"task": task_id})
+
+    def task_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM tasks GROUP BY status"
+            ).fetchall()
+        return {status: n for status, n in rows}
+
+    # ------------------------------------------------------------ reviews (local MRs)
+    def open_review(
+        self, task_id: int | None, title: str, body: str, author: str,
+        branch: str, files: list[str], verification: str = "",
+    ) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO reviews (ts, task_id, title, body, author, branch, "
+                "files, verification) VALUES (?,?,?,?,?,?,?,?)",
+                (time.time(), task_id, title[:300], body[:8000], author, branch,
+                 json.dumps(files), verification[:500]),
+            )
+            mr_id = int(cur.lastrowid or 0)
+        if task_id is not None:
+            self.set_task_status(task_id, "in_review")
+        return mr_id
+
+    def _review_row(self, row_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, task_id, title, body, author, branch, files, "
+                "verification, status, reviewer, verdict_comment, approved_by "
+                "FROM reviews WHERE id=?", (row_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0], "ts": row[1], "task_id": row[2], "title": row[3],
+            "body": row[4], "author": row[5], "branch": row[6],
+            "files": json.loads(row[7] or "[]"), "verification": row[8],
+            "status": row[9], "reviewer": row[10], "verdict_comment": row[11],
+            "approved_by": row[12],
+        }
+
+    def get_review(self, mr_id: int) -> dict | None:
+        return self._review_row(mr_id)
+
+    def open_reviews(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM reviews WHERE status IN ('open','changes_requested') "
+                "ORDER BY id"
+            ).fetchall()
+        return [self._review_row(r[0]) for r in rows]
+
+    def recent_reviews(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM reviews ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._review_row(r[0]) for r in rows]
+
+    def set_review_verdict(
+        self, mr_id: int, status: str, reviewer: str, comment: str = "",
+    ) -> None:
+        """status: approved | changes_requested | merged | failed."""
+        if status == "approved":
+            sql = ("UPDATE reviews SET reviewer=?, verdict_comment=?, "
+                   "status='approved', approved_by=? WHERE id=?")
+            args = [reviewer, comment[:3000], reviewer, mr_id]
+        else:
+            sql = "UPDATE reviews SET reviewer=?, verdict_comment=?, status=? WHERE id=?"
+            args = [reviewer, comment[:3000], status, mr_id]
+        with self._lock, self._conn:
+            self._conn.execute(sql, args)
 
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(

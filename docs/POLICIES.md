@@ -93,3 +93,36 @@ cùng một repo mà không giẫm chân nhau.
 - Claim issue: **label là khoá chính tắc**. Comment claim fail (network) không được rollback
   claim — rollback thất bại sẽ để lại label mồ côi khoá issue vĩnh viễn (đã gặp ở issue #19).
   Nhánh release/sweep của agent sở hữu sẽ dọn label sau.
+
+---
+
+## P10 — Protected paths: code lab là của owner (local-only mode)
+
+**Vấn đề:** khi agents làm việc trực tiếp trên local, nguy cơ lớn nhất là một
+plan "lạc đường" tự sửa code của chính hệ thống agent (`agentics/`), cấu hình
+runtime, hoặc tệ hơn là chạm vào cookie/credentials.
+
+**Chính sách:** các đường sau bị **chặn cứng** với mọi agent:
+
+```
+agentics/   configs/   accounts/   scripts/   .github/
+```
+
+Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`):
+
+1. **Ghi file** — `RepoWorkspace.write_file` từ chối ngay khi plan yêu cầu
+   tạo/sửa một file protected (ValueError → cycle yield).
+2. **Diff trước push** — `node_implement` quét toàn bộ changed files; vi phạm
+   → yield, không commit, không push.
+3. **Cửa review + cửa merge** — Reviewer hạ mọi verdict "approve" thành
+   "request_changes" nếu diff chạm protected paths; `LocalMergeQueue.drain`
+   từ chối merge MR vi phạm kể cả khi đã được duyệt.
+
+**Exception duy nhất thuộc về owner:**
+
+- Theo task: `python -m agentics.cli allow-protected <task_id>` (thu hồi:
+  `--revoke`). Cờ nằm trên row của task — agent không tự cấp được.
+- Theo phiên: biến môi trường `ALLOW_PROTECTED_PATHS=1`.
+
+`accounts/` và `configs/secrets.yaml` (credentials) **không bao giờ** được
+miễn, kể cả với exception.

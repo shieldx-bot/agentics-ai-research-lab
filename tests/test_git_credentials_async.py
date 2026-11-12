@@ -20,7 +20,9 @@ def _workspace(tmp_path: Path, token: str = "test-secret") -> RepoWorkspace:
 
 def test_remote_url_never_contains_github_token(tmp_path):
     ws = _workspace(tmp_path)
-    assert ws._remote == "https://github.com/owner/repo.git"
+    # local-only mode: origin is the on-disk bare repo, never a remote URL
+    assert ws._remote == str(ws.settings.local_repo_path)
+    assert ws._remote.endswith("lab.git")
     assert "test-secret" not in ws._remote
 
 
@@ -47,7 +49,7 @@ def test_existing_clone_rewrites_legacy_credential_bearing_remote(tmp_path):
         ["git", "remote", "get-url", "origin"],
         cwd=ws.path, check=True, capture_output=True, text=True,
     ).stdout.strip()
-    assert remote == "https://github.com/owner/repo.git"
+    assert remote == str(ws.settings.local_repo_path)
     assert "old-secret" not in remote
 
 
@@ -95,7 +97,7 @@ def test_clone_uses_clean_url_and_environment_auth(tmp_path, monkeypatch):
     monkeypatch.setattr(ws, "_git", lambda *args, **kwargs: SimpleNamespace(returncode=0))
     ws.ensure_cloned()
     args, kwargs = calls[0]
-    assert args[-2] == "https://github.com/owner/repo.git"
+    assert args[-2] == str(ws.settings.local_repo_path)
     assert "clone-secret" not in " ".join(args)
     assert "GIT_CONFIG_VALUE_0" in kwargs["env"]
 

@@ -78,6 +78,11 @@ Chính sách chống xung đột: [docs/POLICIES.md](docs/POLICIES.md)
 
 ## 3. Cài đặt nhanh
 
+> **Chế độ LOCAL-ONLY (nhánh `update-interactive-local`):** lab chạy hoàn toàn
+> trên máy của bạn — không cần `GITHUB_TOKEN`, không gọi GitHub. "origin" của
+> agent là bare repo tự seed tại `data/lab.git`; tasks/MR/review/merge đều
+> nằm trong SQLite. Owner theo dõi qua web dashboard.
+
 ```bash
 git clone https://github.com/shieldx-bot/agentics-ai-research-lab.git
 cd agentics-ai-research-lab
@@ -85,9 +90,8 @@ cd agentics-ai-research-lab
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1) Token GitHub (chỉ cần quyền repo) — KHÔNG commit token vào repo
-cp .env.example .env
-#    sửa .env: GITHUB_TOKEN=ghp_xxx  GITHUB_REPO=shieldx-bot/agentics-ai-research-lab
+# 1) Không cần token gì cả — chỉ còn cookie LLM
+cp .env.example .env             # tuỳ chỉnh RESEARCH_TOPIC / MAX_AGENTS
 #    LƯU Ý: agentics/config.py TỰ NẠP .env khi khởi động (không cần `source .env`
 #    hay export tay). Biến môi trường thật trong shell vẫn luôn thắng file .env.
 
@@ -99,16 +103,29 @@ python scripts/setup_accounts.py            # chuẩn hoá + kiểm tra độ t�
 # 3) Kiểm tra 1 account có "sống" không
 python -m agentics.cli test-llm --account 1
 
-# 4) KHỞI CHẠY ĐÀN AGENT (vòng lặp vô tận)
+# 4) KHỞI CHẠY ĐÀN AGENT (vòng lặp vô tận, local 100%)
 python -m agentics.cli run
 
-# 5) DỪNG an toàn (owner quyết định)
+# 5) MẮT OWNER — xem agents đang làm gì, mục đích gì, realtime
+python -m agentics.cli dashboard     # → http://127.0.0.1:8080
+
+# 6) Thêm việc cho đàn agent / sửa backlog
+python -m agentics.cli task "Nghiên cứu thuật toán X" --category research
+python -m agentics.cli task --list
+
+# 7) DỪNG an toàn (owner quyết định)
 python -m agentics.cli stop          # hoặc: touch STOP
 ```
 
 Xem trạng thái trực tiếp: `python -m agentics.cli status`  
 Đo tiến hóa của lab (tỉ lệ merge theo loại việc): `python -m agentics.cli metrics` — xem [docs/EVOLUTION.md](docs/EVOLUTION.md)  
 Sức khỏe bộ nhớ LifeMem (trace, cụm workflow, skill đã chưng cất): `python -m agentics.cli memory-stats` — xem [docs/MEMORY.md](docs/MEMORY.md)
+
+**P10 — code lab là của owner:** mọi diff đụng `agentics/`, `configs/`,
+`accounts/`, `scripts/`, `.github/` bị chặn ở 3 tầng (ghi file, diff trước
+push, cửa merge). Exception DUY NHẤT là owner chạy
+`python -m agentics.cli allow-protected <task_id>` (coi `accounts/` và
+`configs/secrets.yaml` không bao giờ được miễn).
 
 ---
 
@@ -169,10 +186,11 @@ nhánh riêng, module ownership rõ ràng, PR phải qua cross-review.
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # fill GITHUB_TOKEN + GITHUB_REPO
+cp .env.example .env          # optional tuning; no GITHUB_TOKEN needed (local-only)
 python scripts/setup_accounts.py
-python -m agentics.cli run    # infinite research loop
-python -m agentics.cli stop   # owner presses the brakes
+python -m agentics.cli run        # infinite research loop — 100% local
+python -m agentics.cli dashboard  # owner's live view (http://127.0.0.1:8080)
+python -m agentics.cli stop       # owner presses the brakes
 ```
 
 ## License
