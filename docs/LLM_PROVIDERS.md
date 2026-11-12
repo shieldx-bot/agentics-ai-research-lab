@@ -107,3 +107,25 @@ python -m agentics.cli test-llm --provider qwen    # diagnostics only
 python -m agentics.cli status                      # shows pools + mode
 python -m agentics.cli run
 ```
+
+## Hyperbrowser cloud-browser validation (`scripts/hyperbrowser_smoke.py`)
+
+Raw WebSocket access to Perplexity is blocked from datacenter IPs
+(`wss://www.perplexity.ai/socket.io` → HTTP 403 on a bare VPS). To validate the
+cookie pool (or harvest/refresh cookies) from such an environment, drive a real
+browser session on Hyperbrowser instead — verified live on 2026-11-12: **all 10
+accounts logged in, submitted a real query via the web UI and captured real
+answers with citations (~60 s round-trip each)**.
+
+```bash
+export HB_API_KEY=...            # Hyperbrowser API key
+python scripts/hyperbrowser_smoke.py --accounts 1-3 --wait 60
+```
+
+* Creates one stealth session per account (US residential proxy), connects
+  Playwright over CDP, injects the account cookies, detects login via the
+  `session-token` cookie (httpOnly — read through CDP, not `document.cookie`),
+  submits a query in the Lexical editor (`keyboard.insert_text`, not `type()`),
+  extracts the answer text and screenshots.
+* Requires `pip install hyperbrowser playwright` and `playwright install` for
+  the local driver. Free Hyperbrowser plans run 1 session at a time.
