@@ -27,34 +27,41 @@ def scan_open_issues(repo: Repository, limit: int = 30) -> list[Issue]:
 
     The cache is only a discovery optimization. Claim acquisition must still
     re-read the target issue and atomically verify its current claim labels.
+    Only objects with a REAL stable identity (PyGithub ``repo.id``) are cached —
+    keying on ``id(obj)`` poisons the cache when CPython reuses the address of
+    a garbage-collected duck-typed fake (observed as cross-test flakiness: a
+    later test's repo resurrects an earlier test's cached issue list).
     """
-    # Duck-typed repo id: real Repository objects always have `.id`; fakes and
-    # thin wrappers may not — fall back to object identity for the cache key.
-    key = (getattr(repo, "id", id(repo)), int(limit))
+    stable_id = getattr(repo, "id", None)
+    cacheable = stable_id is not None
+    key = (stable_id, int(limit))
     now = time.monotonic()
-    with _SCAN_CACHE_LOCK:
-        cached = _SCAN_CACHE.get(key)
-        if cached and now - cached[0] < _SCAN_CACHE_TTL_S:
-            return list(cached[1])
+    if cacheable:
+        with _SCAN_CACHE_LOCK:
+            cached = _SCAN_CACHE.get(key)
+            if cached and now - cached[0] < _SCAN_CACHE_TTL_S:
+                return list(cached[1])
 
-        issues: list[Issue] = []
-        for issue in repo.get_issues(state="open", sort="created", direction="asc"):
-            if issue.pull_request is not None:
-                continue
-            labels = {lb.name for lb in issue.labels}
-            if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
-                continue
-            if "blocked" in labels:
-                continue
-            issues.append(issue)
-            if len(issues) >= limit:
-                break
-        _SCAN_CACHE[key] = (time.monotonic(), list(issues))
-        # Keep the cache bounded if a process watches several repositories.
-        if len(_SCAN_CACHE) > 32:
-            oldest = min(_SCAN_CACHE, key=lambda k: _SCAN_CACHE[k][0])
-            _SCAN_CACHE.pop(oldest, None)
-        return issues
+    issues: list[Issue] = []
+    for issue in repo.get_issues(state="open", sort="created", direction="asc"):
+        if issue.pull_request is not None:
+            continue
+        labels = {lb.name for lb in issue.labels}
+        if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
+            continue
+        if "blocked" in labels:
+            continue
+        issues.append(issue)
+        if len(issues) >= limit:
+            break
+    if cacheable:
+        with _SCAN_CACHE_LOCK:
+            _SCAN_CACHE[key] = (time.monotonic(), list(issues))
+            # Keep the cache bounded if a process watches several repositories.
+            if len(_SCAN_CACHE) > 32:
+                oldest = min(_SCAN_CACHE, key=lambda k: _SCAN_CACHE[k][0])
+                _SCAN_CACHE.pop(oldest, None)
+    return issues
 
 
 def issue_holders(repo: Repository, issue_number: int) -> list[str]:
