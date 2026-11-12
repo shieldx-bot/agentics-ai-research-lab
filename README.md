@@ -108,10 +108,16 @@ python -m agentics.cli run
 
 # 5) MẮT OWNER — xem agents đang làm gì, mục đích gì, realtime
 python -m agentics.cli dashboard     # → http://127.0.0.1:8080
+python -m agentics.cli watch        # terminal live view (SSH-friendly)
 
 # 6) Thêm việc cho đàn agent / sửa backlog
 python -m agentics.cli task "Nghiên cứu thuật toán X" --category research
 python -m agentics.cli task --list
+
+# 6b) CỔNG MERGE (khi AUTO_MERGE=false — mặc định): owner giữ chốt
+python -m agentics.cli mr list          # pipeline MR: ai làm, ai duyệt
+python -m agentics.cli mr approve 3     # owner duyệt thay/ thêm cross-review
+python -m agentics.cli mr merge 3       # owner merge (P10 + tier-2 vẫn chạy)
 
 # 7) DỪNG an toàn (owner quyết định)
 python -m agentics.cli stop          # hoặc: touch STOP

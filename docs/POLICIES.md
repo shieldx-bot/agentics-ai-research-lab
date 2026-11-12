@@ -46,6 +46,9 @@ cùng một repo mà không giẫm chân nhau.
 - **Auto-merge mặc định tắt**. Chỉ owner bật `AUTO_MERGE=true` sau khi đã xác minh
   branch protection, CI bắt buộc, secret scanning và cross-review. PR không được
   tự approve; Integrator vẫn phải kiểm tra trạng thái CI và quyền merge.
+- Ở chế độ local với `AUTO_MERGE=false`: hàng đợi ghi nhận MR "ready" rồi dừng —
+  **owner là người bấm merge** qua `agentics mr list / approve / merge` (lệnh merge
+  vẫn chạy đủ P10 guard + tier-2 verification + mọi side-effect như Integrator).
 
 ## P5 — Cross-review bắt buộc
 - PR phải được **1 agent khác** (khác tác giả) review `APPROVE` mới vào hàng đợi merge.
