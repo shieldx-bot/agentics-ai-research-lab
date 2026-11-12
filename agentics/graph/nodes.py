@@ -1,8 +1,7 @@
 """Graph nodes — each node is a step of one agent's research cycle.
 
-Nodes are synchronous (GitHub/Git/SQLite are sync libs) and wrapped by the
-graph in a thread executor; only LLM calls are async (kept as coroutines
-invoked from within async nodes).
+GitHub/Git/SQLite operations are synchronous and run in LangGraph's executor.
+LLM and paper-search nodes are async and await their providers directly.
 """
 from __future__ import annotations
 
@@ -409,7 +408,7 @@ def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Reviewer: pick an open PR not authored by me, review it (P5)."""
     repo = ctx.gh.repo
     candidate = None
@@ -434,7 +433,7 @@ def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         'Reply ONLY JSON: {"verdict": "approve|request_changes", '
         '"comment": "..."}'
     )
-    answer, _ = _llm_ask(ctx, prompt, mode="concise")
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise")
     parsed = parse_json_block(answer)
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")
