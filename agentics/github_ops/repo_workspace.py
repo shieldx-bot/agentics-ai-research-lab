@@ -32,7 +32,10 @@ class RepoWorkspace:
     # ------------------------------------------------------------ plumbing
     def _git_env(self) -> dict[str, str]:
         """Return a per-process Git auth environment; never persist credentials."""
-        env = os.environ.copy()
+        allowed = {"PATH", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL"}
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+        env["HOME"] = str(self.path / ".agent-home")
+        env["GIT_TERMINAL_PROMPT"] = "0"
         token = self.settings.github_token
         if token:
             try:
@@ -49,7 +52,7 @@ class RepoWorkspace:
         # Only network operations receive the credential. Local commands (especially
         # commit hooks) must not inherit a token they do not need.
         network_ops = {"fetch", "push", "pull", "ls-remote"}
-        env = self._git_env() if args and args[0] in network_ops else os.environ.copy()
+        env = self._git_env() if args and args[0] in network_ops else self._command_environment()
         proc = subprocess.run(
             ["git", *args], cwd=self.path, capture_output=True, text=True, env=env,
         )
