@@ -298,7 +298,7 @@ class HyperbrowserClient:
                 ) from exc
             # A visible sign-in state means this particular cookie is stale;
             # a generic missing composer is a frontend/UI outage, not bad auth.
-            if re.search(r"sign\\s?in|log\\s?in", diag["body"][:500], re.IGNORECASE):
+            if re.search(r"sign\s?in|log\s?in", diag["body"][:500], re.IGNORECASE):
                 raise HyperbrowserAuthError(
                     f"{self.account.name}: Perplexity rendered a sign-in page "
                     f"(title={diag['title']!r}, url={diag['url']!r})"
