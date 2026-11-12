@@ -96,7 +96,8 @@ python -m agentics.cli run
 python -m agentics.cli stop          # hoặc: touch STOP
 ```
 
-Xem trạng thái trực tiếp: `python -m agentics.cli status`
+Xem trạng thái trực tiếp: `python -m agentics.cli status`  
+Đo tiến hóa của lab (tỉ lệ merge theo loại việc): `python -m agentics.cli metrics` — xem [docs/EVOLUTION.md](docs/EVOLUTION.md)
 
 ---
 

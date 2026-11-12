@@ -6,6 +6,7 @@ max_agents: 10
 cycle_pause_seconds: 60
 auto_merge: true
 claim_ttl_minutes: 45
+evolution_every_n_cycles: 10   # 0 = never open self-evolution issues
 
 # --- Research ------------------------------------------------------------
 research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core automation"

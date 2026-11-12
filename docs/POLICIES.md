@@ -60,3 +60,16 @@ cùng một repo mà không giẫm chân nhau.
 - Agents chạy liên tục; **chỉ owner** quyết định dừng: file `STOP` ở thư mục gốc.
 - Khi dừng: agent hoàn tất node hiện tại, giải phóng claim, ghi trạng thái, thoát.
   Không có agent nào bị cắt giữa chừng khi đang push.
+
+## P9 — Traces & tool registry (GEA)
+- Mỗi chu kỳ làm việc của Coder/Writer ghi 1 **trace** (đã thử gì, fail ở đâu, kết quả) vào
+  shared memory; reviewer/integrator cập nhật kết quả (approved/rejected/merged/failed).
+- Trước khi lập plan, agent đọc trace của agent khác và registry tool; tool mới chỉ vào
+  registry khi PR được **merge**.
+
+## P10 — Kiểm tra hai tầng
+- Tầng 1 (tác giả, trước push): `py_compile` + `pytest -x`. Tầng 2 (Integrator, trước merge):
+  test đầy đủ trên `main + PR`; fail → không merge, ghi failure trace + comment vào PR.
+
+## P11 — Self-evolution có rào chắn
+- PR `evolution` chỉ được sửa allowlist. Chi tiết và giới hạn: [EVOLUTION.md](EVOLUTION.md).
