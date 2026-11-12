@@ -10,7 +10,6 @@ after cycle until the owner writes the STOP file.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from langgraph.graph import END, StateGraph
@@ -47,9 +46,20 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     g.add_node("start", lambda s: node_start(ctx, s))
     g.add_node("scan", lambda s: node_scan(ctx, s))
     g.add_node("claim", lambda s: node_claim(ctx, s))
-    g.add_node("research", lambda s: node_research(ctx, s))
-    g.add_node("plan", lambda s: node_plan(ctx, s))
-    g.add_node("implement", lambda s: node_implement(ctx, s))
+    # Async nodes must be registered as async callables. A sync lambda that merely
+    # returns a coroutine is treated as a sync node and leaks the coroutine object.
+    async def research_node(state: ResearchState) -> ResearchState:
+        return await node_research(ctx, state)
+
+    async def plan_node(state: ResearchState) -> ResearchState:
+        return await node_plan(ctx, state)
+
+    async def implement_node(state: ResearchState) -> ResearchState:
+        return await node_implement(ctx, state)
+
+    g.add_node("research", research_node)
+    g.add_node("plan", plan_node)
+    g.add_node("implement", implement_node)
     g.add_node("open_pr", lambda s: node_open_pr(ctx, s))
     g.add_node("review", lambda s: node_review(ctx, s))
     g.add_node("integrate", lambda s: node_integrate(ctx, s))
@@ -88,6 +98,6 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
 
 async def run_cycle(ctx: AgentContext) -> ResearchState:
     graph = build_research_graph(ctx).compile()
-    # sync nodes (GitHub/git/sqlite) run in a worker thread; LLM calls inside
-    # them use their own event loop
+    # LangGraph runs synchronous I/O nodes in its executor and awaits async
+    # LLM/research nodes on the graph event loop.
     return await graph.ainvoke({})
