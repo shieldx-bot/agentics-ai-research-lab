@@ -97,6 +97,7 @@ python -m agentics.cli stop          # hoặc: touch STOP
 ```
 
 Xem trạng thái trực tiếp: `python -m agentics.cli status`  
+**Bắt buộc chuẩn bị sandbox trước khi chạy agent:** bật rootless Docker và build image theo [docs/SANDBOX.md](docs/SANDBOX.md). Nếu Docker không sẵn sàng, agent sẽ từ chối chạy lệnh thay vì thực thi trên host.  
 Đo tiến hóa của lab (tỉ lệ merge theo loại việc): `python -m agentics.cli metrics` — xem [docs/EVOLUTION.md](docs/EVOLUTION.md)  
 Sức khỏe bộ nhớ LifeMem (trace, cụm workflow, skill đã chưng cất): `python -m agentics.cli memory-stats` — xem [docs/MEMORY.md](docs/MEMORY.md)
 
