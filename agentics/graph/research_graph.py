@@ -34,6 +34,13 @@ from agentics.graph.state import ResearchState
 log = logging.getLogger("graph.cycle")
 
 
+def continue_or_reflect(next_node: str):
+    """Router: go on to `next_node` unless the cycle is already finished or failed."""
+    def route(state: ResearchState) -> str:
+        return "reflect" if state.get("done") or state.get("error") else next_node
+    return route
+
+
 def build_research_graph(ctx: AgentContext) -> StateGraph:
     g = StateGraph(ResearchState)
 
@@ -65,10 +72,12 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
         "review": "review", "integrate": "integrate", "reflect": "reflect",
     })
     g.add_edge("scan", "reflect")
-    g.add_edge("claim", "research")
-    g.add_edge("research", "plan")
-    g.add_edge("plan", "implement")
-    g.add_edge("implement", "open_pr")
+    # A node that sets `done` (nothing to do, lost a race, yielded) or `error` must
+    # short-circuit to reflect; unconditional edges used to push such cycles into
+    # plan/implement/open_pr with missing state.
+    for src, dst in (("claim", "research"), ("research", "plan"),
+                     ("plan", "implement"), ("implement", "open_pr")):
+        g.add_conditional_edges(src, continue_or_reflect(dst), {dst: dst, "reflect": "reflect"})
     g.add_edge("open_pr", "reflect")
     g.add_edge("review", "reflect")
     g.add_edge("integrate", "reflect")

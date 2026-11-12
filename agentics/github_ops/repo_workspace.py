@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 from pathlib import Path
 
 from agentics.config import Settings
@@ -78,15 +79,15 @@ class RepoWorkspace:
             return 127, f"command not found: {cmd[0]}"
 
     def changed_files(self) -> list[str]:
-        proc = self._git("status", "--porcelain", check=False)
+        """Working-tree changes, one entry per file (untracked dirs are expanded)."""
+        proc = self._git("status", "--porcelain", "--untracked-files=all", check=False)
         files = []
         for line in proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
+            if len(line) < 4:
                 continue
-            # "XY path" or "XY \"path with space\""
-            part = line[3:].strip().strip('"')
-            files.append(part.removeprefix("-> ").strip())
+            # "XY path" — X/Y may be a space (" M path"), so never strip before slicing
+            part = line[3:].split(" -> ")[-1].strip().strip('"')
+            files.append(part)
         return files
 
     # ------------------------------------------------------------ push
@@ -112,3 +113,29 @@ class RepoWorkspace:
     def diff_files_vs_main(self) -> list[str]:
         proc = self._git("diff", "--name-only", "origin/main...HEAD", check=False)
         return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+
+    # ------------------------------------------------------------ verification
+    def verify_merge(
+        self, branch: str, cmd: list[str] | None = None, timeout: int = 300,
+    ) -> tuple[bool, str]:
+        """Tier-2 gate: merge origin/<branch> into a throw-away copy of origin/main
+        and run the full test command there. Always leaves the workspace on a
+        clean `main`. Returns (ok, note)."""
+        self.sync_main()
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "verify/tmp", "origin/main")
+            merge = self._git("merge", "--no-edit", "--no-ff", f"origin/{branch}", check=False)
+            if merge.returncode != 0:
+                self._git("merge", "--abort", check=False)
+                return False, f"merge conflict with main: {(merge.stdout + merge.stderr)[-300:]}"
+            code, out = self.run_command(
+                cmd or [sys.executable, "-m", "pytest", "-q", "-x"], timeout=timeout)
+            if code in (0, 5):          # 5 = no tests collected
+                return True, ""
+            return False, f"tests failed on main+PR (exit {code}): {out[-400:]}"
+        except RuntimeError as exc:
+            return False, str(exc)
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "verify/tmp", check=False)

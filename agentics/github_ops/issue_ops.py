@@ -76,3 +76,14 @@ def close_issue_with_summary(repo: Repository, issue_number: int, summary: str) 
     issue = repo.get_issue(issue_number)
     issue.create_comment(f"## Result\n\n{summary}")
     issue.edit(state="closed")
+
+
+def create_issue_if_absent(
+    repo: Repository, title: str, body: str, labels: list[str] | None = None,
+) -> Issue | None:
+    """Open an issue unless an open one with the same title already exists
+    (keeps the Supervisor from flooding the backlog). Returns the new issue or None."""
+    for issue in repo.get_issues(state="open"):
+        if issue.pull_request is None and issue.title == title:
+            return None
+    return repo.create_issue(title=title, body=body, labels=labels or [])

@@ -1,4 +1,4 @@
-"""Agentics CLI — run / stop / status / test-llm / assign-roles."""
+"""Agentics CLI — run / stop / status / metrics / test-llm / assign-roles."""
 from __future__ import annotations
 
 import asyncio
@@ -89,6 +89,34 @@ def status() -> None:
     console.print(f"[bold]Accounts loaded:[/] {len(pool)}")
     for line in pool.status_lines():
         console.print(f"  {line}")
+    memory.close()
+
+
+@app.command()
+def metrics(
+    days: int = typer.Option(0, "--days", help="only the last N days (0 = all time)"),
+) -> None:
+    """How is the lab itself evolving? Outcomes of agent work from the shared traces (offline)."""
+    import time as _t
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    since = _t.time() - days * 86400 if days > 0 else 0.0
+    st = memory.trace_stats(since)
+    rate = "n/a" if st["merge_rate"] is None else f"{st['merge_rate']:.0%}"
+    console.print(f"[bold]Outcomes:[/] {st['by_outcome']}   [bold]merge rate:[/] {rate} "
+                  f"(of {st['judged']} judged: merged / rejected / failed)")
+    table = Table(title="By category")
+    for col in ("category", "merged", "rejected", "failed", "yield", "pending/approved"):
+        table.add_column(col)
+    for cat, o in sorted(st["by_category"].items()):
+        table.add_row(cat, str(o.get("merged", 0)), str(o.get("rejected", 0)),
+                      str(o.get("failed", 0)), str(o.get("yield", 0)),
+                      str(o.get("pending", 0) + o.get("approved", 0)))
+    console.print(table)
     memory.close()
 
 

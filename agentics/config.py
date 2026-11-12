@@ -45,6 +45,11 @@ class Settings:
     claim_ttl_minutes: int = field(
         default_factory=lambda: _env_int("CLAIM_TTL_MINUTES", 45)
     )
+    # Self-evolution: Supervisor opens an evidence-based "self-evolution" issue every
+    # N of its cycles (0 disables). See docs/EVOLUTION.md.
+    evolution_every_n_cycles: int = field(
+        default_factory=lambda: _env_int("EVOLUTION_EVERY_N_CYCLES", 10)
+    )
     # Research domain
     research_topic: str = field(
         default_factory=lambda: _env(

@@ -33,6 +33,9 @@ class ResearchState(TypedDict, total=False):
     plan: str
     changed_files: list[str]
     commit_message: str
+    category: str                  # issue category (research/code/docs/...)
+    verification: str              # tier-1 result, shown in the PR body
+    reuses: list[str]              # registry tools the plan says it reuses
     # review artifacts
     pr_number: int
     pr_url: str
