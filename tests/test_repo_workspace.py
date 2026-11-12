@@ -6,14 +6,16 @@ from agentics.config import Settings
 from agentics.github_ops.repo_workspace import RepoWorkspace
 
 
-def test_git_credentials_are_not_embedded_in_remote_url_or_config(tmp_path):
+def test_git_credentials_are_not_embedded_in_remote_url_or_config(tmp_path, monkeypatch):
     token = "test-token-never-print"
     workspace = RepoWorkspace("agent-test", Settings(github_token=token, data_dir=tmp_path))
 
     assert token not in workspace._remote
     assert "x-access-token:" not in workspace._remote
 
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-secret")
     env = workspace._git_env()
+    assert "GITHUB_TOKEN" not in env
     index = int(env["GIT_CONFIG_COUNT"]) - 1
     header = env[f"GIT_CONFIG_VALUE_{index}"]
     encoded = header.split("basic ", 1)[1]
