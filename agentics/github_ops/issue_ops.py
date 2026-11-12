@@ -28,7 +28,9 @@ def scan_open_issues(repo: Repository, limit: int = 30) -> list[Issue]:
     The cache is only a discovery optimization. Claim acquisition must still
     re-read the target issue and atomically verify its current claim labels.
     """
-    key = (int(repo.id), int(limit))
+    # Duck-typed repo id: real Repository objects always have `.id`; fakes and
+    # thin wrappers may not — fall back to object identity for the cache key.
+    key = (getattr(repo, "id", id(repo)), int(limit))
     now = time.monotonic()
     with _SCAN_CACHE_LOCK:
         cached = _SCAN_CACHE.get(key)
@@ -79,11 +81,20 @@ def claim_issue(repo: Repository, issue_number: int, agent_id: str, ttl_minutes:
     except Exception as exc:  # noqa: BLE001
         log.error("cannot add label on #%s: %s", issue_number, exc)
         return False
-    issue.create_comment(
-        f"{CLAIM_PREFIX} @{agent_id}\n\n"
-        f"Claimed at `{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}`, "
-        f"TTL {ttl_minutes} min. Branch prefix `agent/{agent_id}/`."
-    )
+    # The label is the authoritative cross-process lock. A claim comment is
+    # informational: if it fails (e.g. transient network drop) do NOT roll the
+    # claim back — a failed rollback here could orphan the label and lock the
+    # issue forever. The owner's release/sweep path removes the label later.
+    try:
+        issue.create_comment(
+            f"{CLAIM_PREFIX} @{agent_id}\n\n"
+            f"Claimed at `{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}`, "
+            f"TTL {ttl_minutes} min. Branch prefix `agent/{agent_id}/`."
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "claim comment failed on #%s (label stands): %s", issue_number, exc
+        )
     return True
 
 

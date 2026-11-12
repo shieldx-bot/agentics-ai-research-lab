@@ -5,11 +5,23 @@ from __future__ import annotations
 import logging
 from functools import cached_property
 
-from github import Github, Repository
+from github import Auth, Github, GithubRetry, Repository
 
 from agentics.config import Settings
 
 log = logging.getLogger("gh.client")
+
+# Unattended lab etiquette: poll gently, absorb secondary rate limits (403 with
+# Retry-After) and transient connection drops instead of failing the cycle.
+# - secondary_rate_wait 60s: patient between secondary-limit retries
+# - max_rate_limit_wait 900s: give up (raise) rather than freeze a cycle for
+#   most of an hour when the primary quota is exhausted
+# - timeout 30s: fail fast on dead connections instead of hanging a node
+_GITHUB_RETRY = GithubRetry(
+    secondary_rate_wait=60,
+    max_rate_limit_wait=900,
+)
+_GITHUB_TIMEOUT_S = 30
 
 
 class GitHubClient:
@@ -17,7 +29,12 @@ class GitHubClient:
         if not settings.github_token:
             raise RuntimeError("GITHUB_TOKEN is not set — cannot talk to GitHub")
         self.settings = settings
-        self.gh = Github(settings.github_token, per_page=50)
+        self.gh = Github(
+            auth=Auth.Token(settings.github_token),
+            per_page=50,
+            timeout=_GITHUB_TIMEOUT_S,
+            retry=_GITHUB_RETRY,
+        )
 
     @cached_property
     def repo(self) -> Repository.Repository:

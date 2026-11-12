@@ -177,6 +177,12 @@ def test_composer_timeout_on_challenge_opens_backend_circuit(tmp_path, monkeypat
     class MissingComposer:
         def locator(self, _selector):
             class Locator:
+                # Playwright's Locator.first returns another Locator; the fake
+                # mirrors that so the client's chained lookup works.
+                @property
+                def first(self):
+                    return self
+
                 async def wait_for(self, **_kwargs):
                     raise TimeoutError("no composer")
             return Locator()

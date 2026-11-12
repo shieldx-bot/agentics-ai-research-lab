@@ -52,6 +52,16 @@ def _role_map(settings: Settings) -> dict[int, str]:
     return role_map
 
 
+def _startup_delay_s(index: int) -> float:
+    """Deterministic per-agent startup stagger.
+
+    Ten agents booting at once fire ten synchronized issue scans + claim
+    attempts — exactly the burst that trips GitHub secondary rate limits
+    (403 storms). Spreading first cycles over ~1 minute keeps volume flat.
+    """
+    return float(min(max(0, index) * 7, 60))
+
+
 class Orchestrator:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or load_yaml_overrides(Settings())
@@ -127,11 +137,18 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] lease heartbeat failed: %s", ctx.agent_id, exc)
 
-    async def _agent_loop(self, ctx: AgentContext) -> None:
+    async def _agent_loop(self, ctx: AgentContext, index: int = 0) -> None:
         tag = f"{ctx.agent_id}/{ctx.role.value}"
         log.info("[%s] thread up", tag)
         heartbeat_task = asyncio.create_task(self._lease_heartbeat(ctx))
         try:
+            delay = _startup_delay_s(index)
+            if delay > 0 and not should_stop():
+                log.info("[%s] staggered start in %.0fs (anti-burst)", tag, delay)
+                waited = 0.0
+                while waited < delay and not should_stop():
+                    await asyncio.sleep(min(1.0, delay - waited))
+                    waited += 1.0
             while not should_stop():
                 try:
                     ctx.heartbeat("cycle-start")
@@ -188,7 +205,10 @@ class Orchestrator:
         contexts = self.build_contexts()
         log.info("starting %d agent threads (roles: %s)",
                  len(contexts), [c.role.value for c in contexts])
-        tasks = [asyncio.create_task(self._agent_loop(c)) for c in contexts]
+        tasks = [
+            asyncio.create_task(self._agent_loop(c, i))
+            for i, c in enumerate(contexts)
+        ]
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:

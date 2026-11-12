@@ -81,3 +81,15 @@ cùng một repo mà không giẫm chân nhau.
 
 ## P11 — Self-evolution có rào chắn
 - PR `evolution` chỉ được sửa allowlist. Chi tiết và giới hạn: [EVOLUTION.md](EVOLUTION.md).
+
+## P12 — Nhịp lịch sự với GitHub API
+- Mọi agent dùng chung **cache scan issue 45s** (một lần GET list cho cả đàn, không mỗi agent
+  một lần) — chống bão 403/secondary rate limit đã gặp trong vận hành thật.
+- Agent khởi động **so le** (mỗi agent cách nhau 7s, tối đa 60s) để các chu kỳ đầu không bung
+  đồng loạt scan + claim.
+- `GitHubClient` cấu hình rõ: `timeout=30s`, `GithubRetry(secondary_rate_wait=60,
+  max_rate_limit_wait=900)` — 403 có `Retry-After` được chờ và thử lại trong suốt, quota chính
+  cạn thì fail nhanh thay vì đóng băng chu kỳ.
+- Claim issue: **label là khoá chính tắc**. Comment claim fail (network) không được rollback
+  claim — rollback thất bại sẽ để lại label mồ côi khoá issue vĩnh viễn (đã gặp ở issue #19).
+  Nhánh release/sweep của agent sở hữu sẽ dọn label sau.
