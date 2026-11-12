@@ -1,5 +1,6 @@
 """Unit tests for fail-closed rootless Docker execution (no daemon required)."""
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -78,12 +79,12 @@ def test_workspace_fails_closed_when_sandbox_is_unavailable(tmp_path, monkeypatc
     )
     workspace = RepoWorkspace("agent-1", settings)
     workspace.path.mkdir(parents=True)
-    workspace.write_file("probe.py", "print('should not run')\\n")
+    workspace.write_file("probe.py", "print('should not run')\n")
 
     def refuse(*args, **kwargs):
         raise SandboxError("Docker daemon unavailable")
 
     monkeypatch.setattr(DockerSandboxRunner, "run", refuse)
-    code, output = workspace.run_command(["/usr/local/bin/python", "probe.py"])
+    code, output = workspace.run_command([sys.executable, "probe.py"])
     assert code == 126
     assert "execution refused" in output
