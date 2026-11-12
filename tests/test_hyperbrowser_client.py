@@ -153,3 +153,59 @@ def test_lab_yaml_without_secrets_still_loads(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "PROJECT_ROOT", tmp_path)
     s = cfg.get_settings()
     assert s.browser_backend == "local"
+
+
+
+# ------------------------------------------------------ failure classification
+def test_challenge_detection_is_explicit():
+    from agentics.llm.hyperbrowser_client import HyperbrowserClient
+    assert HyperbrowserClient._challenge_text("Access Verification")
+    assert HyperbrowserClient._challenge_text("Verify you are human")
+    assert not HyperbrowserClient._challenge_text("Welcome to Perplexity")
+
+
+def test_composer_timeout_on_challenge_opens_backend_circuit(tmp_path, monkeypatch):
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path),
+    )
+
+    class MissingComposer:
+        def locator(self, _selector):
+            class Locator:
+                async def wait_for(self, **_kwargs):
+                    raise TimeoutError("no composer")
+            return Locator()
+
+    client._page = MissingComposer()
+
+    async def diagnostics():
+        return {
+            "url": "https://www.perplexity.ai/",
+            "title": "Access Verification",
+            "body": "Verify you are human",
+        }
+
+    monkeypatch.setattr(client, "_page_diagnostics", diagnostics)
+    with pytest.raises(hb.HyperbrowserBackendUnavailable):
+        asyncio_run(client._wait_for_composer())
+    assert hb._BACKEND_COOLDOWN_UNTIL > 0
+    assert "verification" in hb._BACKEND_COOLDOWN_REASON.lower()
+
+
+def test_backend_circuit_rejects_new_account_sessions(tmp_path, monkeypatch):
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", __import__("time").monotonic() + 60)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "verification page")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-02", cookies=[]),
+        _settings(tmp_path),
+    )
+    with pytest.raises(hb.HyperbrowserBackendUnavailable, match="circuit open"):
+        asyncio_run(client.ask("test"))
+    assert client._session_id is None
