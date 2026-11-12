@@ -42,7 +42,9 @@ def _push_branch(w, name, files: dict[str, str]):
     git(w.seed, "pull", "-q", "origin", "main")
     git(w.seed, "checkout", "-q", "-B", name)
     for path, text in files.items():
-        (w.seed / path).write_text(text)
+        target = w.seed / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
     git(w.seed, "add", "-A")
     git(w.seed, "commit", "-m", name)
     git(w.seed, "push", "-q", "-f", "origin", name)
@@ -57,13 +59,17 @@ def test_changed_files_lists_each_new_file_not_the_directory(ws):
 
 
 def test_verify_merge_runs_checks_on_main_plus_pr_and_cleans_up(ws):
-    _push_branch(ws, "feat-ok", {"feature.txt": "hello\n"})
-    probe = [
-        sys.executable,
-        "-c",
-        "import pathlib,sys; sys.exit(0 if pathlib.Path('feature.txt').exists() else 1)",
-    ]
-    ok, note = ws.verify_merge("feat-ok", cmd=probe)
+    _push_branch(
+        ws,
+        "feat-ok",
+        {
+            "feature.txt": "hello\n",
+            # probe ships as a pytest file — the workspace allowlist only runs
+            # python -m pytest / py_compile, never arbitrary `python -c` code
+            "tests/test_feature_probe.py": "from pathlib import Path\n\n\ndef test_feature_present():\n    assert Path('feature.txt').exists()\n",
+        },
+    )
+    ok, note = ws.verify_merge("feat-ok")
     assert ok, note  # the PR's file was present in the merged tree
     cur = subprocess.run(
         ["git", "branch", "--show-current"], cwd=ws.path, capture_output=True, text=True
@@ -73,9 +79,13 @@ def test_verify_merge_runs_checks_on_main_plus_pr_and_cleans_up(ws):
 
 
 def test_verify_merge_reports_failing_checks(ws):
-    _push_branch(ws, "feat-bad", {"feature.txt": "hello\n"})
-    ok, note = ws.verify_merge("feat-bad", cmd=[sys.executable, "-c", "raise SystemExit(3)"])
-    assert not ok and "exit 3" in note
+    _push_branch(
+        ws,
+        "feat-bad",
+        {"feature.txt": "hello\n", "tests/test_probe.py": "def test_always_fails():\n    assert False\n"},
+    )
+    ok, note = ws.verify_merge("feat-bad")
+    assert not ok and "tests failed on main+PR (exit 1)" in note
 
 
 def test_verify_merge_detects_conflict_with_current_main(ws):
@@ -85,6 +95,6 @@ def test_verify_merge_detects_conflict_with_current_main(ws):
     git(ws.seed, "add", "-A")
     git(ws.seed, "commit", "-m", "main moved on")
     git(ws.seed, "push", "-q", "origin", "main")
-    ok, note = ws.verify_merge("feat-conflict", cmd=[sys.executable, "-c", "pass"])
+    ok, note = ws.verify_merge("feat-conflict")
     assert not ok and "conflict" in note
     assert (ws.path / "a.txt").read_text() == "from main\n"  # workspace left clean
