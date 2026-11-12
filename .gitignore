@@ -17,6 +17,7 @@ dist/
 accounts/*.json
 accounts/*.txt
 !accounts/*.example
+!accounts/*.example.json
 !accounts/README.md
 *.token
 

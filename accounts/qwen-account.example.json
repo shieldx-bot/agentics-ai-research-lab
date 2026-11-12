@@ -1,0 +1,12 @@
+{
+  "_comment": "Qwen account template. Copy to accounts/qwen-account-01.json (gitignored). Export cookies from a LIVE logged-in chat.qwen.ai tab (Cookie-Editor, all domains) — the export must include acw_tc/tfstk/cna or the WAF will block API calls. refresh_token comes from the refresh_token cookie (30-day TTL); access_token from localStorage key 'token' (15-minute TTL, refreshed automatically).",
+  "cookies": [
+    {"name": "cna", "value": "REDACTED", "domain": ".qwen.ai"},
+    {"name": "acw_tc", "value": "REDACTED", "domain": "chat.qwen.ai"},
+    {"name": "tfstk", "value": "REDACTED", "domain": ".qwen.ai"},
+    {"name": "refresh_token", "value": "REDACTED", "domain": ".qwen.ai"}
+  ],
+  "refresh_token": "eyJhbGciOi...REDACTED",
+  "access_token": "",
+  "model": "qwen4.0-max-preview"
+}
