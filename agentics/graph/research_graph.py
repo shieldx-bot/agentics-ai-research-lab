@@ -61,7 +61,10 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     g.add_node("plan", plan_node)
     g.add_node("implement", implement_node)
     g.add_node("open_pr", lambda s: node_open_pr(ctx, s))
-    g.add_node("review", lambda s: node_review(ctx, s))
+    async def review_node(state: ResearchState) -> ResearchState:
+        return await node_review(ctx, state)
+
+    g.add_node("review", review_node)
     g.add_node("integrate", lambda s: node_integrate(ctx, s))
     g.add_node("reflect", lambda s: node_reflect(ctx, s))
 
