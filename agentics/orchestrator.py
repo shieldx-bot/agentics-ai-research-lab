@@ -90,35 +90,68 @@ class Orchestrator:
         return contexts
 
     # ------------------------------------------------------------ runtime
+    async def _lease_heartbeat(self, ctx: AgentContext) -> None:
+        """Keep the agent liveness record and its active issue leases fresh."""
+        interval = max(1.0, min(ctx.claims.ttl_s / 3.0, 30.0))
+        while True:
+            await asyncio.sleep(interval)
+            ctx.heartbeat("working")
+            lost = await asyncio.to_thread(ctx.claims.renew_agent_claims, ctx.agent_id)
+            if lost:
+                ctx.memory.post_message(
+                    ctx.agent_id, "alert",
+                    f"Lost expired claim lease(s): {lost}",
+                )
+
     async def _agent_loop(self, ctx: AgentContext) -> None:
         tag = f"{ctx.agent_id}/{ctx.role.value}"
         log.info("[%s] thread up", tag)
-        while not should_stop():
+        heartbeat_task = asyncio.create_task(self._lease_heartbeat(ctx))
+        try:
+            while not should_stop():
+                try:
+                    ctx.heartbeat("cycle-start")
+                    await run_cycle(ctx)
+                    ctx.heartbeat("cycle-end")
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("[%s] cycle failed: %s", tag, exc)
+                    ctx.memory.post_message(ctx.agent_id, "alert", f"cycle error: {exc}")
+                    # A failed graph invocation cannot safely retain its issue lease.
+                    try:
+                        await asyncio.to_thread(
+                            ctx.claims.release_agent_claims,
+                            ctx.agent_id,
+                            f"cycle failed: {type(exc).__name__}",
+                        )
+                    except Exception as release_exc:  # noqa: BLE001
+                        log.warning("[%s] claim cleanup failed: %s", tag, release_exc)
+                    # cookie trouble → cooldown & maybe swap account
+                    if ctx.llm is not None and ("4" in str(exc)[:2] or "auth" in str(exc).lower()):
+                        self.pool.mark_failed(ctx.llm.account, str(exc))
+                        nxt = self.pool.lease()
+                        if nxt is not None:
+                            ctx.llm = self.pool.client_for(nxt)
+                            log.info("[%s] switched to account %s", tag, nxt.name)
+                pause = self.settings.cycle_pause_seconds + random.uniform(0, 15)
+                for _ in range(int(pause)):
+                    if should_stop():
+                        break
+                    await asyncio.sleep(1)
+        finally:
+            heartbeat_task.cancel()
             try:
-                ctx.heartbeat("cycle-start")
-                await run_cycle(ctx)
-                ctx.heartbeat("cycle-end")
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await asyncio.to_thread(
+                    ctx.claims.release_agent_claims, ctx.agent_id, "agent shutdown"
+                )
             except Exception as exc:  # noqa: BLE001
-                log.exception("[%s] cycle failed: %s", tag, exc)
-                ctx.memory.post_message(ctx.agent_id, "alert", f"cycle error: {exc}")
-                # cookie trouble → cooldown & maybe swap account
-                if ctx.llm is not None and ("4" in str(exc)[:2] or "auth" in str(exc).lower()):
-                    self.pool.mark_failed(ctx.llm.account, str(exc))
-                    nxt = self.pool.lease()
-                    if nxt is not None:
-                        ctx.llm = self.pool.client_for(nxt)
-                        log.info("[%s] switched to account %s", tag, nxt.name)
-            pause = self.settings.cycle_pause_seconds + random.uniform(0, 15)
-            for _ in range(int(pause)):
-                if should_stop():
-                    break
-                await asyncio.sleep(1)
-        # graceful exit: release any live claim
-        for issue_no, claim in list(ctx.memory.active_claims().items()):
-            if claim.agent == ctx.agent_id:
-                ctx.claims.release(issue_no, ctx.agent_id, "shutdown")
-        ctx.meta["personal"].close()
-        log.info("[%s] thread stopped gracefully", tag)
+                log.warning("[%s] shutdown claim cleanup failed: %s", tag, exc)
+            ctx.heartbeat("stopped")
+            ctx.meta["personal"].close()
+            log.info("[%s] thread stopped gracefully", tag)
 
     async def run_forever(self) -> None:
         contexts = self.build_contexts()
