@@ -50,6 +50,18 @@ class Settings:
     evolution_every_n_cycles: int = field(
         default_factory=lambda: _env_int("EVOLUTION_EVERY_N_CYCLES", 10)
     )
+    # Untrusted code execution: fail closed when Docker sandbox is unavailable.
+    sandbox_enabled: bool = field(default_factory=lambda: _env_bool("SANDBOX_ENABLED", True))
+    sandbox_image: str = field(
+        default_factory=lambda: _env("SANDBOX_IMAGE", "agentics-sandbox:py311")
+    )
+    sandbox_require_rootless: bool = field(
+        default_factory=lambda: _env_bool("SANDBOX_REQUIRE_ROOTLESS", True)
+    )
+    sandbox_cpu_millis: int = field(default_factory=lambda: _env_int("SANDBOX_CPU_MILLIS", 1000))
+    sandbox_memory_mb: int = field(default_factory=lambda: _env_int("SANDBOX_MEMORY_MB", 1024))
+    sandbox_pids_limit: int = field(default_factory=lambda: _env_int("SANDBOX_PIDS_LIMIT", 128))
+    sandbox_tmpfs_mb: int = field(default_factory=lambda: _env_int("SANDBOX_TMPFS_MB", 128))
     # Research domain
     research_topic: str = field(
         default_factory=lambda: _env(
