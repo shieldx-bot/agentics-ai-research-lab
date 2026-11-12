@@ -166,7 +166,9 @@ prediction of NFV network functions"):
 Constraints of cloud-browser mode (free plan):
 
 * exactly ONE active session — asks are globally serialized and a switching
-  account evicts the previous holder's session; run `MAX_AGENTS=1`
+  account evicts the previous holder's session. The orchestrator now caps
+  Hyperbrowser mode at one agent per process (even if `MAX_AGENTS` is higher),
+  preventing agent threads from evicting one another's browser sessions.
 * each `ask()` navigates a fresh Perplexity thread (~60–140 s round trip)
 * offline unit tests never create sessions; live check:
   `HB_API_KEY=... python scripts/live_research_run.py`
