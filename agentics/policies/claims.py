@@ -33,6 +33,14 @@ class ClaimPolicy:
         except Exception as exc:  # noqa: BLE001
             log.error("github claim failed on #%s: %s", issue_number, exc)
             self.memory.release_claim(issue_number, agent_id)
+            # The GitHub label may have been added before a comment/API failure.
+            try:
+                issue_ops.release_issue(
+                    self.repo, issue_number, agent_id, "claim acquisition rolled back"
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                log.warning("claim rollback cleanup failed on #%s: %s",
+                            issue_number, cleanup_exc)
             return False
         if not ok:
             self.memory.release_claim(issue_number, agent_id)
