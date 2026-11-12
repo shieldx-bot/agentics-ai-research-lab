@@ -147,19 +147,28 @@ class Orchestrator:
                         break
                     await asyncio.sleep(1)
         finally:
-            heartbeat_task.cancel()
             try:
+                heartbeat_task.cancel()
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
-            try:
-                await asyncio.to_thread(
-                    ctx.claims.release_agent_claims, ctx.agent_id, "agent shutdown"
-                )
             except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] heartbeat cleanup failed: %s", tag, exc)
+            # Critical cleanup must survive the task's own cancellation (it
+            # runs during Ctrl-C shutdown, when the task is being cancelled).
+            try:
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        ctx.claims.release_agent_claims, ctx.agent_id, "agent shutdown"
+                    )
+                )
+            except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
                 log.warning("[%s] shutdown claim cleanup failed: %s", tag, exc)
-            ctx.heartbeat("stopped")
-            ctx.meta["personal"].close()
+            try:
+                ctx.heartbeat("stopped")
+                ctx.meta["personal"].close()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] shutdown bookkeeping failed: %s", tag, exc)
             log.info("[%s] thread stopped gracefully", tag)
 
     async def run_forever(self) -> None:
@@ -169,8 +178,23 @@ class Orchestrator:
         tasks = [asyncio.create_task(self._agent_loop(c)) for c in contexts]
         try:
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass                    # Ctrl-C -> asyncio.run cancels this task
         finally:
-            await self.host.close_all()   # stop cloud sessions / sockets
+            # Deterministic teardown: cancel every agent thread and WAIT for
+            # the cancellations to land before closing resources. Without the
+            # awaited gather, asyncio destroys still-pending tasks and dumps
+            # the "Task was destroyed but it is pending!" noise seen at shutdown.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            log.info("all agent threads stopped, closing sessions")
+            try:
+                await self.host.close_all()   # stop cloud sessions / sockets
+            except Exception as exc:  # noqa: BLE001
+                log.warning("session close during shutdown failed: %s", exc)
             self.memory.close()
 
     def status(self) -> str:

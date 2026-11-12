@@ -464,7 +464,11 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
     pr_to_review = await asyncio.to_thread(ctx.gh.repo.get_pull, candidate.number)
     if verdict == "approve":
-        await asyncio.to_thread(pr_ops.approve_review, pr_to_review, comment)
+        # Shared-PAT mode: GitHub rejects self-APPROVE; approve_review falls
+        # back to COMMENT + `approved-by/<agent>` label and returns the event.
+        await asyncio.to_thread(
+            pr_ops.approve_review, pr_to_review, comment, ctx.agent_id
+        )
         author = candidate.title.split("]")[0].lstrip("[") or "agent"
         await asyncio.to_thread(ctx.merge_queue.enqueue, candidate.number, author=author)
         await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "approved")
