@@ -118,3 +118,21 @@ def test_reflect_does_not_release_completed_pr_claim():
     node_reflect(ctx, {"issue_number": 24, "pr_number": 8, "summary": "PR opened"})
 
     assert released == []
+
+def test_complete_claim_marks_done_and_removes_github_label(memory, monkeypatch):
+    released = []
+    monkeypatch.setattr(
+        claims_module.issue_ops, "release_issue",
+        lambda repo, issue, agent, reason: released.append((issue, agent, reason)),
+    )
+    policy = _policy(memory)
+    assert memory.claim_issue(25, "agent-a", 60, "agent/a/25")
+
+    policy.complete(25, "agent-a", "agent/a/25")
+
+    row = memory._conn.execute(
+        "SELECT status, branch FROM claims WHERE issue=?", (25,)
+    ).fetchone()
+    assert row == ("done", "agent/a/25")
+    assert 25 not in memory.claims_for_agent("agent-a")
+    assert released and released[0][0:2] == (25, "agent-a")
