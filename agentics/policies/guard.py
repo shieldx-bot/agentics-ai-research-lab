@@ -44,9 +44,14 @@ class ProtectedPathsGuard:
         self,
         paths: tuple[str, ...] | list[str] = DEFAULT_PROTECTED_PATHS,
         allow_env_override: bool = True,
+        writable_roots: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         self.paths = tuple(paths) or DEFAULT_PROTECTED_PATHS
         self.allow_env_override = allow_env_override
+        # Optional second ring ("cấm tuyệt đối"): when set, ANY file outside
+        # these roots is refused even though it is not machinery — the union
+        # of the ownership surfaces by default (see configs/lab.yaml).
+        self.writable_roots = tuple(writable_roots) if writable_roots else None
 
     # ------------------------------------------------------------ checks
     def is_protected(self, path: str) -> bool:
@@ -75,11 +80,27 @@ class ProtectedPathsGuard:
           but NEVER the ALWAYS_PROTECTED credentials/secret paths;
         - ``ALLOW_PROTECTED_PATHS=1`` (owner env switch) lifts everything.
         """
-        if self._env_allows_all():
-            return [f for f in changed_files if self._always_protected(f)]
-        if task_exempt:
-            return [f for f in changed_files if self._always_protected(f)]
-        return [f for f in changed_files if self.is_protected(f)]
+        if self._env_allows_all() or task_exempt:
+            out = [f for f in changed_files if self._always_protected(f)]
+        else:
+            out = [f for f in changed_files
+                   if self.is_protected(f) or self._outside_writable(f)]
+        return list(dict.fromkeys(out))          # dedup, keep order
+
+    def _outside_writable(self, path: str) -> bool:
+        """True when the whitelist ring is active and `path` is outside it."""
+        if not self.writable_roots:
+            return False
+        norm = (path or "").strip()
+        while norm.startswith("./"):
+            norm = norm[2:]
+        norm = norm.lstrip("/")
+        return not any(
+            norm == root.rstrip("/")
+            or norm.startswith(root)
+            or (("*" in root or "?" in root) and fnmatch.fnmatch(norm, root))
+            for root in self.writable_roots
+        )
 
     def _always_protected(self, path: str) -> bool:
         norm = (path or "").strip().lstrip("./")

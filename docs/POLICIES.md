@@ -127,13 +127,69 @@ Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`):
 `accounts/` và `configs/secrets.yaml` (credentials) **không bao giờ** được
 miễn, kể cả với exception.
 
-**Tầng 4 — DETECT** (`agentics/sandbox/integrity.py`): 3 tầng trên ngăn
-*changeset* của agent chạm vào engine, nhưng chưa có gì bảo vệ **cây runtime
-mà chính lab đang chạy từ đó** — một merge hỏng, một process lọt qua guard,
-hay owner sửa tay đều có thể thay đổi engine giữa chừng mà không ai hay.
+**Tầng 4a — DETECT trên cây runtime** (`agentics/sandbox/integrity.py`): 3 tầng
+trên ngăn *changeset* của agent chạm vào engine, nhưng chưa có gì bảo vệ **cây
+runtime mà chính lab đang chạy từ đó** — một merge hỏng, một process lọt qua
+guard, hay owner sửa tay đều có thể thay đổi engine giữa chừng mà không ai hay.
 `IntegrityGuard` hash toàn bộ `agentics/`, `configs/`, `scripts/` và các file
 dependency lúc khởi động (`data/integrity/baseline.json`); Supervisor kiểm tra
 lại mỗi chu kỳ thứ 5; bất kỳ drift nào trở thành `integrity_alert` trên journal
 + alert trong memory — là cảnh báo, không phải dừng vòng lặp: owner quyết định.
 Owner kiểm tra bất kỳ lúc nào bằng `python -m agentics.cli verify` (chấp nhận
 thay đổi đã review: `--refresh`).
+
+---
+
+## P10 bổ sung — whitelist ring "cấm tuyệt đối" + lớp 4b tự phục hồi workspace
+*(đóng góp từ người đến sau trên chính nhánh này — bổ trợ tầng 4a, không thay thế)*
+
+**Vòng ngoài (whitelist):** ngoài danh sách protected, guard còn hỗ trợ
+`writable_roots` — khi được cấu hình (mặc định trong `configs/lab.yaml` là hợp
+các vùng ownership), MỌI file ngoài các gốc đó đều bị từ chối kể cả khi không
+phải machinery (file lạ ở gốc repo, thư mục dữ liệu bẩn...). Owner exemption
+theo task vẫn nâng được vòng này; `accounts/` và `configs/secrets.yaml` thì
+không bao giờ.
+
+**Tầng 4b — DETECT + tự phục hồi trên workspace của agent**
+(`agentics/policies/integrity.py`): tầng 4a bảo vệ cây runtime, nhưng agent
+*không chạy code trong cây runtime* — chúng chạy trong clone riêng dưới
+`data/workspaces/`, nơi script thí nghiệm được phép chạy Python qua
+`run_command` và có thể tính toán đường dẫn lúc runtime rồi ghi đè code lab
+trong clone của mình. `IntegrityWatcher` re-hash các cây protected trong MỖI
+workspace mỗi `INTEGRITY_INTERVAL_S` giây (mặc định 20, 0 = tắt); drift
+(sửa / xóa / file mới trong vùng cấm) được **hoàn tác từ git ngay lập tức**
+và ghi journal `integrity_drift` — dashboard báo đỏ. Hai watcher chia mặt
+phẳng: 4a = cây runtime (chỉ phát hiện, owner quyết định), 4b = workspace
+(phát hiện + tự lành, vì clone là tài sản tái tạo được từ main).
+
+`main` của bare repo không cần watcher nào: nó chỉ tiến qua merge queue đã qua
+đủ 3 tầng guard.
+
+---
+
+## P13 — File locks: hai agent không đè tay nhau
+
+**Vấn đề:** mỗi agent một workspace riêng, nên hai agent cùng khai báo sửa một
+file chỉ phát hiện nhau ở bước merge (conflict) hoặc tệ hơn — làm trùng việc.
+
+**Chính sách:** ở bước **plan**, danh sách file dự kiến được **khóa toàn cục**
+(SQLite, TTL = `FILE_LOCK_TTL_MINUTES`, mặc định 30 phút). Agent khác có plan
+chạm vào file đang bị giữ sẽ bị **yield ngay trước khi đốt chu kỳ implement**,
+kèm journal `lock_conflict` hiển thị trên dashboard. Khóa acquire kiểu
+all-or-nothing (không bao giờ giữ nửa plan). Agent chết → khóa tự hết hạn;
+supervisor quét dọn lock hết hạn mỗi chu kỳ scan; agent nhả khóa khi kết thúc
+chu kỳ (reflect).
+
+---
+
+## P14 — Intent binding: diff phải nằm trong phạm vi đã tuyên bố
+
+**Vấn đề:** dashboard hiển thị intent (goal/steps/expected_files) do agent
+công bố ở `report()` — nhưng nếu diff thật đi ra ngoài phạm vi tuyên bố thì
+intent chỉ là trưng bày.
+
+**Chính sách:** `node_implement` đối chiếu `changed_files` với
+`expected_files` đã khóa ở plan. File nào nằm ngoài phạm vi tuyên bố → yield
+toàn bộ chu kỳ, journal `scope_violation` (kèm cả danh sách khai báo lẫn
+file vượt phạm vi) — owner thấy ngay sự lệch giữa **lời khai** và **việc làm**.
+Plan rỗng file (task thu hồi tài liệu vào memory) không bị kiểm tra này.

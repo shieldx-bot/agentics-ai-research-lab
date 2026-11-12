@@ -241,6 +241,16 @@ class Orchestrator:
                 log.warning("[%s] shutdown bookkeeping failed: %s", tag, exc)
             log.info("[%s] thread stopped gracefully", tag)
 
+    async def _integrity_loop(self) -> None:
+        """P10 layer 4 — self-healing: re-hash the protected trees inside every
+        agent workspace; drift (a rogue script that bypassed the action-time
+        gates) is restored from git and journalled for the dashboard."""
+        from agentics.policies.integrity import IntegrityWatcher
+
+        watcher = IntegrityWatcher(
+            self.memory, self.local.guard, self.settings.workspaces_dir)
+        await watcher.run(self.settings.integrity_interval_s)
+
     async def run_forever(self) -> None:
         contexts = self.build_contexts()
         log.info("starting %d agent threads (roles: %s)",
@@ -249,6 +259,9 @@ class Orchestrator:
             asyncio.create_task(self._agent_loop(c, i))
             for i, c in enumerate(contexts)
         ]
+        watcher_task = None
+        if int(getattr(self.settings, "integrity_interval_s", 0) or 0) > 0:
+            watcher_task = asyncio.create_task(self._integrity_loop())
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -263,6 +276,9 @@ class Orchestrator:
                     t.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            if watcher_task is not None:
+                watcher_task.cancel()
+                await asyncio.gather(watcher_task, return_exceptions=True)
             log.info("all agent threads stopped, closing sessions")
             try:
                 await self.host.close_all()   # stop cloud sessions / sockets

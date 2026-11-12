@@ -210,13 +210,21 @@ class LocalOps:
 
     def __init__(self, memory: SharedMemory, settings: Settings) -> None:
         from agentics.policies.guard import DEFAULT_PROTECTED_PATHS, ProtectedPathsGuard
+        from agentics.policies.intent import FileLockManager
 
         self.memory = memory
         self.settings = settings
         self.repo = LocalRepo(settings)
         self.tasks = TaskSource(memory, settings)
         paths = tuple(getattr(settings, "protected_paths", None) or ())
-        self.guard = ProtectedPathsGuard(paths=paths or DEFAULT_PROTECTED_PATHS)
+        roots = tuple(getattr(settings, "writable_roots", None) or ())
+        self.guard = ProtectedPathsGuard(
+            paths=paths or DEFAULT_PROTECTED_PATHS,
+            writable_roots=roots or None,
+        )
+        # P13 — plan-time file locks shared by the whole swarm
+        ttl_minutes = int(getattr(settings, "file_lock_ttl_minutes", 30) or 30)
+        self.locks = FileLockManager(memory, ttl_s=ttl_minutes * 60)
 
     def setup(self) -> None:
         """One-time preparation: seed the bare repo and the starter backlog."""

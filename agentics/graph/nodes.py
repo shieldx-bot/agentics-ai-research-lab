@@ -21,6 +21,7 @@ from agentics.evolution.traces import (
     evolution_path_allowed, valid_tool_name,
 )
 from agentics.local_ops import branch_name
+from agentics.policies.intent import scope_violations
 from agentics.memory import lifemem
 from agentics.memory.vector_store import VectorStore
 from agentics.research import citations as cite_fmt
@@ -99,6 +100,10 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Supervisor: sweep stale claims, keep the local backlog fed."""
     state["action"] = "scan"
     freed = ctx.claims.sweep_stale()
+    try:                       # P13 hygiene: dead agents must not hold files
+        stale_locks = ctx.memory.sweep_file_locks()
+    except Exception:  # noqa: BLE001
+        stale_locks = []
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
@@ -113,6 +118,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     summary = (
         f"Backlog scan: {len(tasks)} open unclaimed task(s)."
         + (f" Stale claims freed: {freed}." if freed else "")
+        + (f" Stale file locks freed: {stale_locks}." if stale_locks else "")
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
@@ -320,15 +326,38 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     state["reuses"] = reuses
     for name in reuses:
         ctx.memory.bump_tool_use(name)      # no-op if the name is not registered
+    expected_files = [f.get("path", "") for f in (parsed.get("files") or [])][:15]
+    expected_files = [f for f in expected_files if f]
+    state["expected_files"] = expected_files
     ctx.report(
         node="plan",
         intent={
             "goal": f"Implement task #{state.get('issue_number')}: {state.get('issue_title', '')}",
             "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
-            "expected_files": [f.get("path", "") for f in (parsed.get("files") or [])][:15],
+            "expected_files": expected_files,
             "why": f"category={state.get('category', 'other')}",
         },
     )
+    # P13 — lock the declared scope across the swarm: another agent already
+    # planning the same files is stopped BEFORE burning LLM cycles on implement.
+    locks = getattr(getattr(ctx, "local", None), "locks", None)
+    if locks is not None and expected_files:
+        ok, conflicts = await asyncio.to_thread(
+            locks.try_acquire_all, ctx.agent_id, expected_files)
+        if not ok:
+            ctx.memory.journal(ctx.agent_id, "lock_conflict", {
+                "task": state.get("issue_number"),
+                "files": expected_files,
+                "held_by": conflicts,
+            })
+            return await _yield(
+                ctx, state,
+                f"P13 files already locked by other agents: "
+                f"{list(conflicts.items())[:3]} — pick another angle",
+            )
+        ctx.memory.journal(ctx.agent_id, "intent_bound", {
+            "task": state.get("issue_number"), "files": expected_files,
+        })
     return state
 
 
@@ -403,6 +432,23 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 ctx, state,
                 f"P10 protected paths in diff: {violations[:5]} "
                 "(agent code is owner-only; the owner can exempt a task)",
+            )
+
+    # P14 — the diff must stay inside the declared intent scope. An undeclared
+    # file in the diff means the plan drifted; refuse and journal it.
+    expected = state.get("expected_files") or []
+    if expected:
+        drift = scope_violations(changed, expected)
+        if drift:
+            ctx.memory.journal(ctx.agent_id, "scope_violation", {
+                "task": state.get("issue_number"),
+                "undeclared": drift[:10],
+                "declared": expected,
+            })
+            return await _yield(
+                ctx, state,
+                f"P14 files outside the declared intent: {drift[:5]} "
+                "(re-plan or declare them)",
             )
 
     # Guard: self-evolution PRs may only touch the allow-listed paths.
@@ -683,6 +729,16 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
             log.warning("could not cluster trace #%s: %s", trace_id, exc)
     ctx.report(node="reflect", status="cycle-end",
                intent={"goal": "cycle complete", "steps": []})
+    locks = getattr(getattr(ctx, "local", None), "locks", None)
+    if locks is not None:
+        try:
+            released = locks.release_agent(ctx.agent_id)
+            if released:
+                ctx.memory.journal(ctx.agent_id, "locks_released",
+                                   {"files": released[:15]})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not release file locks for %s: %s",
+                        ctx.agent_id, exc)
     ctx.heartbeat("cycle-end")
     state["done"] = True
     return state

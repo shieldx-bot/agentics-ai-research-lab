@@ -159,6 +159,12 @@ CREATE TABLE IF NOT EXISTS skills (
     uses INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_skills_cluster ON skills(cluster_id, status);
+CREATE TABLE IF NOT EXISTS file_locks (
+    path TEXT PRIMARY KEY,                  -- normalized relative path
+    agent TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
 """
 
 
@@ -923,6 +929,69 @@ class SharedMemory:
                 "UPDATE merge_queue SET status=?, attempts = attempts + ? WHERE pr_number=?",
                 (status, 1 if bump_attempt else 0, pr_number),
             )
+
+    # ------------------------------------------------------------ file locks (P13)
+    def acquire_file_lock(self, path: str, agent: str, ttl_s: float) -> bool:
+        """Atomic per-file lock: a live lock held by another agent wins."""
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT agent, expires_at FROM file_locks WHERE path=?", (path,)
+            ).fetchone()
+            if row:
+                holder, expires_at = row
+                if expires_at > now and holder != agent:
+                    return False
+                self._conn.execute(
+                    "UPDATE file_locks SET agent=?, acquired_at=?, expires_at=? "
+                    "WHERE path=?", (agent, now, now + ttl_s, path),
+                )
+                return True
+            try:
+                self._conn.execute(
+                    "INSERT INTO file_locks (path, agent, acquired_at, expires_at) "
+                    "VALUES (?,?,?,?)", (path, agent, now, now + ttl_s),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def release_file_lock(self, path: str, agent: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM file_locks WHERE path=? AND agent=?", (path, agent),
+            )
+            return cur.rowcount == 1
+
+    def release_agent_locks(self, agent: str) -> list[str]:
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT path FROM file_locks WHERE agent=?", (agent,)
+            ).fetchall()
+            self._conn.execute("DELETE FROM file_locks WHERE agent=?", (agent,))
+        return [r[0] for r in rows]
+
+    def active_file_locks(self) -> list[dict]:
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT path, agent, acquired_at, expires_at FROM file_locks "
+                "WHERE expires_at > ? ORDER BY path", (now,),
+            ).fetchall()
+        return [{"path": r[0], "agent": r[1], "acquired_at": r[2],
+                 "expires_at": r[3]} for r in rows]
+
+    def sweep_file_locks(self) -> list[str]:
+        """Drop expired locks (dead agents must not freeze files forever)."""
+        now = time.time()
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT path FROM file_locks WHERE expires_at <= ?", (now,)
+            ).fetchall()
+            if rows:
+                self._conn.execute(
+                    "DELETE FROM file_locks WHERE expires_at <= ?", (now,))
+        return [r[0] for r in rows]
 
     def close(self) -> None:
         with self._lock:

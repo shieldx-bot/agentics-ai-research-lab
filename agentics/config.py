@@ -117,6 +117,19 @@ class Settings:
                         "agentics/,configs/,accounts/,scripts/,.github/").split(",")
         if p.strip()
     ])
+    # P14 — optional whitelist ring ("cấm tuyệt đối"): when non-empty, ANY
+    # file outside these roots is refused for every agent (owner exemption
+    # per task still lifts it; credentials are never writable). Empty = off.
+    # Default lives in configs/lab.yaml as the union of the ownership surfaces.
+    writable_roots: list[str] = field(default_factory=lambda: [
+        p for p in _env("WRITABLE_ROOTS", "").split(",") if p.strip()
+    ])
+    # P13 — per-file lock TTL in the swarm (anti "hai agent đè tay nhau").
+    file_lock_ttl_minutes: int = field(
+        default_factory=lambda: _env_int("FILE_LOCK_TTL_MINUTES", 30))
+    # P10 layer 4 — integrity self-healing sweep interval (0 = off).
+    integrity_interval_s: int = field(
+        default_factory=lambda: _env_int("INTEGRITY_INTERVAL_S", 20))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(

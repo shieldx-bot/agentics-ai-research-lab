@@ -37,6 +37,12 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
         ],
         "merge_queue": memory.mq_pending(),
         "reviews": reviews,
+        "locks": memory.active_file_locks(),
+        "alerts": [
+            e for e in memory.recent_journal(limit=120)
+            if e.get("event") in ("integrity_drift", "scope_violation",
+                                  "lock_conflict")
+        ][:12],
         "memory": memory.memory_stats(),
         "activity": memory.recent_journal(limit=40),
     }
@@ -116,6 +122,10 @@ _HTML = """<!doctype html>
   <div class="card"><h2>Claims &amp; Merge queue</h2>
     <div class="kv" id="claims"></div>
     <div class="kv" id="mq" style="margin-top:8px"></div></div>
+  <div class="card"><h2>File locks (P13 — ai đang giữ file nào)</h2>
+    <table id="locks"><thead><tr><th>File</th><th>Agent</th><th>Hết hạn</th></tr></thead><tbody></tbody></table></div>
+  <div class="card"><h2>Cảnh báo guard / intent (P10/P13/P14)</h2>
+    <div class="acts" id="alerts"></div></div>
   <div class="card"><h2>Bộ nhớ (trí nhớ chung)</h2>
     <div class="kv" id="memory"></div></div>
   <div class="card" style="grid-column:1/-1"><h2>Nhật ký hoạt động (journal)</h2>
@@ -165,6 +175,17 @@ function render(s){
   document.getElementById("mq").innerHTML = (s.merge_queue||[]).length
     ? "Merge queue: " + (s.merge_queue||[]).map(m=>`MR #${m.pr_number} (${esc(m.author)})`).join(", ")
     : "Merge queue: trống";
+  document.querySelector("#locks tbody").innerHTML = (s.locks||[]).map(l=>`
+    <tr><td>${esc(l.path)}</td><td><b>${esc(l.agent)}</b></td>
+    <td class="kv">còn ${Math.max(0, Math.round(l.expires_at - s.ts))}s</td></tr>`).join("")
+    || '<tr><td colspan="3" class="kv">không có khóa nào</td></tr>';
+  const alerts = s.alerts||[];
+  document.getElementById("alerts").innerHTML = alerts.length
+    ? alerts.slice().reverse().map(e=>`
+      <div class="row"><span class="tm">${hhmmss(e.ts)}</span>
+      <span class="ev" style="color:var(--bad)">${esc(e.event)}</span>
+      <span class="dt">${esc(typeof e.detail==="string"?e.detail:JSON.stringify(e.detail))}</span></div>`).join("")
+    : '<div class="kv">không có cảnh báo nào — mọi lớp guard còn nguyên vẹn</div>';
   const m = s.memory || {};
   document.getElementById("memory").innerHTML =
     `traces: <b>${m.traces??0}</b> (clustered ${m.clustered??0}) · clusters: <b>${m.clusters??0}</b> · ` +

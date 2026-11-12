@@ -127,6 +127,14 @@ push, cửa merge). Exception DUY NHẤT là owner chạy
 `python -m agentics.cli allow-protected <task_id>` (coi `accounts/` và
 `configs/secrets.yaml` không bao giờ được miễn).
 
+**Các lớp bổ sung trên nhánh này (P13/P14 + integrity):** danh sách file dự
+kiến ở bước plan được **khóa toàn cục** (P13 — agent khác đụng trúng bị dừng
+trước khi đốt chu kỳ); diff ở bước implement phải nằm trong **phạm vi intent
+đã tuyên bố** (P14 — lệch phạm vi bị yield + báo dashboard); và một
+**IntegrityWatcher** quét định kỳ (~20s) tự hoàn tác mọi thay đổi vùng cấm
+bị script lạc ghi đè trong workspace — `INTEGRITY_INTERVAL_S=0` để tắt.
+Chi tiết: `docs/POLICIES.md` (P10 bổ sung, P13, P14).
+
 ---
 
 ## 4. Vai trò (roles) & luồng công việc
