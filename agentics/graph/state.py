@@ -1,13 +1,26 @@
 """ResearchState — the LangGraph state flowing through one research cycle."""
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, TypedDict
 
 
 def merge_unique(current: list, incoming: list) -> list:
-    seen, out = set(current), list(current)
-    for item in incoming:
-        key = item if isinstance(item, str) else item.get("id", str(item))
+    """Append-only reducer that keeps the first occurrence of each item.
+
+    Items may be unhashable (papers are dicts), so the seen-set is built
+    from a stable JSON key instead of putting items into a set directly.
+    """
+    out: list = []
+    seen: set[str] = set()
+    for item in [*current, *incoming]:
+        if isinstance(item, str):
+            key = item
+        else:
+            try:
+                key = json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                key = repr(item)
         if key not in seen:
             seen.add(key)
             out.append(item)

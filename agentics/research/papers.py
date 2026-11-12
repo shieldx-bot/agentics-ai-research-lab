@@ -41,11 +41,22 @@ async def search_papers(
     return resp
 
 
-async def dedup_query(vector: VectorStore, query: str, n: int = 5) -> list[dict]:
-    """Check whether the swarm already researched this topic (P7)."""
+# Cosine/L2 distance threshold for the MiniLM embeddings Chroma uses by default:
+# pairs below this are considered "same topic" for the P7 duplicate gate.
+DEDUP_MAX_DISTANCE = 0.85
+
+
+async def dedup_query(
+    vector: VectorStore, query: str, n: int = 5, max_distance: float = DEDUP_MAX_DISTANCE,
+) -> list[dict]:
+    """Check whether the swarm already researched this topic (P7).
+
+    Only results within `max_distance` of the query count as duplicates —
+    similarity matters, not raw result count.
+    """
     if not vector.available:
         return []
-    return vector.search(query, n=n)
+    return [r for r in vector.search(query, n=n) if r.get("distance", 1e9) <= max_distance]
 
 
 async def summarize_for_memory(resp: LLMResponse) -> str:

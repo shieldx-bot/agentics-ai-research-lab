@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -23,28 +24,32 @@ CREATE TABLE IF NOT EXISTS state (
 class PersonalMemory:
     def __init__(self, agent_id: str, base_dir: Path) -> None:
         base_dir.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(base_dir / f"{agent_id}.db"))
+        # Graph nodes run in LangGraph's executor threads, so the connection must
+        # be usable across threads; a lock serialises concurrent access.
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(base_dir / f"{agent_id}.db"), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
 
     # lessons
     def add_lesson(self, lesson: str, issue: int | None = None) -> None:
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO lessons (ts, issue, lesson) VALUES (?,?,?)",
                 (time.time(), issue, lesson),
             )
 
     def recent_lessons(self, limit: int = 20) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT lesson FROM lessons ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT lesson FROM lessons ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
         return [r[0] for r in reversed(rows)]
 
     # key-value state (survives restarts → continuity across infinite cycles)
     def set_state(self, key: str, value: str) -> None:
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO state (key, value, updated_at) VALUES (?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=?, updated_at=?",
@@ -52,10 +57,12 @@ class PersonalMemory:
             )
 
     def get_state(self, key: str, default: str = "") -> str:
-        row = self._conn.execute(
-            "SELECT value FROM state WHERE key=?", (key,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM state WHERE key=?", (key,)
+            ).fetchone()
         return row[0] if row else default
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

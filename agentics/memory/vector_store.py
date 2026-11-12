@@ -64,6 +64,10 @@ class VectorStore:
         out: list[dict[str, Any]] = []
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
-        for doc, meta in zip(docs, metas):
-            out.append({"text": doc, "meta": meta or {}})
+        dists = (res.get("distances") or [[]])[0]
+        for i, (doc, meta) in enumerate(zip(docs, metas)):
+            entry = {"text": doc, "meta": meta or {}}
+            if i < len(dists):
+                entry["distance"] = dists[i]
+            out.append(entry)
         return out
