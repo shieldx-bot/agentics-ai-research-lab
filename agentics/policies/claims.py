@@ -63,7 +63,14 @@ class ClaimPolicy:
         return issue_numbers
 
     def complete(self, issue_number: int, agent_id: str, branch: str) -> None:
+        """Mark local work complete and remove the visible GitHub claim label."""
         self.memory.complete_claim(issue_number, agent_id, branch)
+        try:
+            issue_ops.release_issue(
+                self.repo, issue_number, agent_id, f"handed off to PR branch {branch}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("GitHub claim label cleanup failed on #%s: %s", issue_number, exc)
 
     def sweep_stale(self, stale_after_s: float = 900.0) -> list[int]:
         """Release expired leases or claims whose owner heartbeat has gone stale."""
