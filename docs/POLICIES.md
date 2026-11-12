@@ -38,6 +38,9 @@ cùng một repo mà không giẫm chân nhau.
 - Trước mỗi merge: `git fetch` + rebase nhánh PR lên `main` mới nhất; conflict →
   trả lại cho agent tạo PR tự rebase (Integrator comment `/rebase-request`).
 - Merge method mặc định: **rebase-merge** (lịch sử phẳng, dễ truy vết).
+- **Auto-merge mặc định tắt**. Chỉ owner bật `AUTO_MERGE=true` sau khi đã xác minh
+  branch protection, CI bắt buộc, secret scanning và cross-review. PR không được
+  tự approve; Integrator vẫn phải kiểm tra trạng thái CI và quyền merge.
 
 ## P5 — Cross-review bắt buộc
 - PR phải được **1 agent khác** (khác tác giả) review `APPROVE` mới vào hàng đợi merge.

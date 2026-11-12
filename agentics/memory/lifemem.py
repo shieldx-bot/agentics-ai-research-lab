@@ -142,21 +142,43 @@ def assign_trace(
 def maybe_split(
     memory: SharedMemory, cluster_id: int,
     volume: int = SPLIT_VOLUME, tau_mrl: float = SPLIT_TAU_MRL,
+    llm_ask: Callable[[str], str] | None = None,
 ) -> bool:
-    """LifeMem's adaptive partitioning: split iff n > volume AND R < tau_mrl."""
-    members = [m["attempted"] for m in memory.cluster_members(cluster_id)
-               if m["attempted"]]
-    if len(members) <= volume:
+    """Split a large, heterogeneous cluster without losing trace/label alignment.
+
+    Empty-attempt traces are deliberately excluded from both the vectors and
+    the move operation. After a successful split, refresh skills for BOTH
+    resulting clusters so neither retains a stale cross-workflow abstraction.
+    """
+    eligible = [m for m in memory.cluster_members(cluster_id) if m["attempted"].strip()]
+    if len(eligible) <= volume:
         return False
-    r = mean_resultant_length([embed(t) for t in members])
-    if r >= tau_mrl:                      # homogeneous: splitting adds no value
+    vectors = [embed(m["attempted"]) for m in eligible]
+    if mean_resultant_length(vectors) >= tau_mrl:
         return False
-    labels = two_means_split([embed(t) for t in members])
+    labels = two_means_split(vectors)
+    if len(labels) != len(eligible) or len(set(labels)) < 2:
+        return False
+
     category = memory.get_cluster(cluster_id)["category"]
-    new_id = memory.create_cluster(category, memory.get_cluster(cluster_id)["description"] + " (split)")
-    for m, lb in zip(memory.cluster_members(cluster_id), labels):
-        if lb == 1:
-            memory.set_trace_cluster(m["id"], new_id)
+    description = memory.get_cluster(cluster_id)["description"]
+    new_id = memory.create_cluster(category, description + " (split)")
+    moved = 0
+    for member, label in zip(eligible, labels):
+        if label == 1:
+            memory.set_trace_cluster(member["id"], new_id)
+            moved += 1
+    if moved == 0 or moved == len(eligible):
+        # Defensive rollback: avoid leaving an empty or degenerate cluster.
+        for member in eligible:
+            if memory.trace_cluster(member["id"]) == new_id:
+                memory.set_trace_cluster(member["id"], cluster_id)
+        return False
+
+    # Re-distill after membership changes; each skill now reflects its own
+    # verified merged traces rather than the pre-split mixed cluster.
+    distill_skill(memory, cluster_id, llm_ask=llm_ask)
+    distill_skill(memory, new_id, llm_ask=llm_ask)
     return True
 
 
@@ -230,8 +252,8 @@ def on_merge(
         cid = assign_trace(memory, tid, tr["category"], tr["attempted"])
         if cid is None:
             continue
-        maybe_split(memory, cid)
-        if distill_skill(memory, cid, llm_ask=llm_ask) and cid not in touched:
+        split = maybe_split(memory, cid, llm_ask=llm_ask)
+        if (split or distill_skill(memory, cid, llm_ask=llm_ask)) and cid not in touched:
             touched.append(cid)
     return touched
 

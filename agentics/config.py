@@ -41,7 +41,7 @@ class Settings:
     cycle_pause_seconds: int = field(
         default_factory=lambda: _env_int("CYCLE_PAUSE_SECONDS", 60)
     )
-    auto_merge: bool = field(default_factory=lambda: _env_bool("AUTO_MERGE", True))
+    auto_merge: bool = field(default_factory=lambda: _env_bool("AUTO_MERGE", False))
     claim_ttl_minutes: int = field(
         default_factory=lambda: _env_int("CLAIM_TTL_MINUTES", 45)
     )
