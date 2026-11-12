@@ -50,6 +50,36 @@ _HOME = "https://www.perplexity.ai"
 _ACADEMIC_PREFIX = "[Prefer peer-reviewed academic sources: arXiv, IEEE, ACM, Springer.] "
 _CITE_RE = re.compile(r"^https?://")
 
+# A challenge or frontend outage is shared by every cookie account. Keep a
+# process-wide circuit breaker so agents do not rotate accounts and create
+# more cloud sessions against the same unavailable page.
+_BACKEND_COOLDOWN_UNTIL = 0.0
+_BACKEND_COOLDOWN_REASON = ""
+
+
+class HyperbrowserError(RuntimeError):
+    """Base class for browser-session failures."""
+
+
+class HyperbrowserAuthError(HyperbrowserError):
+    """The injected Perplexity session is no longer authenticated."""
+
+
+class HyperbrowserBackendUnavailable(HyperbrowserError):
+    """The frontend is challenged/unavailable; retry after the circuit opens."""
+
+
+class HyperbrowserUIError(HyperbrowserError):
+    """The page loaded but its expected composer could not be found."""
+
+
+def _open_backend_circuit(reason: str, cooldown_s: int = 300) -> None:
+    global _BACKEND_COOLDOWN_UNTIL, _BACKEND_COOLDOWN_REASON
+    _BACKEND_COOLDOWN_UNTIL = max(
+        _BACKEND_COOLDOWN_UNTIL, time.monotonic() + cooldown_s
+    )
+    _BACKEND_COOLDOWN_REASON = reason[:180]
+
 
 def _raw_cookie_export(account: CookieAccount) -> list | dict:
     """Prefer the raw cookie-editor export (CDP accepts it verbatim); fall
@@ -207,24 +237,88 @@ class HyperbrowserClient:
         await self._teardown()
 
     # ----------------------------------------------------------------- ui
+    async def _page_diagnostics(self) -> dict[str, str]:
+        """Return bounded, non-secret page metadata for actionable failures."""
+        try:
+            data = await self._page.evaluate("""() => ({
+                url: location.href,
+                title: document.title || "",
+                body: (document.body?.innerText || "").slice(0, 1200)
+            })""")
+        except Exception as exc:  # noqa: BLE001
+            return {"url": "", "title": "", "body": f"page inspection failed: {type(exc).__name__}"}
+        return {k: str(data.get(k, ""))[:1200] for k in ("url", "title", "body")}
+
+    @staticmethod
+    def _challenge_text(value: str) -> bool:
+        return bool(re.search(
+            r"access verification|verify you are human|captcha|"
+            r"checking your browser|security challenge|unusual traffic",
+            value,
+            re.IGNORECASE,
+        ))
+
     async def _goto_home(self) -> None:
         await self._page.goto(_HOME, timeout=60000, wait_until="domcontentloaded")
         await asyncio.sleep(6)
+        diag = await self._page_diagnostics()
+        combined = " ".join(diag.values())
+        if self._challenge_text(combined):
+            reason = f"Perplexity verification page detected ({diag['title']!r}, {diag['url']})"
+            _open_backend_circuit(reason, cooldown_s=600)
+            raise HyperbrowserBackendUnavailable(
+                reason + "; complete any required verification in a normal user browser "
+                "and retry later. Automated challenge solving is not supported."
+            )
         names = [c["name"] for c in await self._ctx.cookies(_HOME)]
         if not any("session-token" in n for n in names):
-            raise RuntimeError(
+            raise HyperbrowserAuthError(
                 f"{self.account.name}: session-token cookie missing after load "
-                "(account cookies invalid/expired?)")
+                f"(page={diag['title']!r}, url={diag['url']!r}; account session may be expired)"
+            )
+
+    async def _wait_for_composer(self):
+        # Keep the selector broad, but wait longer for the SPA to hydrate.
+        selectors = (
+            "textarea:visible, [contenteditable='true']:visible, "
+            "[role='textbox']:visible"
+        )
+        box = self._page.locator(selectors).first
+        try:
+            await box.wait_for(state="visible", timeout=45000)
+            return box
+        except Exception as exc:  # noqa: BLE001
+            diag = await self._page_diagnostics()
+            combined = " ".join(diag.values())
+            if self._challenge_text(combined):
+                reason = f"Perplexity verification page detected ({diag['title']!r}, {diag['url']})"
+                _open_backend_circuit(reason, cooldown_s=600)
+                raise HyperbrowserBackendUnavailable(
+                    reason + "; automated challenge solving is not supported"
+                ) from exc
+            # A visible sign-in state means this particular cookie is stale;
+            # a generic missing composer is a frontend/UI outage, not bad auth.
+            if re.search(r"sign\\s?in|log\\s?in", diag["body"][:500], re.IGNORECASE):
+                raise HyperbrowserAuthError(
+                    f"{self.account.name}: Perplexity rendered a sign-in page "
+                    f"(title={diag['title']!r}, url={diag['url']!r})"
+                ) from exc
+            reason = (
+                f"Perplexity composer unavailable after 45s "
+                f"(title={diag['title']!r}, url={diag['url']!r})"
+            )
+            _open_backend_circuit(reason, cooldown_s=180)
+            raise HyperbrowserUIError(
+                reason + "; inspect the page state before retrying"
+            ) from exc
 
     async def _submit(self, text: str) -> None:
-        box = self._page.locator(
-            "textarea:visible, [contenteditable='true']:visible").first
-        await box.wait_for(state="visible", timeout=25000)
+        box = await self._wait_for_composer()
         try:
             await box.click(timeout=4000)
         except Exception:  # noqa: BLE001
-            # onboarding popups / promo cards intercept pointer events —
-            # dismiss them, then focus the editor without a pointer hit-test
+            # A click interception can be caused by a normal modal. Do not
+            # attempt to dismiss or interact with security challenges.
             await self._page.keyboard.press("Escape")
             await asyncio.sleep(1)
             await box.focus()
@@ -292,6 +386,12 @@ class HyperbrowserClient:
         # Hyperbrowser plan runs a single session, so cross-account asks must
         # queue behind each other (and may evict the previous holder's session).
         async with _SESSION_LOCK:
+            if time.monotonic() < _BACKEND_COOLDOWN_UNTIL:
+                remaining = int(_BACKEND_COOLDOWN_UNTIL - time.monotonic())
+                raise HyperbrowserBackendUnavailable(
+                    f"Hyperbrowser/Perplexity frontend circuit open for {remaining}s: "
+                    f"{_BACKEND_COOLDOWN_REASON}"
+                )
             try:
                 await self._ensure_session()
                 await self._goto_home()
