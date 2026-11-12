@@ -71,12 +71,13 @@ def test_network_git_commands_receive_credentials_only_in_environment(tmp_path, 
     seen = {}
 
     def fake_run(args, **kwargs):
+        seen["cmd"] = args
         seen.update(kwargs)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     ws._git("fetch", "origin", "main")
-    assert "network-secret" not in " ".join(seen.get("args", []))
+    assert "network-secret" not in " ".join(seen["cmd"])
     assert "GIT_CONFIG_VALUE_0" in seen["env"]
 
 
