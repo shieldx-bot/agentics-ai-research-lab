@@ -441,7 +441,8 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     pr_to_review = ctx.gh.repo.get_pull(candidate.number)
     if verdict == "approve":
         pr_ops.approve_review(pr_to_review, comment)
-        ctx.merge_queue.enqueue(candidate.number, author=candidate.title.split("]")[0].lstrip("[") or "agent")
+        author = candidate.title.split("]")[0].lstrip("[") or "agent"
+        ctx.merge_queue.enqueue(candidate.number, author=author)
         ctx.memory.set_trace_outcome(candidate.number, "approved")
         state["review_verdict"] = "approve"
     else:
