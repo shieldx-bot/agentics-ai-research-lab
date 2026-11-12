@@ -1,0 +1,14 @@
+# Core
+langgraph>=0.2.60
+langchain-core>=0.3.29
+PyGithub>=2.5.0
+GitPython>=3.1.43
+aiohttp>=3.10.0
+websockets>=13.0
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+typer>=0.12.5
+rich>=13.7.1
+
+# Vector memory (optional but recommended)
+chromadb>=0.5.0

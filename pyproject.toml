@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentics-ai-research-lab"
+version = "0.1.0"
+description = "Multi-agent LangGraph research swarm with shared memory and GitHub-native workflow"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "shieldx-bot" }]
+dependencies = [
+    "langgraph>=0.2.60",
+    "langchain-core>=0.3.29",
+    "PyGithub>=2.5.0",
+    "GitPython>=3.1.43",
+    "aiohttp>=3.10.0",
+    "websockets>=13.0",
+    "PyYAML>=6.0.1",
+    "python-dotenv>=1.0.1",
+    "typer>=0.12.5",
+    "rich>=13.7.1",
+]
+
+[project.optional-dependencies]
+vector = ["chromadb>=0.5.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+agentics = "agentics.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["agentics*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

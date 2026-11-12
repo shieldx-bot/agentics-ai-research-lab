@@ -1,0 +1,78 @@
+"""Issue operations: scan, claim (P1), release, close with summary."""
+from __future__ import annotations
+
+import logging
+import re
+import time
+
+from github.Issue import Issue
+from github.Repository import Repository
+
+log = logging.getLogger("gh.issue")
+
+CLAIM_PREFIX = "/claim"
+CLAIMED_LABEL_RE = re.compile(r"^claimed/(\S+)$")
+
+
+def scan_open_issues(repo: Repository, limit: int = 30) -> list[Issue]:
+    """Open issues without any claimed/* label and not labelled `blocked`."""
+    issues: list[Issue] = []
+    for issue in repo.get_issues(state="open", sort="created", direction="asc"):
+        if issue.pull_request is not None:
+            continue
+        labels = {lb.name for lb in issue.labels}
+        if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
+            continue
+        if "blocked" in labels:
+            continue
+        issues.append(issue)
+        if len(issues) >= limit:
+            break
+    return issues
+
+
+def issue_holders(repo: Repository, issue_number: int) -> list[str]:
+    """Agents currently holding a claim on the issue (from labels + comments)."""
+    holders: list[str] = []
+    issue = repo.get_issue(issue_number)
+    for lb in issue.labels:
+        m = CLAIMED_LABEL_RE.match(lb.name)
+        if m:
+            holders.append(m.group(1))
+    return holders
+
+
+def claim_issue(repo: Repository, issue_number: int, agent_id: str, ttl_minutes: int) -> bool:
+    """Two-layer claim: shared memory is checked by the caller; here we do the
+    GitHub-side check+label as atomically as the REST API allows (P1)."""
+    issue = repo.get_issue(issue_number)
+    holders = issue_holders(repo, issue_number)
+    if holders and agent_id not in holders:
+        return False
+    label = f"claimed/{agent_id}"
+    try:
+        issue.add_to_labels(label)
+    except Exception as exc:  # noqa: BLE001
+        log.error("cannot add label on #%s: %s", issue_number, exc)
+        return False
+    issue.create_comment(
+        f"{CLAIM_PREFIX} @{agent_id}\n\n"
+        f"Claimed at `{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}`, "
+        f"TTL {ttl_minutes} min. Branch prefix `agent/{agent_id}/`."
+    )
+    return True
+
+
+def release_issue(repo: Repository, issue_number: int, agent_id: str, reason: str = "") -> None:
+    issue = repo.get_issue(issue_number)
+    try:
+        issue.remove_from_labels(f"claimed/{agent_id}")
+    except Exception:  # noqa: BLE001
+        pass
+    issue.create_comment(f"/release @{agent_id}\n\nReason: {reason or 'released'}")
+
+
+def close_issue_with_summary(repo: Repository, issue_number: int, summary: str) -> None:
+    issue = repo.get_issue(issue_number)
+    issue.create_comment(f"## Result\n\n{summary}")
+    issue.edit(state="closed")

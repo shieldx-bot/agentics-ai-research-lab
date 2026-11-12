@@ -1,0 +1,59 @@
+"""P1+P6 — claim coordination on top of shared memory + GitHub labels.
+
+Two-layer lock: shared memory (fast, local, atomic) + GitHub label (visible to
+everyone). An issue may only be worked on when BOTH agree the claim is free.
+"""
+from __future__ import annotations
+
+import logging
+
+from agentics.github_ops import issue_ops
+from agentics.github_ops.client import GitHubClient
+from agentics.memory.shared_memory import SharedMemory
+
+log = logging.getLogger("policy.claims")
+
+
+class ClaimPolicy:
+    def __init__(self, gh: GitHubClient, memory: SharedMemory, ttl_minutes: int) -> None:
+        self.repo = gh.repo
+        self.memory = memory
+        self.ttl_s = ttl_minutes * 60
+
+    def try_claim(self, issue_number: int, agent_id: str, branch: str = "") -> bool:
+        # Layer 1: local registry (atomic in SQLite)
+        if not self.memory.claim_issue(issue_number, agent_id, self.ttl_s, branch):
+            return False
+        # Layer 2: GitHub side (labels + comment)
+        try:
+            ok = issue_ops.claim_issue(
+                self.repo, issue_number, agent_id, ttl_minutes=self.ttl_s // 60
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("github claim failed on #%s: %s", issue_number, exc)
+            self.memory.release_claim(issue_number, agent_id)
+            return False
+        if not ok:
+            self.memory.release_claim(issue_number, agent_id)
+            return False
+        return True
+
+    def release(self, issue_number: int, agent_id: str, reason: str = "") -> None:
+        self.memory.release_claim(issue_number, agent_id)
+        try:
+            issue_ops.release_issue(self.repo, issue_number, agent_id, reason)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("github release failed on #%s: %s", issue_number, exc)
+
+    def complete(self, issue_number: int, agent_id: str, branch: str) -> None:
+        self.memory.complete_claim(issue_number, agent_id, branch)
+
+    def sweep_stale(self, stale_after_s: float = 900.0) -> list[int]:
+        """P6: free claims held by agents without fresh heartbeat."""
+        alive = {a["agent"] for a in self.memory.active_agents(stale_after_s)}
+        freed: list[int] = []
+        for issue_no, claim in self.memory.active_claims().items():
+            if claim.agent not in alive:
+                self.release(issue_no, claim.agent, "stale: agent lost heartbeat")
+                freed.append(issue_no)
+        return freed

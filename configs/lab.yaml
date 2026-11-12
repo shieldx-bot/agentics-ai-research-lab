@@ -1,0 +1,37 @@
+# Agentics AI Research Lab — runtime configuration
+# YAML values override .env where present. Secrets NEVER go here.
+
+# --- Swarm ---------------------------------------------------------------
+max_agents: 10
+cycle_pause_seconds: 60
+auto_merge: true
+claim_ttl_minutes: 45
+
+# --- Research ------------------------------------------------------------
+research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core automation"
+
+# --- Role assignment ------------------------------------------------------
+# Fixed mapping account index (1-based) -> role.
+# Remove/leave empty for automatic round-robin assignment.
+role_map:
+  1: supervisor
+  2: researcher
+  3: researcher
+  4: coder
+  5: coder
+  6: writer
+  7: reviewer
+  8: reviewer
+  9: integrator
+  # 10: auto
+
+# --- Ownership matrix (P3 in docs/POLICIES.md) -----------------------------
+ownership:
+  coder:    ["agentics/", "tests/", "scripts/"]
+  researcher: ["research_notes/"]
+  writer:   ["docs/", "README.md", "README*"]
+  integrator: [".github/"]
+  supervisor: ["configs/"]
+
+# --- Perplexity ------------------------------------------------------------
+pplx_timeout: 180
