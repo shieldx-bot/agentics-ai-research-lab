@@ -26,7 +26,9 @@ class RepoWorkspace:
         self._remote = f"https://github.com/{settings.github_repo}.git"
 
     def _git_env(self) -> dict[str, str]:
-        env = os.environ.copy()
+        blocked = ("TOKEN", "COOKIE", "PASSWORD", "SECRET", "API_KEY", "AUTHORIZATION")
+        env = {k: v for k, v in os.environ.items()
+               if not any(marker in k.upper() for marker in blocked)}
         token = self.settings.github_token
         if token:
             auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
