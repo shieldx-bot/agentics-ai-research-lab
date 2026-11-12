@@ -55,6 +55,19 @@ agentics/
 7. Sau merge: node `reflect` ghi lesson vào personal memory + broadcast tin nhắn
    vào shared memory cho các agent khác ở chu kỳ sau.
 
+## 2.1 Workspace execution and credential boundary
+
+- Git remotes use a credential-free HTTPS URL. Git authentication is supplied
+  to each child process through an ephemeral Git configuration header; it is
+  not written to `.git/config`.
+- Validation commands are restricted to the project's Python `py_compile`
+  and `pytest` invocations, with a bounded timeout and credential-like
+  environment variables removed.
+- This allowlist is defense-in-depth, **not an OS sandbox**. Do not run
+  untrusted agent code on a host containing production credentials; use a
+  container/VM sandbox with filesystem, network, CPU and memory restrictions
+  before enabling arbitrary tool execution.
+
 ## 3. LLM — Perplexity qua cookie
 
 - `PerplexityClient` kết nối `wss://www.perplexity.ai/socket.io/?EIO=4&transport=websocket`

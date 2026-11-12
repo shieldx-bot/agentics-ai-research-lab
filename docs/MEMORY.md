@@ -80,6 +80,15 @@ python -m agentics.cli memory-stats   # traces, clusters, active/superseded skil
 `Top skills` shows the most-activated distilled skills — if a skill's `uses`
 count grows while the merge rate stays flat, the skill tier is doing its job.
 
+### Reliability fixes
+
+- Cluster splitting must keep the filtered trace records and their 2-means labels
+  in the same order; empty-attempt traces remain attached to their original
+  cluster. After a split, each resulting cluster is re-distilled independently.
+- The offline hashed BoW implementation remains a baseline, not a semantic
+  embedding claim. Evaluate any future embedding replacement against retrieval
+  benchmarks before changing the default.
+
 ### Limits
 
 - Hashed BoW misses synonymy ("test suite" vs "tests"); the JOIN_THRESHOLD

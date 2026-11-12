@@ -142,6 +142,36 @@ def test_maybe_split_fires_only_on_large_and_loose_clusters(tmp_path):
         m.close()
 
 
+def test_maybe_split_keeps_labels_aligned_when_empty_trace_is_present(tmp_path):
+    m = SharedMemory(tmp_path / "m.db")
+    try:
+        cid = m.create_cluster("code", "mixed workflows")
+        texts_a = ("pytest suite runner assertions", "pytest suite runner fixtures",
+                   "pytest suite runner coverage", "pytest suite runner mocks")
+        texts_b = ("readme documentation prose", "readme documentation prose guide",
+                   "readme documentation prose intro", "readme documentation prose faq")
+        for i, value in enumerate(texts_a):
+            t = m.add_trace("a1", "coder", i, "merged", category="code", attempted=value)
+            m.set_trace_cluster(t, cid)
+        empty = m.add_trace("a1", "coder", 99, "pending", category="code", attempted="")
+        m.set_trace_cluster(empty, cid)
+        for i, value in enumerate(texts_b):
+            t = m.add_trace("a2", "coder", i, "merged", category="code", attempted=value)
+            m.set_trace_cluster(t, cid)
+
+        assert maybe_split(m, cid, volume=6, tau_mrl=0.95) is True
+        original = m.cluster_members(cid)
+        moved = [row for row in m.cluster_members(m.list_clusters("code")[-1]["cluster_id"])
+                 if row["attempted"]]
+        assert {row["attempted"] for row in original if row["attempted"]} == set(texts_a)
+        assert {row["attempted"] for row in moved} == set(texts_b)
+        assert m.trace_cluster(empty) == cid
+        # Each resulting cluster receives a skill distilled only from its merged traces.
+        assert len(m.list_skills("code")) == 2
+    finally:
+        m.close()
+
+
 # ---------------------------------------------------------------- distillation
 def test_distill_requires_verified_merges(tmp_path):
     m = SharedMemory(tmp_path / "m.db")
