@@ -185,6 +185,43 @@ def allow_protected(
 
 
 @app.command()
+def verify(
+    refresh: bool = typer.Option(False, "--refresh",
+                                 help="accept the current tree as the new baseline"),
+) -> None:
+    """Owner: has the RUNNING lab's own code been changed out-of-band?
+
+    Complements the P10 protected-paths guard: its three layers stop agent
+    changesets into the engine; this detects ANY drift of the runtime tree
+    the lab itself runs from (docs/LOCAL_MODE.md, hypothesis-1 layer 4).
+    """
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.sandbox.integrity import IntegrityGuard, verify as verify_tree
+
+    guard = IntegrityGuard(PROJECT_ROOT, settings.integrity_path)
+    if refresh:
+        count = guard.refresh_baseline()
+        console.print(f"[bold green]baseline refreshed[/] — {count} runtime file(s) hashed.")
+        return
+    baseline = guard.load()
+    if baseline is None:
+        guard.ensure_baseline()
+        console.print("[bold green]baseline created[/] (first run) — runtime tree hashed.")
+        return
+    drift = verify_tree(PROJECT_ROOT, baseline)
+    if not drift:
+        console.print("[bold green]OK[/] — the running lab matches its integrity baseline.")
+        return
+    console.print(f"[bold red]DRIFT:[/] {len(drift)} runtime file(s) differ from baseline:")
+    for d in drift[:20]:
+        console.print(f"  {d['kind']:<8} {d['path']}")
+    console.print("[dim]If these changes are yours (or reviewed), accept them with "
+                  "`agentics verify --refresh`.[/]")
+    raise typer.Exit(1)
+
+
+@app.command()
 def metrics(
     days: int = typer.Option(0, "--days", help="only the last N days (0 = all time)"),
 ) -> None:

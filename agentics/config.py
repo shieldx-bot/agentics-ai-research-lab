@@ -169,6 +169,11 @@ class Settings:
         return self.data_dir / "lab.git"
 
     @property
+    def integrity_path(self) -> Path:
+        """Baseline of the runtime tree's hashes (`agentics verify`, layer 4)."""
+        return self.data_dir / "integrity" / "baseline.json"
+
+    @property
     def dashboard_port(self) -> int:
         return _env_int("DASHBOARD_PORT", 8080)
 

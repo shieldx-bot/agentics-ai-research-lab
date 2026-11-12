@@ -75,6 +75,36 @@ class Orchestrator:
         self.local.setup()          # seed data/lab.git + the starter backlog
         self.ownership = OwnershipPolicy.from_config(None)
         self.agents: list[AgentContext] = []
+        self._integrity_baseline()
+
+    # ------------------------------------------------------------ integrity
+    def _integrity_baseline(self) -> None:
+        """DETECT layer: hash the tree the lab itself runs from at startup.
+
+        P10 changeset protection (guard.py) stops AGENT writes into the
+        engine; this catches everything else — a botched merge, an escaped
+        process, a manual edit. Drift is an owner-visible alert, never a
+        cycle-breaking error.
+        """
+        try:
+            from agentics.sandbox.integrity import IntegrityGuard
+
+            guard = IntegrityGuard(PROJECT_ROOT, self.settings.integrity_path)
+            existed, drift = guard.ensure_baseline()
+            if drift:
+                msg = (
+                    "Runtime integrity drift: %d file(s) differ from the baseline "
+                    "- run `agentics verify` (owner decision)" % len(drift)
+                )
+                self.memory.journal("orchestrator", "integrity_alert",
+                                    {"drift": drift[:10]})
+                self.memory.post_message("orchestrator", "alert", msg)
+                log.warning("runtime integrity drift: %d file(s) - see `agentics verify`",
+                            len(drift))
+            elif not existed:
+                log.info("integrity baseline created (first run)")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("integrity baseline failed: %s", exc)
 
     # ------------------------------------------------------------ assembly
     def build_contexts(self) -> list[AgentContext]:

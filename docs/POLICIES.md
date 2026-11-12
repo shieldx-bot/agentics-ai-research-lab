@@ -126,3 +126,14 @@ Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`):
 
 `accounts/` và `configs/secrets.yaml` (credentials) **không bao giờ** được
 miễn, kể cả với exception.
+
+**Tầng 4 — DETECT** (`agentics/sandbox/integrity.py`): 3 tầng trên ngăn
+*changeset* của agent chạm vào engine, nhưng chưa có gì bảo vệ **cây runtime
+mà chính lab đang chạy từ đó** — một merge hỏng, một process lọt qua guard,
+hay owner sửa tay đều có thể thay đổi engine giữa chừng mà không ai hay.
+`IntegrityGuard` hash toàn bộ `agentics/`, `configs/`, `scripts/` và các file
+dependency lúc khởi động (`data/integrity/baseline.json`); Supervisor kiểm tra
+lại mỗi chu kỳ thứ 5; bất kỳ drift nào trở thành `integrity_alert` trên journal
++ alert trong memory — là cảnh báo, không phải dừng vòng lặp: owner quyết định.
+Owner kiểm tra bất kỳ lúc nào bằng `python -m agentics.cli verify` (chấp nhận
+thay đổi đã review: `--refresh`).

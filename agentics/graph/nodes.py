@@ -118,8 +118,33 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     state["summary"] = summary
     _maybe_open_evolution_task(ctx, state)
+    _check_integrity(ctx)
     state["done"] = True
     return state
+
+
+def _check_integrity(ctx: AgentContext) -> None:
+    """DETECT layer (every 5th supervisor cycle): hash-check the tree the lab
+    itself runs from. P10 changeset protection stops agent writes into the
+    engine; this catches everything else (botched merge, escaped process,
+    manual edit). Drift is an owner-visible alert, never a cycle error."""
+    try:
+        if ctx.cycle % 5 != 0:
+            return
+        from agentics.config import PROJECT_ROOT
+        from agentics.sandbox.integrity import IntegrityGuard
+
+        guard = IntegrityGuard(PROJECT_ROOT, ctx.settings.integrity_path)
+        _, drift = guard.ensure_baseline()
+        if drift:
+            ctx.memory.journal(ctx.agent_id, "integrity_alert", {"drift": drift[:10]})
+            ctx.memory.post_message(
+                ctx.agent_id, "alert",
+                f"Runtime integrity drift: {len(drift)} file(s) differ from the "
+                "baseline - run `agentics verify` (owner decision)",
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("integrity check skipped: %s", exc)
 
 
 def _maybe_open_evolution_task(ctx: AgentContext, state: ResearchState) -> None:
