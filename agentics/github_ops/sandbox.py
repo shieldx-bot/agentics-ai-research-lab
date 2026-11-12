@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Sequence
@@ -90,8 +90,10 @@ class DockerSandboxRunner:
             "--network=none", "--read-only",
             "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
             f"--pids-limit={pids}", f"--memory={memory_mb}m",
+            f"--memory-swap={memory_mb}m",
             f"--cpus={cpu_millis / 1000:.3f}",
             "--ipc=private", "--ulimit=nofile=256:256",
+            "--ulimit=fsize=104857600:104857600", "--ulimit=core=0:0",
             f"--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={tmpfs_mb}m",
             "--tmpfs=/home/agent:rw,noexec,nosuid,nodev,size=16m",
             # In a rootless daemon, container UID 0 maps to the invoking host user.
@@ -105,11 +107,22 @@ class DockerSandboxRunner:
         ]
 
     @staticmethod
-    def _tail(stream, limit: int = 4000) -> str:
-        stream.seek(0, os.SEEK_END)
-        size = stream.tell()
-        stream.seek(max(0, size - limit))
-        return stream.read()
+    def _drain_output(pipe, tail: bytearray, limit: int = 4000) -> None:
+        """Drain child output without allowing unbounded host memory/disk growth."""
+        try:
+            while True:
+                chunk = pipe.read(8192)
+                if not chunk:
+                    break
+                tail.extend(chunk)
+                if len(tail) > limit:
+                    del tail[:-limit]
+        finally:
+            pipe.close()
+
+    @staticmethod
+    def _decode_tail(tail: bytearray) -> str:
+        return bytes(tail).decode("utf-8", errors="replace")
 
     def _stop_container(self, docker: str, env: dict[str, str], cidfile: Path) -> None:
         try:
@@ -134,33 +147,37 @@ class DockerSandboxRunner:
         cid_dir.mkdir(parents=True, exist_ok=True)
         cidfile = cid_dir / f"{uuid.uuid4().hex}.cid"
         docker_cmd = self.build_command(docker, workspace, command, cidfile)
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout, tempfile.TemporaryFile(
-            mode="w+t", encoding="utf-8"
-        ) as stderr:
+        tail = bytearray()
+        try:
+            proc = subprocess.Popen(
+                docker_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, env=env, start_new_session=True,
+            )
+        except OSError as exc:
+            raise SandboxError(f"cannot start Docker sandbox: {exc}") from exc
+        reader = threading.Thread(
+            target=self._drain_output, args=(proc.stdout, tail), daemon=True,
+        )
+        reader.start()
+        try:
+            proc.wait(timeout=timeout)
+            reader.join(timeout=5)
+            return proc.returncode, self._decode_tail(tail)
+        except subprocess.TimeoutExpired:
+            self._stop_container(docker, env, cidfile)
             try:
-                proc = subprocess.Popen(
-                    docker_cmd, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                    text=True, env=env, start_new_session=True,
-                )
-            except OSError as exc:
-                raise SandboxError(f"cannot start Docker sandbox: {exc}") from exc
-            try:
-                proc.wait(timeout=timeout)
-                return proc.returncode, self._tail(stdout) + self._tail(stderr)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._stop_container(docker, env, cidfile)
                 try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(proc.pid, 9)
-                    except ProcessLookupError:
-                        pass
-                    proc.kill()
-                    proc.wait(timeout=5)
-                return 124, (self._tail(stdout) + self._tail(stderr) + "\ntimeout")[-4000:]
-            finally:
-                try:
-                    cidfile.unlink(missing_ok=True)
-                except OSError:
+                    os.killpg(proc.pid, 9)
+                except ProcessLookupError:
                     pass
+                proc.kill()
+                proc.wait(timeout=5)
+            reader.join(timeout=5)
+            return 124, (self._decode_tail(tail) + "\ntimeout")[-4000:]
+        finally:
+            try:
+                cidfile.unlink(missing_ok=True)
+            except OSError:
+                pass
