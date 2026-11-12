@@ -16,6 +16,7 @@ from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, assign_roles
 from agentics.config import Settings, load_yaml_overrides, PROJECT_ROOT
 from agentics.github_ops.repo_workspace import RepoWorkspace
+from agentics.llm.errors import is_auth_failure
 from agentics.llm.session_host import BrowserSessionHost
 from agentics.local_ops import LocalClaimPolicy, LocalMergeQueue, LocalOps
 from agentics.memory.personal_memory import PersonalMemory
@@ -175,8 +176,10 @@ class Orchestrator:
                         log.warning("[%s] claim cleanup failed: %s", tag, release_exc)
                     # cookie trouble -> cooldown the account that served the
                     # call; the host re-leases a healthy one automatically at
-                    # the next ask
-                    if ctx.llm is not None and ("4" in str(exc)[:2] or "auth" in str(exc).lower()):
+                    # the next ask. is_auth_failure classifies precisely so a
+                    # generic cycle error that merely starts with "4" (or an
+                    # unrelated "auth" substring) cannot cool a healthy cookie.
+                    if ctx.llm is not None and is_auth_failure(exc):
                         ctx.llm.mark_failed(str(exc))
                 pause = self.settings.cycle_pause_seconds + random.uniform(0, 15)
                 for _ in range(int(pause)):

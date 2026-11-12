@@ -15,8 +15,14 @@ Only :func:`is_auth_failure` failures deserve an account cooldown.
 """
 from __future__ import annotations
 
+import re
+
+# HTTP status codes are matched with word boundaries so "403ms" or a port
+# number cannot masquerade as an auth failure.
+_HTTP_AUTH_STATUS = re.compile(r"\b(?:401|403)\b")
+
 AUTH_MARKERS: tuple[str, ...] = (
-    "401", "403", "unauthorized", "session-token", "sign in", "login",
+    "unauthorized", "session-token", "sign in", "login",
     "log in", "bad cookie", "invalid api key", "api key",
 )
 
@@ -50,7 +56,10 @@ def is_llm_failure(exc: BaseException) -> bool:
 def is_auth_failure(exc: BaseException) -> bool:
     """True when the failure is credential-specific (cookie/token dead) —
     only these deserve an account cooldown."""
-    if type(exc).__name__ == "HyperbrowserAuthError":
+    name = type(exc).__name__
+    if name == "HyperbrowserAuthError" or name.endswith("AuthError"):
         return True
     msg = str(exc).lower()
+    if _HTTP_AUTH_STATUS.search(msg):
+        return True
     return any(marker in msg for marker in AUTH_MARKERS)

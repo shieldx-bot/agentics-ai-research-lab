@@ -36,9 +36,19 @@ def test_plain_runtime_auth_failures_are_auth(exc):
     RuntimeError("connection dropped mid-stream"),
     RuntimeError("no usable browser-session account for purpose 'plan'"),
     TimeoutError("composer wait exceeded"),
+    # the two false positives the orchestrator's old heuristic produced
+    ValueError("4 attempts exhausted before response"),
+    RuntimeError("cycle finished in 403ms"),
 ])
 def test_transient_non_auth_failures_are_not_auth(exc):
     assert is_auth_failure(exc) is False
+
+
+def test_autherror_subclasses_are_auth():
+    class PerplexityAuthError(Exception):
+        pass
+
+    assert is_auth_failure(PerplexityAuthError("expired")) is True
 
 
 def test_hyperbrowser_auth_error_is_auth_without_message_markers():
