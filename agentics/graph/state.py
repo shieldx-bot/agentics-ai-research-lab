@@ -48,6 +48,7 @@ class ResearchState(TypedDict, total=False):
     commit_message: str
     category: str                  # issue category (research/code/docs/...)
     verification: str              # tier-1 result, shown in the PR body
+    verify_cmds: list[str]         # P16: hypothesis checks the plan declares
     reuses: list[str]              # registry tools the plan says it reuses
     # review artifacts
     pr_number: int

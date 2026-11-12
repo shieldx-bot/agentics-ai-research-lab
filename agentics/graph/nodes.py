@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, build_system_prompt, parse_json_block
@@ -377,9 +379,6 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "Propose a concrete implementation plan for this repo. Reply ONLY with "
         'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
         '"steps": ["..."], "commit_message": "...", '
-        '"reuses": ["<registered tool name you rely on>"], '
-        '"reusable_tools": [{"name": "snake_case_name", "path": "<file you create>", '
-        '"description": "what it does, in one line"}], '
         '"verify_cmds": ["<python -m pytest ... or python <workspace .py script> '
         'that CHECKS the idea; exit 0 must mean the hypothesis holds>"]} '
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
@@ -460,6 +459,37 @@ def _tier1(ctx: AgentContext, changed: list[str]) -> tuple[bool, str]:
     if code not in (0, 5):             # 5 = no tests collected
         return False, f"tier-1 tests failed (exit {code}): {out[-400:]}"
     return True, f"tier-1 passed: compiled {len(py_files)} file(s), pytest exit {code}"
+
+
+# ---------------------------------------------------------------- P16 wiring
+def normalize_verify_cmds(cmds: list) -> list[list[str]]:
+    """Turn the plan's declared hypothesis checks into safe argv lists.
+
+    The plan LLM writes commands like ``"python -m pytest tests/x.py -q"``;
+    run_command only ever executes the ACTIVE interpreter, so ``python`` /
+    ``python3`` / ``<sys.executable>`` are all rewritten to ``sys.executable``
+    and anything else is dropped (a blocked command would only burn the run).
+    At most 5 checks, 12 argv words each."""
+    out: list[list[str]] = []
+    for raw in (cmds or [])[:8]:
+        try:
+            argv = shlex.split(raw) if isinstance(raw, str) else [str(a) for a in raw]
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        exe = argv[0]
+        if exe in ("python", "python3") or Path(exe).resolve() == Path(sys.executable):
+            argv[0] = sys.executable
+        elif exe == sys.executable:
+            pass
+        else:
+            continue                  # only the active interpreter is runnable
+        if len(argv) > 12:
+            argv = argv[:12]
+        if argv not in out:
+            out.append(argv)
+    return out[:5]
 
 
 async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
@@ -574,7 +604,11 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     # `refuted` blocks the push (the hypothesis did not hold under test);
     # `inconclusive` (blocked/timeout) journals a warning and proceeds — the
     # reviewer sees the evidence and decides, the pipeline never livelocks.
-    verify_cmds = state.get("verify_cmds") or []
+    # normalize_verify_cmds rewrites "python ..." to the ACTIVE interpreter
+    # and drops anything run_command would refuse: a raw "/bin/sh -c" wrap
+    # would be rejected by the guard (exit 126) and every check would sit at
+    # "inconclusive" forever — the plan's strings must become real argv first.
+    verify_cmds = normalize_verify_cmds(state.get("verify_cmds") or [])
     if verify_cmds:
         evs = await asyncio.to_thread(
             run_experiments, ctx.workspace, verify_cmds, timeout=300)
