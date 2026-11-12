@@ -162,6 +162,12 @@ CREATE INDEX IF NOT EXISTS idx_skills_cluster ON skills(cluster_id, status);
 """
 
 
+# Journal growth cap: the append-only activity feed is trimmed to the newest
+# rows every N inserts (never on each write — trimming is a rare bulk DELETE).
+_JOURNAL_TRIM_EVERY = 500
+_JOURNAL_KEEP_ROWS = 5000
+
+
 @dataclass
 class Claim:
     issue: int
@@ -181,6 +187,7 @@ class SharedMemory:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        self._journal_inserts = 0      # drives the periodic journal trim
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
             for column in (
@@ -401,6 +408,16 @@ class SharedMemory:
                 "INSERT INTO journal (ts, agent, event, detail) VALUES (?,?,?,?)",
                 (time.time(), agent, event, str(detail)[:2000]),
             )
+            # The lab runs forever; the journal is an append-only feed the
+            # dashboard reads through a small window. Keep the table bounded
+            # (checked every _JOURNAL_TRIM_EVERY inserts, not on each write).
+            self._journal_inserts += 1
+            if self._journal_inserts % _JOURNAL_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM journal WHERE id NOT IN "
+                    "(SELECT id FROM journal ORDER BY id DESC LIMIT ?)",
+                    (_JOURNAL_KEEP_ROWS,),
+                )
 
     def recent_journal(self, limit: int = 50, agent: str | None = None) -> list[dict]:
         sql = "SELECT id, ts, agent, event, detail FROM journal"
