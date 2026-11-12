@@ -37,7 +37,7 @@ def ws(tmp_path: Path):
     return w
 
 
-def _push_branch(ws, name, files: dict[str, str]):
+def _push_branch(w, name, files: dict[str, str]):
     git(w.seed, "checkout", "-q", "main")
     git(w.seed, "pull", "-q", "origin", "main")
     git(w.seed, "checkout", "-q", "-B", name)
