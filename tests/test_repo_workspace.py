@@ -35,16 +35,23 @@ def test_existing_clone_remote_is_normalized_before_reuse(tmp_path, monkeypatch)
 
 def test_command_allowlist_accepts_only_project_validation_commands(tmp_path):
     workspace = RepoWorkspace("agent-test", Settings(data_dir=tmp_path))
-    assert workspace._command_allowed([sys.executable, "-m", "pytest", "-q", "-x"])
-    assert workspace._command_allowed([sys.executable, "-m", "py_compile", "agentics/config.py"])
-    assert not workspace._command_allowed(["bash", "-c", "echo unsafe"])
-    assert not workspace._command_allowed([sys.executable, "-c", "print('unsafe')"])
-    assert not workspace._command_allowed([
-        sys.executable, "-m", "py_compile", "../outside.py"
-    ])
-    assert not workspace._command_allowed([
-        sys.executable, "-m", "pytest", "--pyargs", "os"
-    ])
+    ok = workspace._validate_command  # accepted commands raise nothing
+    ok([sys.executable, "-m", "pytest", "-q", "-x"])
+    ok([sys.executable, "-m", "py_compile", "agentics/config.py"])
+    ok([sys.executable, "probe.py"])  # workspace script bound to the clone
+
+    def rejected(*cmd) -> None:
+        try:
+            workspace._validate_command(list(cmd))
+        except ValueError:
+            return
+        raise AssertionError(f"command was accepted: {cmd}")
+
+    rejected(["bash", "-c", "echo unsafe"])
+    rejected([sys.executable, "-c", "print('unsafe')"])
+    rejected([sys.executable, "-m", "py_compile", "../outside.py"])
+    rejected([sys.executable, "-m", "pytest", "-c", "import os"])
+    rejected([sys.executable, "-m", "pytest", "--cache-dir=token-leak", "-q"])
 
 
 def test_rejected_command_never_starts_subprocess(tmp_path, monkeypatch):
@@ -53,7 +60,7 @@ def test_rejected_command_never_starts_subprocess(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("subprocess must not run for a rejected command")
 
-    monkeypatch.setattr("agentics.github_ops.repo_workspace.subprocess.run", forbidden)
+    monkeypatch.setattr("agentics.github_ops.repo_workspace.subprocess.Popen", forbidden)
     code, output = workspace.run_command(["bash", "-c", "echo unsafe"])
     assert code == 126
-    assert "allowlist" in output
+    assert "command rejected" in output

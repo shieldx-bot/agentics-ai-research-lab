@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -18,34 +20,43 @@ class RepoWorkspace:
     credentials never enter the repo config."""
 
     def __init__(self, agent_id: str, settings: Settings) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id):
+            raise ValueError("agent_id must be a simple 1-64 character identifier")
         self.agent_id = agent_id
         self.settings = settings
         self.path = settings.workspaces_dir / agent_id
-        # Keep credentials out of the remote URL and .git/config. Authentication
-        # is injected only into the child process environment for each Git call.
+        # Keep credentials out of the remote URL and .git/config. Git receives
+        # the authorization header through a child-process environment variable.
         self._remote = f"https://github.com/{settings.github_repo}.git"
 
+    # ------------------------------------------------------------ plumbing
     def _git_env(self) -> dict[str, str]:
-        blocked = ("TOKEN", "COOKIE", "PASSWORD", "SECRET", "API_KEY", "AUTHORIZATION")
-        env = {k: v for k, v in os.environ.items()
-               if not any(marker in k.upper() for marker in blocked)}
+        """Return a per-process Git auth environment; never persist credentials."""
+        allowed = {"PATH", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL"}
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+        home = self.settings.data_dir / ".git-home" / self.agent_id
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)
+        env["GIT_TERMINAL_PROMPT"] = "0"
         token = self.settings.github_token
         if token:
-            auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             try:
-                count = int(env.get("GIT_CONFIG_COUNT", "0"))
+                count = max(0, int(env.get("GIT_CONFIG_COUNT", "0")))
             except ValueError:
                 count = 0
-            env[f"GIT_CONFIG_KEY_{count}"] = "http.https://github.com/.extraheader"
-            env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {auth}"
             env["GIT_CONFIG_COUNT"] = str(count + 1)
+            env[f"GIT_CONFIG_KEY_{count}"] = "http.extraheader"
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+            env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {basic}"
         return env
 
-    # ------------------------------------------------------------ plumbing
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        # Only network operations receive the credential. Local commands (especially
+        # commit hooks) must not inherit a token they do not need.
+        network_ops = {"fetch", "push", "pull", "ls-remote"}
+        env = self._git_env() if args and args[0] in network_ops else self._command_environment()
         proc = subprocess.run(
-            ["git", *args], cwd=self.path, capture_output=True, text=True,
-            env=self._git_env(),
+            ["git", *args], cwd=self.path, capture_output=True, text=True, env=env,
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
@@ -53,8 +64,7 @@ class RepoWorkspace:
 
     def ensure_cloned(self) -> None:
         if (self.path / ".git").exists():
-            # Migrate workspaces created by older versions whose origin URL may
-            # contain a token; always normalize it before any fetch or push.
+            # Repair legacy clones that may have stored credentials in origin.
             self._git("remote", "set-url", "origin", self._remote)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -76,50 +86,109 @@ class RepoWorkspace:
         self._git("checkout", "-B", branch)
 
     # ------------------------------------------------------------ content
+    def _resolve_workspace_path(self, rel_path: str) -> Path:
+        """Resolve a relative path and reject traversal or symlink escapes."""
+        candidate = Path(rel_path)
+        if candidate.is_absolute():
+            raise ValueError("workspace paths must be relative")
+        root = self.path.resolve()
+        target = (root / candidate).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("path escapes the agent workspace") from exc
+        return target
+
     def write_file(self, rel_path: str, content: str) -> None:
-        target = self.path / rel_path
+        target = self._resolve_workspace_path(rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Re-resolve after mkdir to catch a symlink introduced in a parent path.
+        target = self._resolve_workspace_path(rel_path)
         target.write_text(content, encoding="utf-8")
 
     def read_file(self, rel_path: str) -> str | None:
-        target = self.path / rel_path
+        target = self._resolve_workspace_path(rel_path)
         if not target.exists():
             return None
         return target.read_text(encoding="utf-8", errors="replace")
 
-    def _command_allowed(self, cmd: list[str]) -> bool:
-        """Allow only the exact Python validation commands used by this project."""
-        if not cmd or Path(cmd[0]).resolve() != Path(sys.executable).resolve():
-            return False
-        if cmd[1:3] == ["-m", "py_compile"] and len(cmd) > 3:
-            root = self.path.resolve()
-            for raw_path in cmd[3:]:
-                candidate = Path(raw_path)
-                candidate = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
-                if not candidate.is_relative_to(root) or candidate.suffix != ".py":
-                    return False
-            return True
-        return cmd[1:3] == ["-m", "pytest"] and set(cmd[3:]).issubset({"-q", "-x"})
+    def _command_environment(self) -> dict[str, str]:
+        """Minimal environment for tests: never forward GitHub/LLM/session secrets."""
+        allowed = {"PATH", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL"}
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+        home = self.path / ".agent-home"
+        home.mkdir(parents=True, exist_ok=True)
+        env.update({
+            "HOME": str(home),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        return env
+
+    def _validate_command(self, cmd: list[str]) -> None:
+        """Permit only this Python runtime, approved test modules, or workspace scripts."""
+        if not cmd or any(not isinstance(arg, str) or "\x00" in arg for arg in cmd):
+            raise ValueError("command must be a non-empty list of text arguments")
+        if len(cmd) > 128 or any(len(arg) > 4096 for arg in cmd):
+            raise ValueError("command exceeds argument limits")
+        executable = Path(cmd[0])
+        try:
+            same_python = executable.resolve() == Path(sys.executable).resolve()
+        except OSError:
+            same_python = False
+        if not same_python:
+            raise ValueError("only the active Python interpreter may be executed")
+        if len(cmd) >= 3 and cmd[1] == "-m" and cmd[2] in {"pytest", "py_compile"}:
+            args = cmd[3:]
+            if any(arg == "-c" or arg.startswith("--") and "=" in arg and
+                   any(secret in arg.lower() for secret in ("token", "password", "cookie"))
+                   for arg in args):
+                raise ValueError("unsafe test-runner argument")
+            for arg in args:
+                path_arg = arg.split("::", 1)[0]
+                if ("/" in path_arg or path_arg.endswith(".py")) and not path_arg.startswith("-"):
+                    self._resolve_workspace_path(path_arg)
+            return
+        if len(cmd) >= 2 and cmd[1].endswith(".py"):
+            self._resolve_workspace_path(cmd[1])
+            return
+        raise ValueError("allowed commands: python -m pytest, python -m py_compile, or workspace .py scripts")
 
     def run_command(self, cmd: list[str], timeout: int = 120) -> tuple[int, str]:
-        """Run only approved Python validation commands (not an OS sandbox)."""
-        if not self._command_allowed(cmd):
-            return 126, "command rejected by workspace allowlist"
+        """Run approved Python checks with a scrubbed environment and bounded lifetime.
+
+        This is a host-process guardrail, not an OS/container security boundary.
+        Use a rootless container sandbox for untrusted code in production.
+        """
+        if not isinstance(timeout, int) or timeout < 1 or timeout > 3600:
+            return 126, "timeout must be an integer between 1 and 3600 seconds"
         try:
-            # Do not expose GitHub/LLM credentials to test processes. This is
-            # defense-in-depth, not a replacement for an OS/container sandbox.
-            blocked = ("TOKEN", "COOKIE", "PASSWORD", "SECRET", "API_KEY", "AUTHORIZATION")
-            child_env = {k: v for k, v in os.environ.items()
-                         if not any(marker in k.upper() for marker in blocked)}
-            proc = subprocess.run(
-                cmd, cwd=self.path, capture_output=True, text=True,
-                timeout=max(1, min(int(timeout), 300)), env=child_env,
-            )
-            return proc.returncode, (proc.stdout + proc.stderr)[-4000:]
+            self._validate_command(cmd)
+        except (ValueError, OSError) as exc:
+            return 126, f"command rejected: {exc}"
+        proc = subprocess.Popen(
+            cmd, cwd=self.path, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=self._command_environment(),
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return proc.returncode, (stdout + stderr)[-4000:]
         except subprocess.TimeoutExpired:
-            return 124, "timeout"
-        except FileNotFoundError:
-            return 127, f"command not found: {cmd[0]}"
+            if os.name == "posix":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.kill()
+            stdout, stderr = proc.communicate()
+            return 124, ((stdout or "") + (stderr or "") + "\ntimeout")[-4000:]
+        except Exception:
+            proc.kill()
+            proc.communicate()
+            raise
 
     def changed_files(self) -> list[str]:
         """Working-tree changes, one entry per file (untracked dirs are expanded)."""

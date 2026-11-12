@@ -1,8 +1,7 @@
 """Graph nodes — each node is a step of one agent's research cycle.
 
-Nodes are synchronous (GitHub/Git/SQLite are sync libs) and wrapped by the
-graph in a thread executor; only LLM calls are async (kept as coroutines
-invoked from within async nodes).
+GitHub/Git/SQLite operations are synchronous and run in LangGraph's executor.
+LLM and paper-search nodes are async and await their providers directly.
 """
 from __future__ import annotations
 
@@ -45,16 +44,17 @@ def _memory_context(ctx: AgentContext) -> dict:
     }
 
 
-def _llm_ask(
+async def _llm_ask(
     ctx: AgentContext, prompt: str, mode: str = "concise", purpose: str = "general"
 ) -> tuple[str, list[str]]:
-    """Route one LLM call through the BrowserSessionHost by purpose:
-    research -> Perplexity (citations); plan/implement/review -> Qwen."""
+    """Await the BrowserSessionHost directly; never create or nest an event
+    loop in a graph worker. Purpose tags the call for provider routing
+    (research wants citations; plan/implement/review want the code model)."""
     if ctx.llm is None:
         return "", []
-    resp = asyncio.get_event_loop().run_until_complete(
-        ctx.llm.ask(prompt, mode=mode, purpose=purpose, system=build_system_prompt(
-            ctx.agent_id, ctx.role, ctx.settings.research_topic))
+    resp = await ctx.llm.ask(
+        prompt, mode=mode, purpose=purpose, system=build_system_prompt(
+            ctx.agent_id, ctx.role, ctx.settings.research_topic)
     )
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
@@ -175,7 +175,7 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings."""
     topic = state.get("issue_title") or ctx.settings.research_topic
     query = (
@@ -183,9 +183,7 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "Focus on methods, benchmarks, reproducible results."
     )
     # P7: dedup — skip if the swarm already covered this
-    known = asyncio.get_event_loop().run_until_complete(
-        papers_mod.dedup_query(ctx.vector, topic)
-    )
+    known = await papers_mod.dedup_query(ctx.vector, topic)
     if len(known) >= 3:
         state["summary"] = f"topic already covered by {len(known)} findings; skipping"
         state["done"] = True
@@ -195,9 +193,7 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["error"] = "no LLM account available"
         state["done"] = True
         return state
-    resp = asyncio.get_event_loop().run_until_complete(
-        papers_mod.search_papers(ctx.llm, query, purpose="research")
-    )
+    resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     state["papers"] = [{"title": topic, "answer": resp.answer}]
@@ -206,12 +202,16 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
     title = f"Findings: {topic}"
     content = f"{resp.answer[:6000]}\n\n## BibTeX\n\n{state['bibtex'][:3000]}"
-    fid = ctx.memory.add_finding(
-        ctx.agent_id, title, content, resp.citations, state.get("issue_number")
+    fid = await asyncio.to_thread(
+        ctx.memory.add_finding,
+        ctx.agent_id, title, content, resp.citations, state.get("issue_number"),
     )
-    ctx.vector.add(content, {"agent": ctx.agent_id, "finding_id": fid,
-                             "issue": state.get("issue_number")})
-    ctx.memory.post_message(
+    await asyncio.to_thread(
+        ctx.vector.add, content,
+        {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
+    )
+    await asyncio.to_thread(
+        ctx.memory.post_message,
         ctx.agent_id, "broadcast",
         f"New finding #{fid} on '{topic}' with {len(resp.citations)} citations.",
         state.get("issue_number"),
@@ -224,7 +224,7 @@ def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: turn research into an implementation plan (LLM, JSON)."""
     category = state.get("category") or categorize_issue(
         state.get("issue_title", ""), state.get("issue_body", ""))
@@ -259,7 +259,7 @@ def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
         "'reusable_tools' if it is a genuinely reusable utility.)"
     )
-    answer, _ = _llm_ask(ctx, prompt, mode="concise", purpose="plan")
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan")
     parsed = parse_json_block(answer)
     if not parsed:
         state["error"] = "plan parsing failed"
@@ -274,9 +274,9 @@ def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
-def _yield(ctx: AgentContext, state: ResearchState, reason: str) -> ResearchState:
-    ctx.claims.release(state["issue_number"], ctx.agent_id, f"yield: {reason}")
-    ctx.workspace.sync_main()          # discard local changes
+async def _yield(ctx: AgentContext, state: ResearchState, reason: str) -> ResearchState:
+    # node_reflect owns the single terminal cleanup path for non-PR cycles.
+    await asyncio.to_thread(ctx.workspace.sync_main)  # discard local changes
     state["yield_reason"] = reason
     state["done"] = True
     ctx.memory.add_decision(ctx.agent_id, "yield", f"issue #{state['issue_number']}: {reason}")
@@ -299,51 +299,58 @@ def _tier1(ctx: AgentContext, changed: list[str]) -> tuple[bool, str]:
     return True, f"tier-1 passed: compiled {len(py_files)} file(s), pytest exit {code}"
 
 
-def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: create branch, write code from plan, run tests, push (P2/P3)."""
     branch = state["branch"]
-    ctx.workspace.sync_main()
-    branch_ops.create_branch(ctx.gh.repo, branch)
-    ctx.workspace.checkout_new_branch(branch)
+    await asyncio.to_thread(ctx.workspace.sync_main)
+    await asyncio.to_thread(branch_ops.create_branch, ctx.gh.repo, branch)
+    await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
     plan = json.loads(state.get("plan") or "{}")
     for spec in plan.get("files", []):
         path, change = spec.get("path", ""), spec.get("change", "new")
-        current = ctx.workspace.read_file(path) if change == "edit" else ""
+        current = (
+            await asyncio.to_thread(ctx.workspace.read_file, path)
+            if change == "edit" else ""
+        )
         prompt = (
             f"Issue: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
-        answer, _ = _llm_ask(ctx, prompt, mode="concise", purpose="implement")
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="implement")
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
-            ctx.workspace.write_file(path, content)
+            await asyncio.to_thread(ctx.workspace.write_file, path, content)
 
     # NOTE: must be the working-tree status — `diff_files_vs_main()` compares
     # commits and is empty before the commit, which silently disabled P3.
-    changed = ctx.workspace.changed_files()
+    changed = await asyncio.to_thread(ctx.workspace.changed_files)
     state["changed_files"] = changed
 
     # Guard: self-evolution PRs may only touch the allow-listed paths.
     if state.get("category") == "evolution":
         out_of_bounds = [f for f in changed if not evolution_path_allowed(f)]
         if out_of_bounds:
-            return _yield(ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}")
+            return await _yield(
+                ctx, state, f"evolution PR outside allowed paths {out_of_bounds[:5]}"
+            )
 
     # P3: ownership check against other active roles
+    active_agents = await asyncio.to_thread(ctx.memory.active_agents, stale_after_s=300)
     active_roles = {
-        a["role"] for a in ctx.memory.active_agents(stale_after_s=300)
-        if a["agent"] != ctx.agent_id
+        a["role"] for a in active_agents if a["agent"] != ctx.agent_id
     }
-    ok, foreign = ctx.ownership.evaluate(ctx.role.value, changed, active_roles)
+    ok, foreign = await asyncio.to_thread(
+        ctx.ownership.evaluate, ctx.role.value, changed, active_roles
+    )
     if not ok:
-        return _yield(ctx, state, f"foreign files {foreign[:5]}")
+        return await _yield(ctx, state, f"foreign files {foreign[:5]}")
 
     # Tier 1 (author, before push): compile + fast tests. Tier 2 (full suite on
     # main+PR) runs later, in the Integrator, right before merge.
-    t1_ok, verification = _tier1(ctx, changed)
+    t1_ok, verification = await asyncio.to_thread(_tier1, ctx, changed)
     state["verification"] = verification
     if not t1_ok:
         state["error"] = verification
@@ -351,9 +358,10 @@ def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
 
     try:
-        pushed = ctx.workspace.commit_and_push(
+        pushed = await asyncio.to_thread(
+            ctx.workspace.commit_and_push,
             branch, f"agent({ctx.agent_id}): {state.get('commit_message', 'work')} "
-                    f"(#{state['issue_number']})"
+                    f"(#{state['issue_number']})",
         )
     except RuntimeError as exc:
         state["error"] = str(exc)
@@ -407,26 +415,29 @@ def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
     )
     state["pr_number"] = pr.number
     state["pr_url"] = pr.html_url
+    # The issue is now handed off to the PR lifecycle; mark the lease complete
+    # before any non-critical memory/notification work can fail.
+    ctx.claims.complete(state["issue_number"], ctx.agent_id, state["branch"])
     _register_tools(ctx, state, pr.number)
     ctx.memory.post_message(
         ctx.agent_id, "handoff",
         f"PR #{pr.number} ready for cross-review: {pr.html_url}",
         state["issue_number"],
     )
-    ctx.claims.complete(state["issue_number"], ctx.agent_id, state["branch"])
     state["done"] = True
     state["summary"] = f"opened PR #{pr.number}"
     return state
 
 
-def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
+async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Reviewer: pick an open PR not authored by me, review it (P5)."""
     repo = ctx.gh.repo
     candidate = None
-    for pr in repo.get_pulls(state="open"):
+    pulls = await asyncio.to_thread(lambda: list(repo.get_pulls(state="open")))
+    for pr in pulls:
         if pr.user and pr.user.login == "shieldx-bot" and f"[{ctx.agent_id}]" in pr.title:
             continue  # never review own PR
-        labels = {lb.name for lb in pr.get_labels()}
+        labels = {lb.name for lb in await asyncio.to_thread(lambda: list(pr.get_labels()))}
         if "reviewed" in labels:
             continue
         candidate = pr
@@ -436,33 +447,39 @@ def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["done"] = True
         return state
 
-    diff = candidate.get_files()
-    files_desc = "\n".join(f"- {f.filename} (+{f.additions}/-{f.deletions})" for f in diff[:30])
+    diff = await asyncio.to_thread(lambda: list(candidate.get_files()))
+    files_desc = "\n".join(
+        f"- {f.filename} (+{f.additions}/-{f.deletions})" for f in diff[:30]
+    )
     prompt = (
         f"Review PR #{candidate.number}: {candidate.title}\n{candidate.body or ''}\n\n"
         f"Files:\n{files_desc}\n\n"
         'Reply ONLY JSON: {"verdict": "approve|request_changes", '
         '"comment": "..."}'
     )
-    answer, _ = _llm_ask(ctx, prompt, mode="concise", purpose="review")
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review")
     parsed = parse_json_block(answer)
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")
 
-    pr_to_review = ctx.gh.repo.get_pull(candidate.number)
+    pr_to_review = await asyncio.to_thread(ctx.gh.repo.get_pull, candidate.number)
     if verdict == "approve":
-        pr_ops.approve_review(pr_to_review, comment)
-        ctx.merge_queue.enqueue(candidate.number, author=candidate.title.split("]")[0].lstrip("[") or "agent")
-        ctx.memory.set_trace_outcome(candidate.number, "approved")
+        await asyncio.to_thread(pr_ops.approve_review, pr_to_review, comment)
+        author = candidate.title.split("]")[0].lstrip("[") or "agent"
+        await asyncio.to_thread(ctx.merge_queue.enqueue, candidate.number, author=author)
+        await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "approved")
         state["review_verdict"] = "approve"
     else:
-        pr_to_review.create_issue_comment(f"Review ({ctx.agent_id}): {comment}")
+        await asyncio.to_thread(
+            pr_to_review.create_issue_comment,
+            f"Review ({ctx.agent_id}): {comment}",
+        )
         # the reviewer's reason becomes a failure trace every agent can learn from
-        ctx.memory.set_trace_outcome(candidate.number, "rejected", comment)
-        ctx.memory.drop_tools(candidate.number)
+        await asyncio.to_thread(ctx.memory.set_trace_outcome, candidate.number, "rejected", comment)
+        await asyncio.to_thread(ctx.memory.drop_tools, candidate.number)
         state["review_verdict"] = "request_changes"
     try:                                   # without this the same PR is re-reviewed every cycle
-        candidate.add_to_labels("reviewed")
+        await asyncio.to_thread(candidate.add_to_labels, "reviewed")
     except Exception as exc:  # noqa: BLE001
         log.warning("could not label PR #%s reviewed: %s", candidate.number, exc)
     state["review_comment"] = comment
@@ -516,7 +533,16 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
     if state.get("error"):
         lesson_bits.append(f"error: {state['error']}")
     lesson = "; ".join(lesson_bits) or "cycle completed"
-    ctx.meta["personal"].add_lesson(lesson, state.get("issue_number"))
+    # Any claimed issue that did not reach PR creation must be unlocked, including
+    # early exits (no LLM, duplicate research, invalid plan, failed tests).
+    issue_number = state.get("issue_number")
+    if issue_number and not state.get("pr_number"):
+        try:
+            ctx.claims.release(issue_number, ctx.agent_id, "cycle ended without a PR")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not release claim #%s for %s: %s",
+                        issue_number, ctx.agent_id, exc)
+    ctx.meta["personal"].add_lesson(lesson, issue_number)
     ctx.memory.add_decision(ctx.agent_id, f"cycle {ctx.cycle} done", lesson[:200])
     if state.get("issue_number") and ctx.role in (Role.CODER, Role.WRITER):
         trace_id = ctx.memory.add_trace(

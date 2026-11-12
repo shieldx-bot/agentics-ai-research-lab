@@ -1,5 +1,6 @@
 """Wiring of the new behaviour inside the graph nodes (fake GitHub / LLM)."""
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,7 +117,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
     mem.activate_tools(9)
     seen = {}
 
-    def fake_llm(ctx, prompt, mode="concise", purpose="general"):
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general"):
         seen["prompt"] = prompt
         return json.dumps(
             {
@@ -129,7 +130,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
         ), []
 
     monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
-    state = nodes.node_plan(
+    state = asyncio.run(nodes.node_plan(
         _ctx(mem),
         {
             "issue_number": 3,
@@ -138,7 +139,7 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
             "papers": [{"answer": ""}],
             "category": "code",
         },
-    )
+    ))
     assert "catastrophic backtracking" in seen["prompt"]  # a05's failure reaches a04
     assert "snippet_extract" in seen["prompt"]  # registry is in the prompt
     assert state["reuses"] == ["snippet_extract"]
@@ -148,12 +149,12 @@ def test_plan_prompt_carries_group_traces_and_registry_and_counts_reuse(mem, mon
 def test_evolution_plan_prompt_states_the_allowed_paths(mem, monkeypatch):
     seen = {}
 
-    def fake_llm(ctx, prompt, mode="concise", purpose="general"):
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general"):
         seen["p"] = prompt
         return "{}", []
 
     monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
-    nodes.node_plan(
+    asyncio.run(nodes.node_plan(
         _ctx(mem),
         {
             "issue_number": 1,
@@ -162,7 +163,7 @@ def test_evolution_plan_prompt_states_the_allowed_paths(mem, monkeypatch):
             "papers": [{"answer": ""}],
             "category": "evolution",
         },
-    )
+    ))
     assert "SELF-EVOLUTION" in seen["p"] and "agentics/agents/roles.py" in seen["p"]
 
 
@@ -288,7 +289,7 @@ def no_branch(monkeypatch):
 
 def test_implement_happy_path_runs_both_tier1_checks_and_pushes(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["agentics/a.py", "docs/x.md"])
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state())
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
     assert ws.pushed and state["action"] == "open_pr"
     assert "tier-1 passed" in state["verification"] and "1 file" in state["verification"]
     assert state["changed_files"] == ["agentics/a.py", "docs/x.md"]
@@ -297,33 +298,33 @@ def test_implement_happy_path_runs_both_tier1_checks_and_pushes(mem, tmp_path, n
 
 def test_implement_blocks_push_when_tier1_tests_fail(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["agentics/a.py"], {"pytest": (1, "1 failed")})
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state())
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
     assert not ws.pushed and state["done"] and "tier-1 tests failed" in state["error"]
 
 
 def test_implement_blocks_push_on_syntax_error_before_running_pytest(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["agentics/a.py"], {"compile": (1, "SyntaxError")})
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state())
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
     assert "tier-1 compile failed" in state["error"]
     assert not any("pytest" in c for c in ws.cmds)  # fail fast
 
 
 def test_implement_skips_tier1_for_docs_only_changes(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["docs/x.md"])
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state())
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
     assert ws.pushed and "skipped" in state["verification"] and ws.cmds == []
 
 
 def test_evolution_pr_touching_forbidden_files_is_yielded(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["agentics/agents/roles.py", "agentics/stop.py"])
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state("evolution"))
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state("evolution")))
     assert not ws.pushed and "outside allowed paths" in state["yield_reason"]
     assert "agentics/stop.py" in state["yield_reason"]
 
 
 def test_evolution_pr_limited_to_allowed_files_goes_through(mem, tmp_path, no_branch):
     ws = FakeWorkspace(tmp_path, ["agentics/agents/roles.py", "tests/test_roles.py"])
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state("evolution"))
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state("evolution")))
     assert ws.pushed and not state.get("yield_reason")
 
 
@@ -331,5 +332,5 @@ def test_ownership_yield_now_actually_triggers(mem, tmp_path, no_branch):
     """Regression: P3 compared an always-empty file list, so it never fired."""
     mem.heartbeat("a06", "writer", 1)  # an active writer owns docs/
     ws = FakeWorkspace(tmp_path, ["agentics/a.py", "docs/a.md", "docs/b.md"])
-    state = nodes.node_implement(_impl_ctx(mem, ws), _impl_state())
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
     assert not ws.pushed and "foreign files" in state["yield_reason"]

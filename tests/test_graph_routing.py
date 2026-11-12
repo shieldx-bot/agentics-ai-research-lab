@@ -1,5 +1,6 @@
 """A node that finishes or fails the cycle must send it to `reflect`."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,13 @@ def _run(monkeypatch, role, updates=None):
     calls: list[str] = []
 
     def make(name):
+        if name in {"research", "plan", "implement", "review"}:
+            async def async_node(ctx, state):
+                calls.append(name)
+                state.update(updates.get(name, {}))
+                return state
+            return async_node
+
         def node(ctx, state):
             calls.append(name)
             state.update(updates.get(name, {}))
@@ -37,7 +45,7 @@ def _run(monkeypatch, role, updates=None):
 
     for n in ALL:
         monkeypatch.setattr(rg, f"node_{n}", make(n))
-    rg.build_research_graph(SimpleNamespace(role=role)).compile().invoke({})
+    asyncio.run(rg.build_research_graph(SimpleNamespace(role=role)).compile().ainvoke({}))
     return calls
 
 
