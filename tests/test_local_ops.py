@@ -63,6 +63,92 @@ def test_local_repo_refuses_non_git_source(settings, tmp_path):
         LocalRepo(settings).ensure(src=empty)
 
 
+def _git(*args: str, env_extra: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    import os
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(["git", *args], cwd=cwd, env=env,
+                          capture_output=True, text=True)
+
+
+def _clone_and_commit(bare: Path, work: Path) -> None:
+    _git("clone", "-q", str(bare), str(work))
+    (work / "reports").mkdir(exist_ok=True)
+    (work / "reports" / "ok.md").write_text("fine\n", encoding="utf-8")
+    _git("add", ".", cwd=work)
+    _git("commit", "-qm", "research work", cwd=work)
+
+
+def test_pre_receive_hook_blocks_direct_push_of_lab_code(settings, project, tmp_path):
+    """P10 layer 2.5 (defence in depth): even a raw `git push` straight to
+    data/lab.git — no workspace, no review, no merge queue — cannot introduce
+    agentics/configs/accounts/scripts/.github paths into the origin."""
+    repo = LocalRepo(settings)
+    repo.ensure(src=project)
+    work = tmp_path / "work"
+    _clone_and_commit(repo.path, work)
+
+    (work / "agentics").mkdir()
+    (work / "agentics" / "rogue.py").write_text("x = 1\n", encoding="utf-8")
+    _git("add", ".", cwd=work)
+    _git("commit", "-qm", "sneak lab code", cwd=work)
+    refused = _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=work)
+    assert refused.returncode != 0
+    assert "protected lab paths" in refused.stderr
+    # the refused commit never landed
+    assert repo.main_head() != _git("rev-parse", "HEAD", cwd=work).stdout.strip()
+
+    # drop the refused commit, then a clean research-only push goes through
+    _git("reset", "-q", "--hard", "origin/main", cwd=work)
+    (work / "reports").mkdir(exist_ok=True)
+    (work / "reports" / "more.md").write_text("more\n", encoding="utf-8")
+    _git("add", ".", cwd=work)
+    _git("commit", "-qm", "more research", cwd=work)
+    ok = _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=work)
+    assert ok.returncode == 0
+    assert repo.main_head() == _git("rev-parse", "HEAD", cwd=work).stdout.strip()
+
+
+def test_pre_receive_hook_honours_owner_env_override(settings, project, tmp_path):
+    """ALLOW_PROTECTED_PATHS=1 in the pushing shell lifts the git-layer block,
+    mirroring the app-layer override in policies/guard.py."""
+    repo = LocalRepo(settings)
+    repo.ensure(src=project)
+    work = tmp_path / "work"
+    _clone_and_commit(repo.path, work)
+    (work / "agentics").mkdir()
+    (work / "agentics" / "owner_backport.py").write_text("x = 1\n", encoding="utf-8")
+    _git("add", ".", cwd=work)
+    _git("commit", "-qm", "owner backport", cwd=work)
+    ok = _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=work,
+              env_extra={"ALLOW_PROTECTED_PATHS": "1"})
+    assert ok.returncode == 0
+
+
+def test_pre_receive_hook_never_clobbers_owner_hook(settings, project):
+    """A hook that does not carry the agentics sentinel belongs to the owner
+    and must survive ensure() untouched."""
+    repo = LocalRepo(settings)
+    repo.ensure(src=project)
+    hook = repo.path / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 0  # mine\n", encoding="utf-8")
+    repo.ensure(src=project)                    # repair path must not rewrite
+    assert "mine" in hook.read_text(encoding="utf-8")
+    assert repo.install_pre_receive().read_text(encoding="utf-8") == \
+        "#!/bin/sh\nexit 0  # mine\n"
+
+
+def test_pre_receive_hook_updated_when_settings_change(settings, project):
+    repo = LocalRepo(settings)
+    repo.ensure(src=project)
+    hook = repo.path / "hooks" / "pre-receive"
+    settings.protected_paths = list(settings.protected_paths) + ["docs/"]
+    repo.ensure(src=project)                    # repair path picks up new list
+    assert "docs/" in hook.read_text(encoding="utf-8")
+
+
 def test_task_crud_and_scan_ordering(mem):
     t1 = mem.create_task("first survey", body="b1", category="research")
     t2 = mem.create_task("second docs", body="b2", category="docs")
@@ -137,6 +223,59 @@ def test_task_source_supervisor_tops_up_when_dry(settings, mem):
     src = TaskSource(mem, settings)
     assert src.supervisor_top_up() == 1        # empty backlog -> survey task
     assert src.supervisor_top_up() == 0        # still open -> nothing new
+
+
+def test_supervisor_top_up_rotates_survey_angles(settings, mem):
+    """Regression (cd8b536 review): top-up used to re-open SURVEY_ANGLES[0]
+    forever — the backlog dried, the same survey was re-created, and the other
+    five angles were never reached. Least-used-first rotation fixes that."""
+    from agentics.local_ops import SURVEY_ANGLES
+
+    src = TaskSource(mem, settings)
+    first = src.supervisor_top_up()
+    assert first == 1
+    t1 = mem.scan_open_tasks()[0]
+    assert t1["title"].startswith(SURVEY_ANGLES[0] + ":")
+
+    mem.set_task_status(t1["id"], "merged")    # backlog dry again
+    assert src.supervisor_top_up() == 1
+    titles = [t["title"] for t in mem.list_tasks(limit=10)]
+    assert sum(t.startswith(a + ":") for a in SURVEY_ANGLES for t in titles) == 2
+    # the second angle differs from the first and no angle repeats
+    angles_used = [a for a in SURVEY_ANGLES
+                   if sum(t.startswith(a + ":") for t in titles) >= 1]
+    assert len(angles_used) == 2               # two distinct angles so far
+
+    mem.set_task_status(mem.scan_open_tasks()[0]["id"], "merged")
+    assert src.supervisor_top_up() == 1
+    titles = [t["title"] for t in mem.list_tasks(limit=10)]
+    angles_used = [a for a in SURVEY_ANGLES
+                   if sum(t.startswith(a + ":") for t in titles) >= 1]
+    assert len(angles_used) == 3               # rotation keeps advancing
+
+
+def test_supervisor_top_up_investigates_newest_failure_first(settings, mem):
+    """GEA: the newest failed trace with no task yet becomes a bugfix task
+    before any survey angle is opened; an already-investigated failure
+    (merged task) is never re-opened."""
+    src = TaskSource(mem, settings)
+    trace_id = mem.add_trace(
+        agent="a02", role="coder", cycle=3, outcome="failed",
+        category="tool", attempted="run benchmark", failure="ModuleNotFoundError: no module named 'sklearn'",
+    )
+    assert src.supervisor_top_up() == 1
+    task = mem.scan_open_tasks()[0]
+    assert task["category"] == "bugfix"
+    assert task["title"].startswith("Investigate failure (tool):")
+    assert "ModuleNotFoundError" in task["title"]
+    assert task["body"].startswith("Self-generated from the group failure traces")
+
+    mem.set_task_status(task["id"], "merged")  # investigation done & merged
+    assert src.supervisor_top_up() == 1        # falls through to the survey angle
+    titles = [t["title"] for t in mem.list_tasks(limit=10)]
+    assert sum(t.startswith("Investigate failure (tool):") for t in titles) == 1
+
+    _ = trace_id
 
 
 def test_merge_queue_drains_approved_mrs_serially(mem):

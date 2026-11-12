@@ -1,4 +1,4 @@
-"""Agentics CLI — run / stop / status / dashboard / task / test-llm.
+"""Agentics CLI — run / stop / status / dashboard / task / journal / test-llm.
 
 Local-only mode: the lab runs entirely on this machine — no GITHUB_TOKEN
 needed, nothing leaves the box except the LLM provider traffic.
@@ -182,6 +182,58 @@ def allow_protected(
     state = "EXEMPT (may touch agent code, except credentials)" if not revoke else "PROTECTED again"
     console.print(f"[bold]task #{task_id}[/] → {state}")
     memory.close()
+
+
+@app.command()
+def journal(
+    follow: bool = typer.Option(False, "--follow", "-f", help="stream new entries live (like tail -f)"),
+    lines: int = typer.Option(30, "-n", "--lines", help="how many past entries to show first"),
+    agent: str = typer.Option("", "--agent", "-a", help="only entries of one agent id"),
+) -> None:
+    """Owner: tail the live activity journal in the terminal (works offline).
+
+    The web dashboard (agentics dashboard) shows the same feed in a browser;
+    this is the keyboard-only equivalent. Every claim / plan / review / merge
+    decision lands here with its agent id and reason — no black box.
+
+        python -m agentics.cli journal -f          # live stream
+        python -m agentics.cli journal -a a02 -n 5 # one agent, last 5
+    """
+    import time as _time
+
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+
+    def _print(entry: dict) -> None:
+        ts = _time.strftime("%H:%M:%S", _time.localtime(entry["ts"]))
+        console.print(
+            f"[dim]{ts}[/] [magenta]{entry['agent']:<10}[/] "
+            f"[cyan]{entry['event']:<16}[/] {entry['detail']}"
+        )
+
+    try:
+        past = memory.recent_journal(limit=lines, agent=agent or None)
+        for entry in reversed(past):
+            _print(entry)
+        if not follow:
+            return
+        last_id = past[-1]["id"] if past else 0
+        console.print("[dim]— streaming new journal entries, Ctrl+C to stop —[/]")
+        while True:
+            fresh = [r for r in memory.recent_journal(limit=200, agent=agent or None)
+                     if r["id"] > last_id]
+            for entry in sorted(fresh, key=lambda r: r["id"]):
+                _print(entry)
+                last_id = entry["id"]
+            _time.sleep(1.0)
+    except KeyboardInterrupt:
+        console.print("[dim]journal closed[/]")
+    finally:
+        memory.close()
 
 
 @app.command()

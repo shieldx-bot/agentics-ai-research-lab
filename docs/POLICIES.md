@@ -108,12 +108,20 @@ runtime, hoặc tệ hơn là chạm vào cookie/credentials.
 agentics/   configs/   accounts/   scripts/   .github/
 ```
 
-Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`):
+Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`) + **1 tầng git**:
 
 1. **Ghi file** — `RepoWorkspace.write_file` từ chối ngay khi plan yêu cầu
    tạo/sửa một file protected (ValueError → cycle yield).
 2. **Diff trước push** — `node_implement` quét toàn bộ changed files; vi phạm
    → yield, không commit, không push.
+   2.5. **Pre-receive hook trong `data/lab.git`** — các tầng trên chỉ thấy
+   traffic đi qua code agentics; một `git push` thẳng vào bare repo bỏ qua tất
+   cả. Hook tự sinh từ danh sách `protected_paths` hiện hành
+   (`LocalRepo.install_pre_receive`) và git từ chối mọi push đưa protected
+   path vào origin ngay ở tầng git, kể cả nhánh/MR chưa từng tồn tại. Chỉ
+   hook mang sentinel
+   `# agentics pre-receive (managed)` mới được agentics cập nhật — hook của
+   owner không bao giờ bị ghi đè.
 3. **Cửa review + cửa merge** — Reviewer hạ mọi verdict "approve" thành
    "request_changes" nếu diff chạm protected paths; `LocalMergeQueue.drain`
    từ chối merge MR vi phạm kể cả khi đã được duyệt.

@@ -29,6 +29,48 @@ log = logging.getLogger("local.ops")
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+# First line of every hook we manage — hooks without it are owner property.
+PRE_RECEIVE_SENTINEL = "# agentics pre-receive (managed)"
+
+
+def _pre_receive_script(paths: list[str] | tuple[str, ...]) -> str:
+    """POSIX-sh pre-receive hook blocking pushes that introduce ``paths``.
+
+    ``git diff --name-only`` output is matched against escaped literal path
+    prefixes (guard.is_protected semantics: exact or prefix match), so a
+    settings entry like ``configs/`` covers ``configs/secrets.yaml`` too.
+    """
+    import re as _re
+
+    alts = "|".join(_re.escape(p) for p in paths)
+    return f'''#!/bin/sh
+{PRE_RECEIVE_SENTINEL} — P10 defence in depth for the local origin (data/lab.git).
+# Installed by agentics.local_ops.LocalRepo; regenerated on lab boot when the
+# protected-path list changes. Refuses ANY push introducing protected lab
+# paths — including direct pushes that bypass workspaces, reviews and the
+# merge queue. Owner override: ALLOW_PROTECTED_PATHS=1 in the pushing shell.
+ZERO=0000000000000000000000000000000000000000
+case "$ALLOW_PROTECTED_PATHS" in
+    1|true|yes|on) exit 0 ;;
+esac
+status=0
+while read old new ref; do
+    [ "$new" = "$ZERO" ] && continue          # branch deletion
+    if [ "$old" = "$ZERO" ]; then
+        range="$new --not --all"
+    else
+        range="$old..$new"
+    fi
+    bad=$(git diff --name-only $range 2>/dev/null | grep -E '^({alts})')
+    if [ -n "$bad" ]; then
+        echo "push refused — protected lab paths cannot enter the local origin (P10):" >&2
+        echo "$bad" | head -5 >&2
+        status=1
+    fi
+done
+exit $status
+'''
+
 
 def branch_name(agent_id: str, task_id: int, title: str) -> str:
     slug = _SLUG_RE.sub("-", title.lower()).strip("-")[:40]
@@ -57,6 +99,7 @@ class LocalRepo:
     def ensure(self, src: Path | None = None) -> Path:
         """Seed the bare repo once from the running lab checkout."""
         if (self.path / "HEAD").exists():
+            self.install_pre_receive()          # repair path for existing repos
             return self.path
         src = src or PROJECT_ROOT
         if not (src / ".git").exists():
@@ -78,7 +121,49 @@ class LocalRepo:
             ["git", "-C", str(self.path), "symbolic-ref", "HEAD", "refs/heads/main"],
             capture_output=True, text=True,
         )
+        self.install_pre_receive()
         return self.path
+
+    # ------------------------------------------------------------------ P10
+    def install_pre_receive(self) -> Path:
+        """Defence in depth BELOW the app-level P10 gates (ported from the
+        earlier local-mode proposal on this branch).
+
+        The three app gates (workspace write, pre-push diff scan, review +
+        merge) only see traffic that flows through agentics code. A direct
+        ``git push`` to data/lab.git bypasses all of them — this pre-receive
+        hook closes that hole at the git layer: any push introducing a
+        protected path is refused before a branch or MR can even exist.
+
+        The pattern is generated from the CURRENT settings (lab.yaml can
+        extend the default list); ``ALWAYS_PROTECTED`` credentials/secret
+        paths are always included. Only hooks carrying the agentics sentinel
+        are (re)written — an owner-customised hook is never clobbered.
+        The ``ALLOW_PROTECTED_PATHS=1`` env switch of the PUSHING process is
+        honoured (receive-pack inherits it for local pushes), mirroring the
+        app-layer override semantics.
+        """
+        from agentics.policies.guard import ALWAYS_PROTECTED
+
+        base = tuple(getattr(self.settings, "protected_paths", None) or ())
+        paths = [p for p in (*base, *ALWAYS_PROTECTED) if p]
+        script = _pre_receive_script(paths)
+        hook = self.path / "hooks" / "pre-receive"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        if hook.exists():
+            current = hook.read_text(encoding="utf-8", errors="replace")
+            if current == script:
+                return hook                     # already up to date
+            if PRE_RECEIVE_SENTINEL not in current[:256]:
+                log.info("pre-existing owner hook at %s left untouched", hook)
+                return hook
+        hook.write_text(script, encoding="utf-8")
+        try:
+            hook.chmod(0o755)
+        except OSError:
+            pass
+        log.info("pre-receive P10 hook installed at %s", hook)
+        return hook
 
     def main_head(self) -> str:
         proc = subprocess.run(
@@ -122,22 +207,86 @@ class TaskSource:
             self.memory.create_task(title, body=body, category=category, agent="seed")
 
     def supervisor_top_up(self) -> int:
-        """Supervisor: if nothing is claimable, open the next survey-angle task."""
+        """Supervisor: if nothing is claimable, grow the backlog by one task.
+
+        Two self-generated sources, in priority order (ported from the earlier
+        local-mode proposal on this branch — review of cd8b536 found that the
+        original top-up always re-opened ``SURVEY_ANGLES[0]``, so a dry backlog
+        re-created the same survey forever and never reached the other angles):
+
+          1. failure-driven investigation — the newest failed trace without a
+             task yet becomes an investigation task (the GEA loop fed by the
+             swarm's own incident history),
+          2. the next survey angle — angles ROTATE, least-used first, so the
+             infinite research loop revisits the topic from a new side each
+             time instead of repeating the first angle.
+
+        Returns the number of tasks created (0 or 1).
+        """
         if self.memory.scan_open_tasks(limit=1):
             return 0
+        if self._open_failure_investigation():
+            return 1
+        return self._open_next_survey_angle()
+
+    def _open_failure_investigation(self) -> int:
+        """Turn the newest un-investigated failed trace into a bugfix task."""
+        known = {t["title"] for t in self.memory.list_tasks(limit=500)}
+        for trace in self.memory.recent_traces(limit=5, failures_only=True):
+            failure = " ".join(
+                str(trace.get("failure") or trace.get("attempted") or "").split()
+            )
+            if not failure:
+                continue
+            snippet = failure if len(failure) <= 90 else failure[:89] + "…"
+            title = (f"Investigate failure ({trace.get('category', 'unknown')}): "
+                     f"{snippet}")
+            # a failure already investigated (any state, incl. merged) must not
+            # re-open — recurring failures are the evolution task's job
+            if title in known:
+                continue
+            task_id = self.memory.create_task_if_absent(
+                title,
+                body=(
+                    "Self-generated from the group failure traces (GEA).\n\n"
+                    f"Agent `{trace.get('agent')}` attempted "
+                    f"`{str(trace.get('attempted') or '')[:200]}` -> failed "
+                    f"`{failure[:200]}`.\n\n## Task\nInvestigate the root cause, "
+                    "fix or document it in the research repo, and record what "
+                    "you learned as a trace."
+                ),
+                category="bugfix",
+                agent="supervisor",
+            )
+            if task_id is not None:
+                self.memory.journal("supervisor", "backlog_top_up",
+                                    {"task": task_id, "source": "failure_trace",
+                                     "trace": trace.get("id")})
+                return 1
+        return 0
+
+    def _open_next_survey_angle(self) -> int:
+        """Open the least-used survey angle for the research topic."""
         topic = self.settings.research_topic
-        counts = self.memory.task_counts()
-        created = self.memory.create_task_if_absent(
-            f"{SURVEY_ANGLES[0]}: {topic}",
+        used: dict[str, int] = {}
+        for t in self.memory.list_tasks(limit=500):
+            for angle in SURVEY_ANGLES:
+                if t["title"].startswith(f"{angle}:"):
+                    used[angle] = used.get(angle, 0) + 1
+                    break
+        angle = min(SURVEY_ANGLES, key=lambda a: (used.get(a, 0), SURVEY_ANGLES.index(a)))
+        task_id = self.memory.create_task_if_absent(
+            f"{angle}: {topic}",
             body=("Backlog ran dry. Produce the next research increment with "
                   "citations and store findings in shared memory."),
             category="research",
             agent="supervisor",
         )
-        if created is not None:
-            self.memory.journal("supervisor", "backlog_top_up", {"task": created})
+        if task_id is not None:
+            self.memory.journal("supervisor", "backlog_top_up",
+                                {"task": task_id, "source": "survey_rotation",
+                                 "angle": angle})
             return 1
-        _ = counts
         return 0
 
 

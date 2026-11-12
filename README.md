@@ -78,10 +78,12 @@ Chính sách chống xung đột: [docs/POLICIES.md](docs/POLICIES.md)
 
 ## 3. Cài đặt nhanh
 
-> **Chế độ LOCAL-ONLY (nhánh `update-interactive-local`):** lab chạy hoàn toàn
+> **Chế độ LOCAL-ONLY (nhánh `update_interactive_local`):** lab chạy hoàn toàn
 > trên máy của bạn — không cần `GITHUB_TOKEN`, không gọi GitHub. "origin" của
 > agent là bare repo tự seed tại `data/lab.git`; tasks/MR/review/merge đều
-> nằm trong SQLite. Owner theo dõi qua web dashboard.
+> nằm trong SQLite. Owner theo dõi qua web dashboard (`agentics dashboard`)
+> hoặc terminal (`agentics journal -f`). Chi tiết kiến trúc + nhật ký tích
+> hợp: [docs/LOCAL_MODE.md](docs/LOCAL_MODE.md).
 
 ```bash
 git clone https://github.com/shieldx-bot/agentics-ai-research-lab.git
