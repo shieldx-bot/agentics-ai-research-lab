@@ -467,10 +467,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     plan = json.loads(state.get("plan") or "{}")
     for spec in plan.get("files", []):
         path, change = spec.get("path", ""), spec.get("change", "new")
+        # `or ""`: read_file returns None for a hallucinated path (the plan
+        # says "edit" but the file does not exist in the workspace) — treat
+        # it as a new file instead of crashing the whole cycle.
         current = (
             await asyncio.to_thread(ctx.workspace.read_file, path)
             if change == "edit" else ""
-        )
+        ) or ""
         prompt = (
             f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"

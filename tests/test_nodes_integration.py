@@ -550,3 +550,24 @@ def test_integrator_refuses_merge_of_protected_diff(mem):
     nodes.node_integrate(ctx, {})
     assert mem.get_review(mr_id)["status"] == "failed"
     assert mem.get_task(1)["status"] == "failed"
+
+
+def test_implement_survives_a_hallucinated_edit_path(mem, tmp_path, monkeypatch):
+    """read_file returns None when the plan says 'edit' but the file does not
+    exist in the workspace — the node must treat it as a new file instead of
+    crashing with TypeError on current[:6000] (found while integrating)."""
+    _llm_json(monkeypatch, payload_by_purpose={"implement": "x = 1\n"})
+
+    class NoFileWorkspace(FakeWorkspace):
+        def read_file(self, p):
+            return None               # the path was hallucinated by the plan
+
+    ws = NoFileWorkspace(tmp_path, ["experiments/hallucinated.py"])
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws),
+        {**_impl_state(), "plan": json.dumps(
+            {"files": [{"path": "experiments/hallucinated.py", "change": "edit"}],
+             "commit_message": "new experiment"})},
+    ))
+    assert state.get("error") is None, state
+    assert ws.pushed and state["action"] == "open_pr"
