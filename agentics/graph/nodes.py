@@ -336,7 +336,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     active_roles = {
         a["role"] for a in active_agents if a["agent"] != ctx.agent_id
     }
-    ok, foreign = await asyncio.to_thread(ctx.ownership.evaluate, ctx.role.value, changed, active_roles)
+    ok, foreign = await asyncio.to_thread(
+        ctx.ownership.evaluate, ctx.role.value, changed, active_roles
+    )
     if not ok:
         return _yield(ctx, state, f"foreign files {foreign[:5]}")
 
