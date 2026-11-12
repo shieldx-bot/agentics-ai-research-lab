@@ -219,10 +219,22 @@ class SharedMemory:
             )
             return True
 
+    def renew_claim(self, issue: int, agent: str, ttl_s: float) -> bool:
+        """Extend a live lease only for its current owner; expired leases cannot revive."""
+        now = time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE claims SET expires_at=? "
+                "WHERE issue=? AND agent=? AND status='active' AND expires_at>?",
+                (now + ttl_s, issue, agent, now),
+            )
+            return cur.rowcount == 1
+
     def release_claim(self, issue: int, agent: str) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE claims SET status='released' WHERE issue=? AND agent=?",
+                "UPDATE claims SET status='released' "
+                "WHERE issue=? AND agent=? AND status='active'",
                 (issue, agent),
             )
 
@@ -234,6 +246,7 @@ class SharedMemory:
             )
 
     def active_claims(self) -> dict[int, Claim]:
+        """Return currently valid leases (for status displays and renewals)."""
         now = time.time()
         with self._lock:
             rows = self._conn.execute(
@@ -241,9 +254,26 @@ class SharedMemory:
                 "FROM claims WHERE status='active' AND expires_at > ?",
                 (now,),
             ).fetchall()
-        return {
-            r[0]: Claim(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows
-        }
+        return {r[0]: Claim(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows}
+
+    def all_active_claims(self) -> dict[int, Claim]:
+        """Return every active row, including expired leases awaiting cleanup."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT issue, agent, claimed_at, expires_at, branch, status "
+                "FROM claims WHERE status='active'"
+            ).fetchall()
+        return {r[0]: Claim(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows}
+
+    def claims_for_agent(self, agent: str) -> dict[int, Claim]:
+        """Return active rows owned by one agent, including expired leases."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT issue, agent, claimed_at, expires_at, branch, status "
+                "FROM claims WHERE status='active' AND agent=?",
+                (agent,),
+            ).fetchall()
+        return {r[0]: Claim(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows}
 
     # ------------------------------------------------------------ heartbeats
     def heartbeat(self, agent: str, role: str, cycle: int, status: str = "idle") -> None:
