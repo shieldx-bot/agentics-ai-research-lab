@@ -136,3 +136,24 @@ def test_complete_claim_marks_done_and_removes_github_label(memory, monkeypatch)
     assert row == ("done", "agent/a/25")
     assert 25 not in memory.claims_for_agent("agent-a")
     assert released and released[0][0:2] == (25, "agent-a")
+
+def test_partial_github_claim_failure_rolls_back_label_and_local_lease(
+    memory, monkeypatch
+):
+    released = []
+    monkeypatch.setattr(
+        claims_module.issue_ops, "claim_issue",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("comment API failed")),
+    )
+    monkeypatch.setattr(
+        claims_module.issue_ops, "release_issue",
+        lambda repo, issue, agent, reason: released.append((issue, agent, reason)),
+    )
+
+    assert not _policy(memory).try_claim(26, "agent-a", "agent/a/26")
+
+    row = memory._conn.execute(
+        "SELECT status FROM claims WHERE issue=?", (26,)
+    ).fetchone()
+    assert row == ("released",)
+    assert released and released[0][0:2] == (26, "agent-a")
