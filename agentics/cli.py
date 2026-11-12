@@ -407,6 +407,51 @@ def test_llm(
     pool.mark_ok(acc)
 
 
+@app.command("evidence")
+def evidence(
+    task_id: int = typer.Argument(None, help="chỉ hiện bằng chứng của 1 task (bỏ trống = tất cả)"),
+    search: str = typer.Option("", "--search", "-s", help="tìm theo giả thuyết/lệnh/kết quả"),
+    limit: int = typer.Option(30, "--limit", "-l", help="số dòng tối đa"),
+) -> None:
+    """Owner: mọi kết quả kiểm chứng thực nghiệm (P16) các agent đã ghi.
+
+    Đây là phần trả lời cho giả thuyết 3: kết quả kiểm chứng của một agent
+    được lưu chung và MỌI agent (cùng owner) tra cứu lại được."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        counts = mem.evidence_counts()
+        console.print("[bold]Bằng chứng kiểm chứng (P16)[/]",
+                      " — ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+                      or "(chưa có)")
+        rows = (mem.evidence_search(search, limit=limit) if search
+                else mem.evidence_for_task(task_id) if task_id is not None
+                else mem.latest_evidence(limit=limit))
+        table = Table(title="Empirical evidence" + (f" — task #{task_id}" if task_id is not None else ""))
+        table.add_column("ID", justify="right")
+        table.add_column("Task", justify="right")
+        table.add_column("Agent")
+        table.add_column("Verdict")
+        table.add_column("Lệnh kiểm chứng", overflow="fold")
+        table.add_column("Exit", justify="right")
+        table.add_column("Ghi chú", overflow="fold")
+        for e in rows:
+            color = {"confirmed": "green", "refuted": "red"}.get(e["verdict"], "yellow")
+            table.add_row(
+                str(e["id"]),
+                str(e["task_id"] if e["task_id"] is not None else "-"),
+                e["agent"], f"[{color}]{e['verdict']}[/]", e["cmd"],
+                str(e["exit_code"]),
+                e["note"] or (f"bởi {e['verdict_by']}" if e["verdict_by"] else ""),
+            )
+        console.print(table)
+    finally:
+        mem.close()
+
+
 @app.command()
 def assign_roles() -> None:
     """Print the role assignment for current accounts (dry-run)."""

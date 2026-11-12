@@ -45,6 +45,10 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
         "merge_queue": memory.mq_pending(),
         "reviews": reviews,
         "locks": memory.active_file_locks(),
+        "evidence": {
+            "counts": memory.evidence_counts(),
+            "recent": memory.latest_evidence(limit=12),
+        },
         "alerts": [
             e for e in memory.recent_journal(limit=120)
             if e.get("event") in ("integrity_drift", "scope_violation",
@@ -137,6 +141,9 @@ _HTML = """<!doctype html>
     <div class="kv" id="mq" style="margin-top:8px"></div></div>
   <div class="card"><h2>File locks (P13 — ai đang giữ file nào)</h2>
     <table id="locks"><thead><tr><th>File</th><th>Agent</th><th>Hết hạn</th></tr></thead><tbody></tbody></table></div>
+  <div class="card" style="grid-column:1/-1"><h2>Kiểm chứng thực nghiệm (P16 — bằng chứng chạy thật, không phải lời nói LLM)</h2>
+    <div class="kv" id="evcounts"></div>
+    <table id="evidence" style="margin-top:8px"><thead><tr><th>ID</th><th>Task</th><th>Agent</th><th>Verdict</th><th>Lệnh kiểm chứng</th><th>Exit</th></tr></thead><tbody></tbody></table></div>
   <div class="card"><h2>Cảnh báo guard / intent (P10/P13/P14)</h2>
     <div class="acts" id="alerts"></div></div>
   <div class="card"><h2>Bộ nhớ (trí nhớ chung)</h2>
@@ -192,6 +199,16 @@ function render(s){
     <tr><td>${esc(l.path)}</td><td><b>${esc(l.agent)}</b></td>
     <td class="kv">còn ${Math.max(0, Math.round(l.expires_at - s.ts))}s</td></tr>`).join("")
     || '<tr><td colspan="3" class="kv">không có khóa nào</td></tr>';
+  const ev = s.evidence || {counts:{}, recent:[]};
+  const vc = ev.counts || {};
+  document.getElementById("evcounts").innerHTML = Object.keys(vc).length
+    ? Object.entries(vc).map(([k,v])=>`<span class="pill ${k==='confirmed'?'merged':k==='refuted'?'failed':'claimed'}">${esc(k)}: <b>${v}</b></span>`).join(" ")
+    : '<span class="kv">chưa có bằng chứng nào — agent khai báo "verify_cmds" trong kế hoạch để chạy kiểm chứng thật (P16)</span>';
+  document.querySelector("#evidence tbody").innerHTML = (ev.recent||[]).map(e=>`
+    <tr><td>#${e.id}</td><td>${e.task_id??'-'}</td><td>${esc(e.agent)}</td>
+    <td><span class="pill ${e.verdict==='confirmed'?'merged':e.verdict==='refuted'?'failed':'claimed'}">${esc(e.verdict)}</span>${e.verdict_by?` <span class="kv">(${esc(e.verdict_by)})</span>`:''}</td>
+    <td class="dt">${esc(e.cmd)}</td><td>${e.exit_code}</td></tr>`).join("")
+    || '<tr><td colspan="6" class="kv">trống</td></tr>';
   const alerts = s.alerts||[];
   document.getElementById("alerts").innerHTML = alerts.length
     ? alerts.slice().reverse().map(e=>`
