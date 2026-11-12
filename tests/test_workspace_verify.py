@@ -28,7 +28,7 @@ def ws(tmp_path: Path):
     git(seed, "remote", "add", "origin", str(bare))
     git(seed, "push", "origin", "main")
 
-    settings = Settings(github_token="x", github_repo="o/r")
+    settings = Settings(github_token="x", github_repo="o/r", sandbox_enabled=False)
     settings.data_dir = tmp_path / "data"
     w = RepoWorkspace("a01", settings)
     w._remote = str(bare)  # point the workspace at the local remote
