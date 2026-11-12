@@ -271,9 +271,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
 
 async def _yield(ctx: AgentContext, state: ResearchState, reason: str) -> ResearchState:
-    await asyncio.to_thread(
-        ctx.claims.release, state["issue_number"], ctx.agent_id, f"yield: {reason}"
-    )
+    # node_reflect owns the single terminal cleanup path for non-PR cycles.
     await asyncio.to_thread(ctx.workspace.sync_main)  # discard local changes
     state["yield_reason"] = reason
     state["done"] = True
@@ -413,13 +411,15 @@ def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
     )
     state["pr_number"] = pr.number
     state["pr_url"] = pr.html_url
+    # The issue is now handed off to the PR lifecycle; mark the lease complete
+    # before any non-critical memory/notification work can fail.
+    ctx.claims.complete(state["issue_number"], ctx.agent_id, state["branch"])
     _register_tools(ctx, state, pr.number)
     ctx.memory.post_message(
         ctx.agent_id, "handoff",
         f"PR #{pr.number} ready for cross-review: {pr.html_url}",
         state["issue_number"],
     )
-    ctx.claims.complete(state["issue_number"], ctx.agent_id, state["branch"])
     state["done"] = True
     state["summary"] = f"opened PR #{pr.number}"
     return state
