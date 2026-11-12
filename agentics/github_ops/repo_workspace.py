@@ -1,7 +1,9 @@
 """Local git workspace per agent — clone once, sync per cycle, push to own branch."""
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,15 +21,30 @@ class RepoWorkspace:
         self.agent_id = agent_id
         self.settings = settings
         self.path = settings.workspaces_dir / agent_id
-        self._remote = (
-            f"https://x-access-token:{settings.github_token}@github.com/"
-            f"{settings.github_repo}.git"
-        )
+        # Keep credentials out of the remote URL and .git/config. Git receives
+        # the authorization header through a child-process environment variable.
+        self._remote = f"https://github.com/{settings.github_repo}.git"
 
     # ------------------------------------------------------------ plumbing
+    def _git_env(self) -> dict[str, str]:
+        """Return a per-process Git auth environment; never persist credentials."""
+        env = os.environ.copy()
+        token = self.settings.github_token
+        if token:
+            try:
+                count = max(0, int(env.get("GIT_CONFIG_COUNT", "0")))
+            except ValueError:
+                count = 0
+            env["GIT_CONFIG_COUNT"] = str(count + 1)
+            env[f"GIT_CONFIG_KEY_{count}"] = "http.extraheader"
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+            env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {basic}"
+        return env
+
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         proc = subprocess.run(
-            ["git", *args], cwd=self.path, capture_output=True, text=True
+            ["git", *args], cwd=self.path, capture_output=True, text=True,
+            env=self._git_env(),
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
@@ -35,12 +52,14 @@ class RepoWorkspace:
 
     def ensure_cloned(self) -> None:
         if (self.path / ".git").exists():
+            # Repair legacy clones that may have stored credentials in origin.
+            self._git("remote", "set-url", "origin", self._remote)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         log.info("[%s] cloning repo…", self.agent_id)
         subprocess.run(
             ["git", "clone", "--filter=blob:none", self._remote, str(self.path)],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, env=self._git_env(),
         )
         self._git("config", "user.name", f"agentics[{self.agent_id}]")
         self._git("config", "user.email", f"agentics+{self.agent_id}@users.noreply.github.com")
