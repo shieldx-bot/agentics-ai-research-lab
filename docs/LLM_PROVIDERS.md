@@ -170,3 +170,21 @@ Constraints of cloud-browser mode (free plan):
 * each `ask()` navigates a fresh Perplexity thread (~60–140 s round trip)
 * offline unit tests never create sessions; live check:
   `HB_API_KEY=... python scripts/live_research_run.py`
+
+### Failure handling
+
+* A missing composer is not automatically treated as a bad cookie. The client
+  records bounded page metadata (URL/title/body excerpt), distinguishes an
+  expired login from a provider verification/challenge page, and tears down
+  the failed session.
+* A verification page opens a process-wide circuit breaker (10 minutes); a
+  generic composer/frontend failure opens it for 3 minutes. While open, agents
+  fail fast instead of creating sessions for every account.
+* Provider-wide UI/challenge failures do **not** put individual cookie
+  accounts on cooldown. Only account-specific authentication failures do.
+  The client does not automate or attempt to bypass CAPTCHA/security
+  verification; resolve any required verification through the normal
+  provider-supported user flow, then restart/retry.
+* Agent issue discovery is cached process-wide for 45 seconds. This coalesces
+  synchronized scans; the actual claim operation still re-reads the issue and
+  checks its current labels before acquiring the claim.
