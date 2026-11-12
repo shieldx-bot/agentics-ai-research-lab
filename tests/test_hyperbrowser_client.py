@@ -220,14 +220,15 @@ def test_provider_ui_outage_does_not_cool_down_cookie_account(tmp_path, monkeypa
     calls = []
 
     class BrokenClient:
-        account = account
+        def __init__(self, account):
+            self.account = account
 
         async def ask(self, *_args, **_kwargs):
             raise HyperbrowserBackendUnavailable("verification page")
 
     pool = host.pools["perplexity"]
     monkeypatch.setattr(pool, "mark_failed", lambda *args, **kwargs: calls.append(args))
-    monkeypatch.setattr(host, "_lease", lambda _purpose: ("perplexity", BrokenClient()))
+    monkeypatch.setattr(host, "_lease", lambda _purpose: ("perplexity", BrokenClient(account)))
 
     with pytest.raises(HyperbrowserBackendUnavailable):
         asyncio_run(host.ask("test", purpose="research"))
