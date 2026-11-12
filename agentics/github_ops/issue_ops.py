@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 
 from github.Issue import Issue
@@ -14,21 +15,44 @@ CLAIM_PREFIX = "/claim"
 CLAIMED_LABEL_RE = re.compile(r"^claimed/(\S+)$")
 
 
+# All agents share one process. Cache the expensive GitHub issue scan so
+# synchronized agent loops do not issue identical paginated requests.
+_SCAN_CACHE_TTL_S = 45.0
+_SCAN_CACHE_LOCK = threading.Lock()
+_SCAN_CACHE: dict[tuple[int, int], tuple[float, list[Issue]]] = {}
+
+
 def scan_open_issues(repo: Repository, limit: int = 30) -> list[Issue]:
-    """Open issues without any claimed/* label and not labelled `blocked`."""
-    issues: list[Issue] = []
-    for issue in repo.get_issues(state="open", sort="created", direction="asc"):
-        if issue.pull_request is not None:
-            continue
-        labels = {lb.name for lb in issue.labels}
-        if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
-            continue
-        if "blocked" in labels:
-            continue
-        issues.append(issue)
-        if len(issues) >= limit:
-            break
-    return issues
+    """Open, unclaimed issues; a short shared cache limits API polling.
+
+    The cache is only a discovery optimization. Claim acquisition must still
+    re-read the target issue and atomically verify its current claim labels.
+    """
+    key = (int(repo.id), int(limit))
+    now = time.monotonic()
+    with _SCAN_CACHE_LOCK:
+        cached = _SCAN_CACHE.get(key)
+        if cached and now - cached[0] < _SCAN_CACHE_TTL_S:
+            return list(cached[1])
+
+        issues: list[Issue] = []
+        for issue in repo.get_issues(state="open", sort="created", direction="asc"):
+            if issue.pull_request is not None:
+                continue
+            labels = {lb.name for lb in issue.labels}
+            if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
+                continue
+            if "blocked" in labels:
+                continue
+            issues.append(issue)
+            if len(issues) >= limit:
+                break
+        _SCAN_CACHE[key] = (time.monotonic(), list(issues))
+        # Keep the cache bounded if a process watches several repositories.
+        if len(_SCAN_CACHE) > 32:
+            oldest = min(_SCAN_CACHE, key=lambda k: _SCAN_CACHE[k][0])
+            _SCAN_CACHE.pop(oldest, None)
+        return issues
 
 
 def issue_holders(repo: Repository, issue_number: int) -> list[str]:
