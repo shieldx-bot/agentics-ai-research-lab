@@ -42,9 +42,12 @@ class RepoWorkspace:
         return env
 
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        # Only network operations receive the credential. Local commands (especially
+        # commit hooks) must not inherit a token they do not need.
+        network_ops = {"fetch", "push", "pull", "ls-remote"}
+        env = self._git_env() if args and args[0] in network_ops else os.environ.copy()
         proc = subprocess.run(
-            ["git", *args], cwd=self.path, capture_output=True, text=True,
-            env=self._git_env(),
+            ["git", *args], cwd=self.path, capture_output=True, text=True, env=env,
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
