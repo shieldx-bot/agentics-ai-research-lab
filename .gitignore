@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== SECRETS — KHÔNG BAO GIỜ COMMIT =====
+.env
+.env.*
+!*.example
+accounts/*.json
+accounts/*.txt
+!accounts/README.md
+*.token
+
+# Runtime data
+data/
+logs/
+STOP
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
