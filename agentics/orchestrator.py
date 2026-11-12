@@ -15,6 +15,7 @@ import random
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, assign_roles
 from agentics.config import Settings, load_yaml_overrides, PROJECT_ROOT
+from agentics.github_ops import issue_ops
 from agentics.github_ops.repo_workspace import RepoWorkspace
 from agentics.llm.errors import is_auth_failure
 from agentics.llm.session_host import BrowserSessionHost
@@ -68,6 +69,8 @@ class Orchestrator:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or load_yaml_overrides(Settings())
         self.settings.ensure_dirs()
+        # Apply the YAML/env scan-cache TTL to the shared issue cache.
+        issue_ops.set_scan_cache_ttl(getattr(self.settings, "gh_scan_cache_ttl", 60))
         self.memory = SharedMemory(self.settings.db_path)
         self.vector = VectorStore(self.settings.chroma_path)
         self.host = BrowserSessionHost.from_settings(self.settings)
@@ -179,6 +182,10 @@ class Orchestrator:
                     # the next ask. is_auth_failure classifies precisely so a
                     # generic cycle error that merely starts with "4" (or an
                     # unrelated "auth" substring) cannot cool a healthy cookie.
+                    # Graph-node LLM failures degrade to state["error"] before
+                    # reaching this branch (ported from main); only errors that
+                    # still bubble up (heartbeat, non-graph code) land here, and
+                    # only genuine auth failures cool a cookie.
                     if ctx.llm is not None and is_auth_failure(exc):
                         ctx.llm.mark_failed(str(exc))
                 pause = self.settings.cycle_pause_seconds + random.uniform(0, 15)

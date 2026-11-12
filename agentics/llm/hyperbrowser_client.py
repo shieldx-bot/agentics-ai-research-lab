@@ -284,8 +284,9 @@ class HyperbrowserClient:
             "[role='textbox']:visible"
         )
         box = self._page.locator(selectors).first
+        timeout_s = max(5, int(getattr(self.settings, "hb_input_timeout", 45) or 45))
         try:
-            await box.wait_for(state="visible", timeout=45000)
+            await box.wait_for(state="visible", timeout=timeout_s * 1000)
             return box
         except Exception as exc:  # noqa: BLE001
             diag = await self._page_diagnostics()
@@ -304,7 +305,7 @@ class HyperbrowserClient:
                     f"(title={diag['title']!r}, url={diag['url']!r})"
                 ) from exc
             reason = (
-                f"Perplexity composer unavailable after 45s "
+                f"Perplexity composer unavailable after {timeout_s}s "
                 f"(title={diag['title']!r}, url={diag['url']!r})"
             )
             _open_backend_circuit(reason, cooldown_s=180)
