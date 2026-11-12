@@ -7,7 +7,8 @@ import pytest
 
 from agentics.config import Settings
 from agentics.local_ops import (
-    LocalClaimPolicy, LocalMergeQueue, LocalRepo, TaskSource, branch_name,
+    SURVEY_ANGLES, LocalClaimPolicy, LocalMergeQueue, LocalRepo, TaskSource,
+    branch_name,
 )
 from agentics.memory.shared_memory import SharedMemory
 from agentics.policies.guard import ProtectedPathsGuard
@@ -137,6 +138,71 @@ def test_task_source_supervisor_tops_up_when_dry(settings, mem):
     src = TaskSource(mem, settings)
     assert src.supervisor_top_up() == 1        # empty backlog -> survey task
     assert src.supervisor_top_up() == 0        # still open -> nothing new
+
+
+def test_supervisor_top_up_rotates_survey_angles(settings, mem):
+    """Backlog dry again and again must walk every angle, not repeat angle 0."""
+    src = TaskSource(mem, settings)
+    titles = []
+    for _ in range(len(SURVEY_ANGLES)):        # exactly one full rotation
+        created = src.supervisor_top_up()
+        if created:
+            newest = mem.list_tasks(limit=1)[0]
+            titles.append(newest["title"])
+            mem.set_task_status(newest["id"], "merged")   # dry the backlog again
+        else:
+            break
+    assert len(titles) >= 3                    # distinct angles over time
+    assert len(set(titles)) == len(titles)     # never the same angle twice in a row
+    angles_logged = [j["detail"] for j in mem.recent_journal(limit=50)
+                     if j["event"] == "backlog_top_up"]
+    assert len(angles_logged) == len(titles)
+
+
+def test_repair_orphan_tasks_reopens_claimed_without_lease(settings, mem):
+    src = TaskSource(mem, settings)
+    tid = mem.create_task("crashed claim")
+    mem.set_task_status(tid, "claimed", claimed_by="a04")   # no claim row at all
+    assert src.repair_orphan_tasks() == [tid]
+    assert mem.get_task(tid)["status"] == "open"
+    events = [j["event"] for j in mem.recent_journal()]
+    assert "task_repair" in events
+
+
+def test_repair_orphan_tasks_keeps_live_claims_and_reviews(settings, mem):
+    src = TaskSource(mem, settings)
+    held = mem.create_task("held work")
+    policy = LocalClaimPolicy(mem, ttl_minutes=60)
+    assert policy.try_claim(held, "a04", "agent/a04/x")     # active lease -> untouched
+    in_review = mem.create_task("in review with live MR")
+    mr = mem.open_review(in_review, "MR", "b", author="a05",
+                         branch="agent/a05/x", files=[])
+    mem.set_review_verdict(mr, "changes_requested", "a07", "please fix")
+    assert src.repair_orphan_tasks() == []
+    assert mem.get_task(held)["status"] == "claimed"
+    assert mem.get_task(in_review)["status"] == "in_review"
+
+
+def test_repair_orphan_tasks_reopens_in_review_without_live_mr(settings, mem):
+    src = TaskSource(mem, settings)
+    stalled = mem.create_task("MR vanished")
+    mem.set_task_status(stalled, "in_review")
+    failed_mr = mem.open_review(stalled, "MR", "b", author="a05",
+                                branch="agent/a05/x", files=[])
+    mem.set_review_verdict(failed_mr, "failed", "a09", "tier-2 failed")
+    assert src.repair_orphan_tasks() == [stalled]
+    assert mem.get_task(stalled)["status"] == "open"
+
+
+def test_release_never_reopens_a_task_with_a_live_mr(mem):
+    """An in_review task has a live MR — release must not reopen it (P5)."""
+    tid = mem.create_task("reviewed work")
+    mr = mem.open_review(tid, "MR", "b", author="a04",
+                         branch="agent/a04/x", files=[])
+    mem.set_review_verdict(mr, "changes_requested", "a07", "fix")
+    policy = LocalClaimPolicy(mem, ttl_minutes=60)
+    policy.release(tid, "a04", "cycle ended without an MR")
+    assert mem.get_task(tid)["status"] == "in_review"
 
 
 def test_merge_queue_drains_approved_mrs_serially(mem):

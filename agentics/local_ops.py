@@ -213,23 +213,64 @@ class TaskSource:
             self.memory.create_task(title, body=body, category=category, agent="seed")
 
     def supervisor_top_up(self) -> int:
-        """Supervisor: if nothing is claimable, open the next survey-angle task."""
+        """Supervisor: if nothing is claimable, open the next survey-angle task.
+
+        Angles rotate by the number of tasks the lab has already been through,
+        so a long-running backlog sweeps every research angle instead of
+        reopening "State-of-the-art survey" forever. If the rotated angle is
+        still open/claimed elsewhere, the next angles are tried, so a dry
+        backlog always receives work as long as any angle title is free.
+        """
         if self.memory.scan_open_tasks(limit=1):
             return 0
         topic = self.settings.research_topic
-        counts = self.memory.task_counts()
-        created = self.memory.create_task_if_absent(
-            f"{SURVEY_ANGLES[0]}: {topic}",
-            body=("Backlog ran dry. Produce the next research increment with "
-                  "citations and store findings in shared memory."),
-            category="research",
-            agent="supervisor",
-        )
-        if created is not None:
-            self.memory.journal("supervisor", "backlog_top_up", {"task": created})
-            return 1
-        _ = counts
+        total = sum(self.memory.task_counts().values())
+        for offset in range(len(SURVEY_ANGLES)):
+            angle = SURVEY_ANGLES[(total + offset) % len(SURVEY_ANGLES)]
+            created = self.memory.create_task_if_absent(
+                f"{angle}: {topic}",
+                body=("Backlog ran dry. Produce the next research increment with "
+                      "citations and store findings in shared memory."),
+                category="research",
+                agent="supervisor",
+            )
+            if created is not None:
+                self.memory.journal("supervisor", "backlog_top_up",
+                                    {"task": created, "angle": angle})
+                return 1
         return 0
+
+    def repair_orphan_tasks(self) -> list[int]:
+        """Put tasks whose lifecycle stalled back into the open pool.
+
+        Two stall shapes exist and both shrink the backlog permanently if left
+        alone (scan_open_tasks only ever reads status='open'):
+
+        - ``claimed`` but no active claim row  — a crash between the atomic
+          claim and the task-status update, or a lease already swept;
+        - ``in_review`` but no live MR (open / changes_requested / approved) —
+          the MR row vanished or failed without the queue closing the task.
+
+        Runs every Supervisor scan, after sweep_stale released expired leases.
+        """
+        repaired: list[int] = []
+        for task in self.memory.list_tasks(limit=200, status="claimed"):
+            if task["id"] not in self.memory.all_active_claims():
+                self.memory.set_task_status(task["id"], "open", claimed_by="")
+                self.memory.journal("supervisor", "task_repair", {
+                    "task": task["id"], "why": "claimed without an active lease",
+                })
+                repaired.append(task["id"])
+        live_mr = ("open", "changes_requested", "approved")
+        for task in self.memory.list_tasks(limit=200, status="in_review"):
+            mrs = self.memory.reviews_by_task(task["id"])
+            if not any(r["status"] in live_mr for r in mrs):
+                self.memory.set_task_status(task["id"], "open", claimed_by="")
+                self.memory.journal("supervisor", "task_repair", {
+                    "task": task["id"], "why": "in_review without a live MR",
+                })
+                repaired.append(task["id"])
+        return repaired
 
 
 class LocalClaimPolicy:
@@ -253,7 +294,10 @@ class LocalClaimPolicy:
     def release(self, task_id: int, agent_id: str, reason: str = "") -> None:
         self.memory.release_claim(task_id, agent_id)
         task = self.memory.get_task(task_id)
-        if task and task["status"] in ("claimed", "in_review"):
+        # Only a plain claimed task returns to the open pool. An in_review task
+        # has a live MR — reopening it here would let a second MR be raised
+        # against the same task while the first still awaits re-review.
+        if task and task["status"] == "claimed":
             self.memory.set_task_status(task_id, "open", claimed_by="")
         self.memory.journal(agent_id, "release", {"task": task_id, "why": reason})
 

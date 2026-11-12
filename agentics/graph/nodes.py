@@ -104,6 +104,10 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         stale_locks = ctx.memory.sweep_file_locks()
     except Exception:  # noqa: BLE001
         stale_locks = []
+    # repair tasks stalled without a lease / without a live MR (after the sweep,
+    # so expired leases released above count as repaired orphans)
+    tasks_src = getattr(getattr(ctx, "local", None), "tasks", None)
+    repaired = tasks_src.repair_orphan_tasks() if tasks_src is not None else []
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
@@ -111,7 +115,6 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
             f"Freed {len(freed)} stale claim(s): {freed}"
         )
     topped_up = 0
-    tasks_src = getattr(getattr(ctx, "local", None), "tasks", None)
     if not tasks and tasks_src is not None:
         topped_up = tasks_src.supervisor_top_up()
         tasks = ctx.memory.scan_open_tasks(limit=30)
@@ -119,6 +122,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Backlog scan: {len(tasks)} open unclaimed task(s)."
         + (f" Stale claims freed: {freed}." if freed else "")
         + (f" Stale file locks freed: {stale_locks}." if stale_locks else "")
+        + (f" Repaired stalled task(s): {repaired}." if repaired else "")
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
@@ -177,13 +181,63 @@ def _maybe_open_evolution_task(ctx: AgentContext, state: ResearchState) -> None:
         state["summary"] += f" Opened self-evolution task #{task_id}."
 
 
+def _pick_rework(ctx: AgentContext) -> tuple[dict, dict] | None:
+    """My oldest changes_requested MR whose task still exists (author rework).
+
+    P5 hygiene: address the review feedback before claiming new work. The task
+    stays parked in in_review during the rework — no new claim, so a crash
+    mid-rework leaves the MR exactly where it was and the same author simply
+    retries next cycle.
+    """
+    for mr in ctx.memory.reviews_by_author(ctx.agent_id, status="changes_requested"):
+        task = ctx.memory.get_task(mr["task_id"]) if mr.get("task_id") else None
+        if task is None or task["status"] not in ("in_review",):
+            continue
+        return mr, task
+    return None
+
+
 def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder/Writer: claim a task (P1), ranked by Performance–Novelty.
 
     Replaces "oldest first": each task is scored with this agent's own merge
     history (see agentics/evolution/scoring.py); ties fall back to oldest-first.
     Only the Coder may take self-evolution tasks.
+
+    A changes_requested MR authored by this agent comes first: the review
+    feedback must be reworked (same branch, same MR) before new claims.
     """
+    if ctx.role in (Role.CODER, Role.WRITER):
+        rework = _pick_rework(ctx)
+        if rework is not None:
+            mr, task = rework
+            feedback = (mr.get("verdict_comment") or "").strip()
+            state["rework_mr"] = mr["id"]
+            state["issue_number"] = task["id"]
+            state["issue_title"] = task["title"]
+            state["issue_body"] = (
+                (task["body"] or "")[:4000]
+                + f"\n\n## Review feedback on MR #{mr['id']} to address\n{feedback[:2000]}"
+            )
+            state["branch"] = mr["branch"]
+            state["category"] = task.get("category") or "other"
+            state["task_exempt"] = bool(task.get("exempt"))
+            state["action"] = "research"
+            ctx.memory.add_decision(
+                ctx.agent_id, f"rework MR #{mr['id']} (task #{task['id']})",
+                f"feedback: {feedback[:200]}")
+            ctx.memory.journal(ctx.agent_id, "rework_start", {
+                "mr": mr["id"], "task": task["id"], "feedback": feedback[:300],
+            })
+            ctx.report(
+                node="claim", task_id=task["id"], task_title=task["title"],
+                intent={
+                    "goal": f"Rework MR #{mr['id']} on task #{task['id']}",
+                    "why": f"review feedback: {feedback[:160]}",
+                    "steps": [], "expected_files": [],
+                },
+            )
+            return state
     tasks = ctx.memory.scan_open_tasks(limit=30)
     infos = [
         IssueInfo(
@@ -231,7 +285,15 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
 
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Researcher: search papers, dedup vs vector memory, store findings."""
+    """Researcher: search papers, dedup vs vector memory, store findings.
+
+    A rework cycle skips research entirely: the topic is already covered (the
+    dedup guard would otherwise abort the cycle) and the review feedback, not
+    new literature, drives the fix.
+    """
+    if state.get("rework_mr"):
+        state["action"] = "plan"
+        return state
     topic = state.get("issue_title") or ctx.settings.research_topic
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
@@ -295,6 +357,12 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + ", ".join(EVOLUTION_ALLOWED_PATHS) + ".\n"
         if category == "evolution" else ""
     )
+    rework_rule = (
+        f"\nThis is a REWORK of MR #{state.get('rework_mr')}: the branch already "
+        "carries the reviewed implementation — plan ONLY the changes that answer "
+        "the review feedback below; do not rewrite unrelated files.\n"
+        if state.get("rework_mr") else ""
+    )
     prompt = (
         f"Issue #{state.get('issue_number')}: {state.get('issue_title')}\n"
         f"{state.get('issue_body')}\n\nResearch summary:\n"
@@ -304,7 +372,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{evolution_rule}\n"
+        f"{tools_txt}\n{evolution_rule}{rework_rule}\n"
         "Propose a concrete implementation plan for this repo. Reply ONLY with "
         'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
         '"steps": ["..."], "commit_message": "...", '
@@ -390,7 +458,11 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     """Coder: write code from plan into a local branch, run tests, push (P2/P3/P10)."""
     branch = state["branch"]
     await asyncio.to_thread(ctx.workspace.sync_main)
-    await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
+    if state.get("rework_mr"):
+        # resume the pushed branch — the reviewed work must survive the rework
+        await asyncio.to_thread(ctx.workspace.checkout_branch_from_origin, branch)
+    else:
+        await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
     plan = json.loads(state.get("plan") or "{}")
     for spec in plan.get("files", []):
@@ -527,7 +599,41 @@ def _register_tools(ctx: AgentContext, state: ResearchState, pr_number: int) -> 
 
 
 def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Open a local MR (merge request) — the reviews table replaces GitHub PRs."""
+    """Open a local MR (merge request) — the reviews table replaces GitHub PRs.
+
+    Rework cycles do not open a second MR: the fixes are pushed to the same
+    branch and the changes_requested MR goes back to 'open' for re-review.
+    """
+    rework_id = state.get("rework_mr")
+    if rework_id:
+        review = ctx.memory.get_review(rework_id)
+        if (review and review["author"] == ctx.agent_id
+                and review["status"] == "changes_requested"):
+            files = sorted(
+                set(review.get("files") or []) | set(state.get("changed_files") or []))
+            ctx.memory.reopen_review(
+                rework_id, files=files, verification=state.get("verification", ""))
+            state["pr_number"] = rework_id
+            state["pr_url"] = f"local://mr/{rework_id}"
+            _register_tools(ctx, state, rework_id)
+            ctx.memory.post_message(
+                ctx.agent_id, "handoff",
+                f"MR #{rework_id} reworked on branch {state['branch']} — "
+                "ready for re-review",
+                state.get("issue_number"),
+            )
+            ctx.memory.journal(ctx.agent_id, "rework_mr", {
+                "mr": rework_id, "task": state.get("issue_number"),
+                "files": state.get("changed_files", [])[:20],
+            })
+            ctx.report(node="open_mr", status="handoff",
+                       task_id=state.get("issue_number"),
+                       intent={"goal": f"MR #{rework_id} reworked, awaiting re-review",
+                              "steps": []})
+            state["done"] = True
+            state["summary"] = f"reworked MR #{rework_id}"
+            return state
+        # MR vanished / already handled — fall through and open a fresh MR.
     mr_id = ctx.memory.open_review(
         task_id=state.get("issue_number"),
         title=f"[{ctx.agent_id}] {state.get('issue_title', 'work')} (#{state['issue_number']})",
@@ -704,8 +810,9 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
     lesson = "; ".join(lesson_bits) or "cycle completed"
     # Any claimed task that did not reach MR creation must be unlocked, including
     # early exits (no LLM, duplicate research, invalid plan, failed tests).
+    # A rework cycle holds no claim and must leave its parked in_review task alone.
     issue_number = state.get("issue_number")
-    if issue_number and not state.get("pr_number"):
+    if issue_number and not state.get("pr_number") and not state.get("rework_mr"):
         try:
             ctx.claims.release(issue_number, ctx.agent_id, "cycle ended without an MR")
         except Exception as exc:  # noqa: BLE001

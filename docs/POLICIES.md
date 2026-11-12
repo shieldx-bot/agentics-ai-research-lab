@@ -51,6 +51,10 @@ cùng một repo mà không giẫm chân nhau.
 - PR phải được **1 agent khác** (khác tác giả) review `APPROVE` mới vào hàng đợi merge.
 - Reviewer kiểm tra: đúng issue, ownership matrix, chất lượng, citation chuẩn
   (với phần nghiên cứu), không chèn secret.
+- MR bị `request_changes` không bị bỏ rơi: ở chu kỳ kế tiếp chính **tác giả**
+  rework ngay MR đó — tiếp tục từ head đã push của nhánh (không reset về main,
+  không mở MR thứ hai cho cùng task), push phần sửa rồi mở lại MR `open` cho
+  reviewer duyệt lại. Task giữ trạng thái `in_review` trong lúc rework.
 
 ## P6 — Heartbeat & ốm chết
 - Mỗi agent ghi heartbeat vào shared memory đầu mỗi chu kỳ.
@@ -75,10 +79,6 @@ cùng một repo mà không giẫm chân nhau.
 - Trước khi lập plan, agent đọc trace của agent khác và registry tool; tool mới chỉ vào
   registry khi PR được **merge**.
 
-## P10 — Kiểm tra hai tầng
-- Tầng 1 (tác giả, trước push): `py_compile` + `pytest -x`. Tầng 2 (Integrator, trước merge):
-  test đầy đủ trên `main + PR`; fail → không merge, ghi failure trace + comment vào PR.
-
 ## P11 — Self-evolution có rào chắn
 - PR `evolution` chỉ được sửa allowlist. Chi tiết và giới hạn: [EVOLUTION.md](EVOLUTION.md).
 
@@ -93,6 +93,10 @@ cùng một repo mà không giẫm chân nhau.
 - Claim issue: **label là khoá chính tắc**. Comment claim fail (network) không được rollback
   claim — rollback thất bại sẽ để lại label mồ côi khoá issue vĩnh viễn (đã gặp ở issue #19).
   Nhánh release/sweep của agent sở hữu sẽ dọn label sau.
+
+## P13 — Kiểm tra hai tầng
+- Tầng 1 (tác giả, trước push): `py_compile` + `pytest -x`. Tầng 2 (Integrator, trước merge):
+  test đầy đủ trên `main + PR`; fail → không merge, ghi failure trace + comment vào PR.
 
 ---
 

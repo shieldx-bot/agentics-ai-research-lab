@@ -184,6 +184,91 @@ def allow_protected(
     memory.close()
 
 
+@app.command("events")
+def events(
+    tail: int = typer.Option(40, "--tail", "-n", help="how many events to show"),
+    agent: str = typer.Option("", "--agent", "-a", help="only one agent's events"),
+) -> None:
+    """Owner: read the activity journal (what/why each agent did) in a terminal.
+
+    The same feed the dashboard shows — useful over SSH when no browser is at
+    hand. Oldest first, so it reads like a story; add --follow-like polling by
+    re-running with a bigger --tail.
+    """
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    rows = memory.recent_journal(limit=max(1, tail), agent=agent or None)
+    if not rows:
+        console.print("[dim]journal trống — chưa có agent nào chạy.[/]")
+        memory.close()
+        return
+    table = Table(title=f"Journal ({len(rows)} sự kiện, mới nhất cuối)")
+    for col in ("time", "agent", "event", "detail"):
+        table.add_column(col, overflow="fold")
+    import time as _t
+    for r in rows:
+        table.add_row(
+            _t.strftime("%H:%M:%S", _t.localtime(r["ts"])),
+            r["agent"], r["event"], r["detail"],
+        )
+    console.print(table)
+    memory.close()
+
+
+@app.command("explain")
+def explain(
+    agent_id: str = typer.Argument(..., help="agent id, e.g. a03"),
+) -> None:
+    """Owner: WHY-trace one agent — current intent, claims, MRs, last actions.
+
+    Answers "a03 đang làm gì, vì sao?" without opening the dashboard: live
+    intent from the heartbeat, held claims, MRs authored, and the agent's
+    latest journal entries in order.
+    """
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    live = {a["agent"]: a for a in memory.active_agents(stale_after_s=86400)}
+    a = live.get(agent_id)
+    if a:
+        intent = a.get("intent") or {}
+        console.print(f"[bold]{agent_id}[/] role={a['role']} node={a['node'] or '-'} "
+                      f"status={a['status']} cycle={a['cycle']}")
+        if a.get("task_id"):
+            console.print(f"  task #{a['task_id']}: {a['task_title']}")
+        console.print(f"  [bold]mục đích:[/] {intent.get('goal', '(chưa công bố)')}")
+        if intent.get("why"):
+            console.print(f"  [bold]vì sao:[/] {intent['why']}")
+        for s in (intent.get("steps") or [])[:8]:
+            console.print(f"    - {s}")
+    else:
+        console.print(f"[dim]{agent_id} không có heartbeat gần đây.[/]")
+    claims = [c for tid, c in memory.active_claims().items() if c.agent == agent_id]
+    for c in claims:
+        task = memory.get_task(c.issue)
+        title = task["title"][:60] if task else "?"
+        console.print(f"  claim: task #{c.issue} ({title}) — branch {c.branch}")
+    mrs = memory.reviews_by_author(agent_id)
+    for mr in mrs[-8:]:
+        console.print(f"  MR #{mr['id']} [{mr['status']}] task #{mr['task_id']} "
+                      f"— {(mr.get('verdict_comment') or '')[:80]}")
+    journal = memory.recent_journal(limit=15, agent=agent_id)
+    if journal:
+        console.print("[bold]hành động gần nhất (cũ nhất trước):[/]")
+        import time as _t
+        for r in reversed(journal):
+            console.print(f"  {_t.strftime('%H:%M:%S', _t.localtime(r['ts']))} "
+                          f"[cyan]{r['event']}[/] {r['detail']}")
+    memory.close()
+
+
 @app.command()
 def verify(
     refresh: bool = typer.Option(False, "--refresh",

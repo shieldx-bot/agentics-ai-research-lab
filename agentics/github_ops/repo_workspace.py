@@ -69,6 +69,7 @@ class RepoWorkspace:
             env = {**env, **extra_env}
         proc = subprocess.run(
             ["git", *args], cwd=self.path, capture_output=True, text=True, env=env,
+            check=False,
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
@@ -95,6 +96,24 @@ class RepoWorkspace:
 
     def checkout_new_branch(self, branch: str) -> None:
         self._git("checkout", "-B", branch)
+
+    def checkout_branch_from_origin(self, branch: str) -> None:
+        """Rework: resume a previously pushed branch instead of resetting to main.
+
+        The branch restarts from its origin head, so the already-reviewed work
+        is kept and the author only adds the fixes the review asked for. A
+        branch that was never pushed (or was deleted) falls back to a fresh one.
+        """
+        self.ensure_cloned()
+        fetch = self._git("fetch", "origin", branch, check=False)
+        verified = (
+            self._git("rev-parse", "--verify", f"origin/{branch}", check=False)
+            if fetch.returncode == 0 else None
+        )
+        if verified is not None and verified.returncode == 0:
+            self._git("checkout", "-B", branch, f"origin/{branch}")
+        else:
+            self._git("checkout", "-B", branch)
 
     # ------------------------------------------------------------ content
     def _resolve_workspace_path(self, rel_path: str) -> Path:

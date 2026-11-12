@@ -619,6 +619,49 @@ class SharedMemory:
         with self._lock, self._conn:
             self._conn.execute(sql, args)
 
+    def reviews_by_author(self, author: str, status: str | None = None) -> list[dict]:
+        """MRs written by one agent, oldest first (the rework queue)."""
+        sql, args = "SELECT id FROM reviews WHERE author=?", [author]
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [self._review_row(r[0]) for r in rows]
+
+    def reviews_by_task(self, task_id: int) -> list[dict]:
+        """Every MR raised against a task, oldest first (orphan detection)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM reviews WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
+        return [self._review_row(r[0]) for r in rows]
+
+    def reopen_review(self, mr_id: int, files: list[str], verification: str = "") -> bool:
+        """Rework: an author pushes fixes and puts their MR back into review.
+
+        Only a changes_requested MR authored by ``agent`` is reopened; reviewer
+        fields are cleared so the (possibly different) reviewer starts fresh.
+        The task goes back to in_review if it was parked elsewhere.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT author, status, task_id FROM reviews WHERE id=?", (mr_id,)
+            ).fetchone()
+            if row is None or row[1] != "changes_requested":
+                return False
+            author, _, task_id = row
+            self._conn.execute(
+                "UPDATE reviews SET status='open', files=?, verification=?, "
+                "reviewer='', verdict_comment='', approved_by='' WHERE id=?",
+                (json.dumps(files), verification[:500], mr_id),
+            )
+        if task_id is not None:
+            self.set_task_status(task_id, "in_review")
+        self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
+        return True
+
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(
         self, agent: str, role: str, cycle: int, outcome: str,
