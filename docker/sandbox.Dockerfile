@@ -12,7 +12,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/agentics
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY agentics ./agentics
 RUN python -m pip install --no-cache-dir . "pytest>=8.0"
 
