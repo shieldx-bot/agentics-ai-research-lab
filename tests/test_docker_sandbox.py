@@ -88,3 +88,19 @@ def test_workspace_fails_closed_when_sandbox_is_unavailable(tmp_path, monkeypatc
     code, output = workspace.run_command([sys.executable, "probe.py"])
     assert code == 126
     assert "execution refused" in output
+
+
+
+def test_sandbox_image_cannot_inject_docker_flags(tmp_path):
+    settings = _settings(tmp_path)
+    settings.sandbox_image = "--privileged"
+    runner = DockerSandboxRunner(settings)
+    with pytest.raises(SandboxError, match="valid image reference"):
+        runner.build_command(
+            "docker", tmp_path / "workspace", [sys.executable, "probe.py"], tmp_path / "x.cid"
+        )
+
+
+def test_sandbox_is_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+    assert Settings().sandbox_enabled is True
