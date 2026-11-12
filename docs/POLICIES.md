@@ -19,9 +19,10 @@ cùng một repo mà không giẫm chân nhau.
 - Commit message format: `agent(<agent-id>): <mô tả> (#<issue>)` — truy vết được ai làm gì.
 - Mỗi agent có một clone/workspace riêng dưới `data/workspaces/<agent-id>`; không dùng chung working tree.
 - Đường dẫn đọc/ghi phải nằm trong workspace của agent; đường dẫn tuyệt đối, traversal và symlink thoát workspace bị từ chối.
-- Lệnh kiểm thử chỉ chạy bằng Python interpreter của môi trường, với `pytest`, `py_compile` hoặc script `.py` nằm trong workspace. Lệnh inline `python -c` và executable tùy ý bị từ chối.
-- Process kiểm thử nhận môi trường tối thiểu, không kế thừa GitHub token, Perplexity cookie hay API key; có timeout và dọn process group khi hết hạn.
-- **Giới hạn bảo mật:** runner này là host-process guardrail, không phải OS/container sandbox. Không chạy mã không tin cậy trên host; triển khai production phải dùng rootless container/VM sandbox với resource/network policy riêng.
+- Lệnh kiểm thử chỉ chạy bằng Python interpreter đã allowlist (`pytest`, `py_compile` hoặc script `.py` nằm trong workspace); inline `python -c` và executable tùy ý bị từ chối.
+- Mặc định mọi lệnh chạy trong rootless Docker: network `none`, root filesystem read-only, chỉ mount workspace riêng, drop toàn bộ Linux capabilities, `no-new-privileges`, giới hạn CPU/RAM/swap/PID/tmpfs/file size và timeout.
+- Container không nhận host environment, GitHub token, Perplexity cookie, LLM API key, host home hay Docker socket. GitHub/API và nghiên cứu mạng phải chạy trong orchestrator đáng tin cậy bên ngoài sandbox.
+- Thiếu Docker, daemon không rootless hoặc image chưa được build → fail closed; tuyệt đối không tự chạy lại trên host. `SANDBOX_ENABLED=false` chỉ dành cho phát triển local với mã tin cậy.
 
 ## P3 — Ownership matrix (vùng file)
 | Role | Vùng sở hữu |
