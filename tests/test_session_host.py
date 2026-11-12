@@ -180,6 +180,26 @@ def test_ask_marks_failure_on_cooldown(tmp_path, monkeypatch):
     assert h.failures == 1 and h.in_cooldown()
 
 
+def test_transient_non_auth_failure_does_not_cool_account(tmp_path, monkeypatch):
+    # A websocket read timeout / dropped socket from the local backend is NOT
+    # a dead cookie: the account must stay healthy so the next cycle (or the
+    # client's own retry) can recover it — mirrors the Hyperbrowser
+    # provider-outage policy for backends that raise plain RuntimeErrors.
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
+
+    async def flaky(self, query, **kwargs):
+        raise RuntimeError("websocket read timed out (op=60s)")
+
+    monkeypatch.setattr(QwenClient, "ask", flaky)
+    with pytest.raises(RuntimeError):
+        asyncio.run(host.view(prefer_index=0).ask("code", purpose="implement"))
+    h = host.pools["qwen"].health["qwen-01"]
+    assert not h.in_cooldown()
+    # the very next lease still gets the same (healthy) account
+    _prov, client = host.view(prefer_index=0)._lease("implement")
+    assert client.account.name == "qwen-01"
+
+
 def test_ask_marks_ok_after_success(tmp_path, monkeypatch):
     host = BrowserSessionHost.from_settings(_settings(tmp_path))
 
