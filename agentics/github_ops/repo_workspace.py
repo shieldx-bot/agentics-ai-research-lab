@@ -1,7 +1,9 @@
 """Local git workspace per agent — clone once, sync per cycle, push to own branch."""
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,15 +21,29 @@ class RepoWorkspace:
         self.agent_id = agent_id
         self.settings = settings
         self.path = settings.workspaces_dir / agent_id
-        self._remote = (
-            f"https://x-access-token:{settings.github_token}@github.com/"
-            f"{settings.github_repo}.git"
-        )
+        # Keep credentials out of the remote URL and .git/config. Authentication
+        # is injected only into the child process environment for each Git call.
+        self._remote = f"https://github.com/{settings.github_repo}.git"
+
+    def _git_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        token = self.settings.github_token
+        if token:
+            auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            try:
+                count = int(env.get("GIT_CONFIG_COUNT", "0"))
+            except ValueError:
+                count = 0
+            env[f"GIT_CONFIG_KEY_{count}"] = "http.https://github.com/.extraheader"
+            env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {auth}"
+            env["GIT_CONFIG_COUNT"] = str(count + 1)
+        return env
 
     # ------------------------------------------------------------ plumbing
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         proc = subprocess.run(
-            ["git", *args], cwd=self.path, capture_output=True, text=True
+            ["git", *args], cwd=self.path, capture_output=True, text=True,
+            env=self._git_env(),
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
@@ -40,7 +56,7 @@ class RepoWorkspace:
         log.info("[%s] cloning repo…", self.agent_id)
         subprocess.run(
             ["git", "clone", "--filter=blob:none", self._remote, str(self.path)],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, env=self._git_env(),
         )
         self._git("config", "user.name", f"agentics[{self.agent_id}]")
         self._git("config", "user.email", f"agentics+{self.agent_id}@users.noreply.github.com")
@@ -66,11 +82,28 @@ class RepoWorkspace:
             return None
         return target.read_text(encoding="utf-8", errors="replace")
 
+    def _command_allowed(self, cmd: list[str]) -> bool:
+        """Allow only the exact Python validation commands used by this project."""
+        if not cmd or Path(cmd[0]).resolve() != Path(sys.executable).resolve():
+            return False
+        if cmd[1:3] == ["-m", "py_compile"] and len(cmd) > 3:
+            root = self.path.resolve()
+            for raw_path in cmd[3:]:
+                candidate = Path(raw_path)
+                candidate = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+                if not candidate.is_relative_to(root) or candidate.suffix != ".py":
+                    return False
+            return True
+        return cmd[1:3] == ["-m", "pytest"] and set(cmd[3:]).issubset({"-q", "-x"})
+
     def run_command(self, cmd: list[str], timeout: int = 120) -> tuple[int, str]:
-        """Run a whitelisted command inside the workspace (e.g. tests)."""
+        """Run only approved Python validation commands (not an OS sandbox)."""
+        if not self._command_allowed(cmd):
+            return 126, "command rejected by workspace allowlist"
         try:
             proc = subprocess.run(
-                cmd, cwd=self.path, capture_output=True, text=True, timeout=timeout
+                cmd, cwd=self.path, capture_output=True, text=True,
+                timeout=max(1, min(int(timeout), 300)),
             )
             return proc.returncode, (proc.stdout + proc.stderr)[-4000:]
         except subprocess.TimeoutExpired:
