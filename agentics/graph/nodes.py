@@ -22,6 +22,7 @@ from agentics.evolution.traces import (
 )
 from agentics.local_ops import branch_name
 from agentics.policies.intent import scope_violations
+from agentics.verify_ops import run_experiments, summarize
 from agentics.memory import lifemem
 from agentics.memory.vector_store import VectorStore
 from agentics.research import citations as cite_fmt
@@ -378,9 +379,13 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         '"steps": ["..."], "commit_message": "...", '
         '"reuses": ["<registered tool name you rely on>"], '
         '"reusable_tools": [{"name": "snake_case_name", "path": "<file you create>", '
-        '"description": "what it does, in one line"}]} '
+        '"description": "what it does, in one line"}], '
+        '"verify_cmds": ["<python -m pytest ... or python <workspace .py script> '
+        'that CHECKS the idea; exit 0 must mean the hypothesis holds>"]} '
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
-        "'reusable_tools' if it is a genuinely reusable utility.)"
+        "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
+        "is how your idea gets VERIFIED by running real code instead of an LLM's "
+        "opinion — declare at least one check for a code task.)"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan")
     parsed = parse_json_block(answer)
@@ -390,6 +395,8 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
     state["plan"] = json.dumps(parsed, ensure_ascii=False)[:8000]
     state["commit_message"] = parsed.get("commit_message", "update")
+    verify_cmds = [str(c) for c in (parsed.get("verify_cmds") or [])][:5]
+    state["verify_cmds"] = verify_cmds
     reuses = [n for n in parsed.get("reuses", []) if isinstance(n, str)][:10]
     state["reuses"] = reuses
     for name in reuses:
@@ -403,6 +410,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
             "goal": f"Implement task #{state.get('issue_number')}: {state.get('issue_title', '')}",
             "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
             "expected_files": expected_files,
+            "verify_cmds": verify_cmds,
             "why": f"category={state.get('category', 'other')}",
         },
     )
@@ -560,6 +568,40 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         state["done"] = True
         return state
 
+    # P16 — empirical evidence: run the plan's declared verification commands
+    # and record their REAL outcomes as shared evidence (owner hypotheses 1-3).
+    # The verdict comes from exit codes, never from an LLM's self-assessment.
+    # `refuted` blocks the push (the hypothesis did not hold under test);
+    # `inconclusive` (blocked/timeout) journals a warning and proceeds — the
+    # reviewer sees the evidence and decides, the pipeline never livelocks.
+    verify_cmds = state.get("verify_cmds") or []
+    if verify_cmds:
+        evs = await asyncio.to_thread(
+            run_experiments, ctx.workspace, verify_cmds, timeout=300)
+        task_id = state.get("issue_number")
+        for ev in evs:
+            await asyncio.to_thread(
+                ctx.memory.record_evidence, ctx.agent_id, task_id,
+                ev.cmd, ev.exit_code, ev.verdict,
+                hypothesis=state.get("issue_title", ""),
+                method=ev.method, output=ev.output,
+                duration_s=ev.duration_s)
+        digest = summarize(evs)
+        state["verification"] = f"{verification} | {digest}"[:500]
+        refuted = [e for e in evs if e.verdict == "refuted"]
+        if refuted:
+            return await _yield(
+                ctx, state,
+                f"P16 hypothesis refuted by experiment: {digest} "
+                f"(exit codes {[e.exit_code for e in refuted][:5]}) "
+                "— fix the code or re-plan",
+            )
+        inconclusive = [e for e in evs if e.verdict == "inconclusive"]
+        if inconclusive:
+            ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
+                "task": task_id,
+                "cmds": [e.cmd[:120] for e in inconclusive][:5]})
+
     try:
         pushed = await asyncio.to_thread(
             ctx.workspace.commit_and_push,
@@ -700,10 +742,22 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     )
 
     files_desc = "\n".join(f"- {f}" for f in candidate.get("files", [])[:30])
+    # P16: show the reviewer the REAL runs recorded for this task (shared
+    # evidence), so the verdict weighs measurements, not just author claims.
+    ev_rows = ctx.memory.evidence_for_task(candidate.get("task_id"))
+    ev_desc = ""
+    if ev_rows:
+        ev_lines = [
+            f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
+            f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
+            for e in ev_rows[-6:]
+        ]
+        ev_desc = "\n\nEmpirical evidence recorded for this task (P16):\n" + "\n".join(ev_lines)
     prompt = (
         f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
         f"Files:\n{files_desc}\n\n"
-        f"Verification recorded by the author: {candidate.get('verification') or '(none)'}\n\n"
+        f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
+        f"{ev_desc}\n\n"
         'Reply ONLY JSON: {"verdict": "approve|request_changes", '
         '"comment": "..."}'
     )
@@ -711,6 +765,11 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     parsed = parse_json_block(answer)
     verdict = parsed.get("verdict", "request_changes")
     comment = parsed.get("comment", "auto review")
+    if ev_rows:
+        counts: dict[str, int] = {}
+        for e in ev_rows:
+            counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
+        comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
 
     # P10 layer 3: protected paths never reach main via any MR.
     guard = getattr(getattr(ctx, "local", None), "guard", None)
