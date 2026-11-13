@@ -36,7 +36,10 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def branch_name(agent_id: str, task_id: int, title: str) -> str:
     slug = _SLUG_RE.sub("-", title.lower()).strip("-")[:40]
-    return f"agent/{agent_id}/task-{task_id}-{slug}"
+    # Non-Latin titles (e.g. a Vietnamese research topic) collapse to no ASCII
+    # slug at all — keep the branch name meaningful instead of a bare
+    # trailing hyphen.
+    return f"agent/{agent_id}/task-{task_id}-{slug or 'task'}"
 
 
 
@@ -341,8 +344,12 @@ class TaskSource:
         Runs every Supervisor scan, after sweep_stale released expired leases.
         """
         repaired: list[int] = []
+        # one read of the lease table for the whole pass — all_active_claims()
+        # scans the claims table, so calling it inside the loop made the
+        # repair cost O(claimed_tasks) full scans on every Supervisor cycle
+        active = self.memory.all_active_claims()
         for task in self.memory.list_tasks(limit=200, status="claimed"):
-            if task["id"] not in self.memory.all_active_claims():
+            if task["id"] not in active:
                 self.memory.set_task_status(task["id"], "open", claimed_by="")
                 self.memory.journal("supervisor", "task_repair", {
                     "task": task["id"], "why": "claimed without an active lease",
@@ -509,7 +516,9 @@ class LocalMergeQueue:
                         scanned = scan_branch(review["branch"])
                         if scanned is not None:
                             diff_files = scanned
-                    except RuntimeError as exc:
+                    except Exception as exc:  # noqa: BLE001 — layer 4 is DETECT-only:
+                        # a broken re-scan must degrade to the recorded file
+                        # list, never abort the whole drain for every MR
                         log.warning("layer-4 re-scan of branch %s failed: %s",
                                     review["branch"], exc)
                 violations = self.guard.check_task(

@@ -332,3 +332,55 @@ def test_merge_queue_with_auto_merge_off_only_marks_ready(mem):
     assert queue.drain("a09", verify=lambda mr: (True, "")) == 0
     assert mem.get_review(mr)["status"] == "approved"   # waiting for the owner
     assert mem.get_task(tid)["status"] == "in_review"
+
+
+# ------------------------------------------------- expert polish (existing features)
+def test_branch_name_falls_back_when_the_title_slugs_to_nothing():
+    """A title with no ASCII alnum at all (CJK, emoji, punctuation-only)
+    slugs to nothing — the branch must stay meaningful instead of ending in
+    a bare trailing hyphen."""
+    name = branch_name("a04", 12, "中文研究标题 🔧")
+    assert name.endswith("task-12-task")
+    assert branch_name("a04", 13, "Fix: the Crash (again)!").endswith(
+        "task-13-fix-the-crash-again")                # latin titles unchanged
+
+
+def test_repair_orphan_tasks_reads_the_lease_table_once(settings, mem, monkeypatch):
+    """Perf: all_active_claims() is a full scan of the claims table — it was
+    re-read INSIDE the repair loop, making every Supervisor cycle pay
+    O(claimed tasks) scans. One read per repair pass, same behavior."""
+    calls = {"n": 0}
+    orig = mem.all_active_claims
+
+    def counting():
+        calls["n"] += 1
+        return orig()
+
+    monkeypatch.setattr(mem, "all_active_claims", counting)
+    for i in range(5):
+        tid = mem.create_task(f"stuck task {i}", body="b", category="code",
+                              agent="owner")
+        mem.set_task_status(tid, "claimed", claimed_by="a09")
+    repaired = TaskSource(mem, settings).repair_orphan_tasks()
+    assert len(repaired) == 5                     # behavior unchanged: all 5 reopened
+    assert calls["n"] == 1                        # ...with exactly ONE lease scan
+    assert len([t for t in mem.list_tasks(limit=50) if t["status"] == "open"]) == 5
+
+
+def test_drain_survives_a_broken_layer4_rescan(mem):
+    """Robustness: a layer-4 re-scan that raises must degrade to the
+    author-recorded file list — one broken scan must not abort the drain
+    and strand every other MR in the queue."""
+    tid = mem.create_task("resilient work")
+    mr = mem.open_review(tid, "MR", "body", author="a04",
+                         branch="agent/a04/task-1-x", files=["experiments/a.py"])
+    mem.mq_enqueue(mr, author="a04")
+    queue = LocalMergeQueue(mem, auto_merge=True, guard=ProtectedPathsGuard())
+
+    def broken_scan(branch):
+        raise ValueError(f"simulated re-scan crash on {branch}")
+
+    drained = queue.drain("a09", verify=lambda m: (True, ""),
+                          merge=lambda m: True, scan_branch=broken_scan)
+    assert drained == 1                            # fell back, merged anyway
+    assert mem.get_review(mr)["status"] == "merged"

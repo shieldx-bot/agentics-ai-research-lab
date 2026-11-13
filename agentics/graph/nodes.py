@@ -12,11 +12,12 @@ import json
 import logging
 import shlex
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from agentics.agents.base import AgentContext
-from agentics.agents.roles import Role, build_system_prompt, parse_json_block
+from agentics.agents.roles import Role, parse_json_block
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS,
@@ -28,10 +29,17 @@ from agentics.evolution.traces import (
 )
 from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
+from agentics.planning import (
+    PLAN_INSTRUCTION,
+    bump_prompt_feedback,
+    normalize_plan,
+    resolve_system_prompt,
+)
 from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
+from agentics.research import free_tools
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
 from agentics.verify_ops import (
@@ -155,18 +163,40 @@ async def _llm_ask(
     exhausted pool) must NOT kill the LangGraph task — it is recorded in
     ``state["error"]`` so the cycle degrades to `reflect` (claim released,
     trace + personal lesson written) and the swarm retries next cycle.
+
+    P18 — budget gate: every ask passes the shared BudgetPolicy (pool-wide
+    hourly cap + per-agent circuit breaker) and is recorded in `llm_usage`
+    either way, so a runaway agent is a bounded event, not an infinite burn.
     """
     if ctx.llm is None:
         if state is not None:
             state["error"] = "no LLM account available"
         return "", []
+    budget = getattr(ctx, "budget", None)
+    started = time.monotonic()
+    if budget is not None:
+        allowed, why = budget.can_ask(ctx.agent_id)
+        if not allowed:
+            log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
+            if state is not None and not state.get("error"):
+                state["error"] = f"P18 budget: {why}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "budget_blocked",
+                                   {"purpose": purpose, "why": why[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return "", []
     try:
+        system = await resolve_system_prompt(ctx, state)
         resp = await ctx.llm.ask(
-            prompt, mode=mode, purpose=purpose, system=build_system_prompt(
-                ctx.agent_id, ctx.role, ctx.settings.research_topic)
+            prompt, mode=mode, purpose=purpose, system=system
         )
+        if budget is not None:
+            budget.record(ctx.agent_id, purpose, True, time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
+        if budget is not None:
+            budget.record(ctx.agent_id, purpose, False, time.monotonic() - started)
         if state is not None and not state.get("error"):
             state["error"] = f"llm {purpose} call failed: {exc}"
         return "", []
@@ -395,6 +425,85 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
+# ---------------------------------------------------------------- research helpers
+async def _grounded_bibtex(ctx: AgentContext, urls: list[str]) -> str:
+    """BibTeX from REAL publisher metadata (arXiv/Crossref) with a safe
+    fallback to the legacy <title> scrape for unknown URLs — grounded
+    citations beat scraped ones, but a broken source must never break the
+    cycle (docs/FREE_TOOLS.md)."""
+    try:
+        return await free_tools.enriched_bibtex(list(urls), settings=ctx.settings)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[%s] bibtex grounding fell back to legacy: %s", ctx.agent_id, exc)
+        return cite_fmt.to_bibtex(cite_fmt.parse_citations(list(urls)))
+
+
+async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
+                           answer: str, citations: list[str], source: str) -> ResearchState:
+    """Shared tail of node_research: persist the finding and route the cycle.
+
+    One code path for both evidence sources (LLM cookies and the free
+    keyless APIs) so shared memory / vector store rows keep the exact same
+    shape regardless of where the metadata came from."""
+    state["papers"] = [{"title": topic, "answer": answer}]
+    state["citations"] = list(citations)
+    title = f"Findings: {topic}"
+    content = f"{answer[:6000]}\n\n## BibTeX\n\n{state['bibtex'][:3000]}"
+    fid = await asyncio.to_thread(
+        ctx.memory.add_finding,
+        ctx.agent_id, title, content, list(citations), state.get("issue_number"),
+    )
+    await asyncio.to_thread(
+        ctx.vector.add, content,
+        {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
+    )
+    await asyncio.to_thread(
+        ctx.memory.post_message,
+        ctx.agent_id, "broadcast",
+        f"New finding #{fid} on '{topic}' with {len(citations)} citations (source: {source}).",
+        state.get("issue_number"),
+    )
+    if ctx.role == Role.RESEARCHER:
+        # P16bis (H2): the finding's claims must be VERIFIED by running code,
+        # not trusted because an LLM wrote them — the cycle continues into
+        # node_verify, which pre-registers hypotheses and adjudicates.
+        state["finding_id"] = fid
+        state["finding_text"] = content[:4000]
+        state["action"] = "verify"
+    else:
+        state["action"] = "plan"
+    return state
+
+
+async def _free_tools_fallback(ctx: AgentContext, state: ResearchState,
+                               topic: str, reason: str) -> ResearchState:
+    """LLM unavailable -> real-metadata research via the free keyless APIs.
+
+    arXiv/OpenAlex/Crossref ground the finding in verifiable metadata so a
+    dead cookie pool no longer wastes the whole cycle (docs/FREE_TOOLS.md).
+    When the free tools are disabled (or every source comes up empty) the
+    original degrade-to-error behaviour is preserved exactly."""
+    if not getattr(ctx.settings, "free_tools_enabled", True):
+        state["error"] = reason or "research unavailable"
+        state["done"] = True
+        return state
+    try:
+        fb = await free_tools.fallback_research(topic, settings=ctx.settings)
+    except Exception as exc:  # noqa: BLE001 — a source outage must not crash the cycle
+        log.warning("[%s] free-tools fallback failed: %s", ctx.agent_id, exc)
+        fb = None
+    if fb is None or not fb.ok:
+        state["error"] = reason or "research unavailable (free-tools fallback empty)"
+        state["done"] = True
+        return state
+    log.info("[%s] research continued via free tools (%s)", ctx.agent_id, reason)
+    acc = getattr(ctx.llm, "account", None)
+    ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
+    ctx.meta["research_source"] = "free-tools"
+    state["bibtex"] = fb.bibtex
+    return await _finish_research(ctx, state, topic, fb.answer, fb.citations, "free-tools")
+
+
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings.
 
@@ -422,48 +531,47 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         return state
 
     if ctx.llm is None:
-        state["error"] = "no LLM account available"
-        state["done"] = True
-        return state
+        return await _free_tools_fallback(ctx, state, topic,
+                                          reason="no LLM account available")
+    # P19 — research calls bypass _llm_ask (provider routing differs), so the
+    # budget gate and the usage ledger are applied here as well. A BLOCKED ask
+    # still falls back to the free tools: the owner keeps getting research
+    # without burning a single budgeted call.
+    budget = getattr(ctx, "budget", None)
+    if budget is not None:
+        allowed, why = budget.can_ask(ctx.agent_id)
+        if not allowed:
+            log.warning("[%s] research blocked by budget: %s", ctx.agent_id, why)
+            try:
+                ctx.memory.journal(ctx.agent_id, "budget_blocked",
+                                   {"purpose": "research", "why": why[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return await _free_tools_fallback(ctx, state, topic,
+                                              reason=f"P19 budget: {why}")
+    import time as _time
+    _t0 = _time.monotonic()
+    resp = None
+    llm_error = ""
     try:
         resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
         log.warning("[%s] research llm call failed: %s", ctx.agent_id, exc)
-        state["error"] = f"research llm call failed: {exc}"
-        state["done"] = True
-        return state
+        if budget is not None:
+            budget.record(ctx.agent_id, "research", False, _time.monotonic() - _t0)
+        llm_error = f"research llm call failed: {exc}"
+    if budget is not None and resp is not None and resp.ok:
+        budget.record(ctx.agent_id, "research", True, _time.monotonic() - _t0)
+    if resp is None or not resp.ok:
+        return await _free_tools_fallback(
+            ctx, state, topic,
+            reason=llm_error or "research llm returned an empty answer",
+        )
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
-    state["papers"] = [{"title": topic, "answer": resp.answer}]
-    state["citations"] = list(resp.citations)
-    state["bibtex"] = cite_fmt.to_bibtex(cite_fmt.parse_citations(resp.citations))
-
-    title = f"Findings: {topic}"
-    content = f"{resp.answer[:6000]}\n\n## BibTeX\n\n{state['bibtex'][:3000]}"
-    fid = await asyncio.to_thread(
-        ctx.memory.add_finding,
-        ctx.agent_id, title, content, resp.citations, state.get("issue_number"),
-    )
-    await asyncio.to_thread(
-        ctx.vector.add, content,
-        {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
-    )
-    await asyncio.to_thread(
-        ctx.memory.post_message,
-        ctx.agent_id, "broadcast",
-        f"New finding #{fid} on '{topic}' with {len(resp.citations)} citations.",
-        state.get("issue_number"),
-    )
-    if ctx.role == Role.RESEARCHER:
-        # P16bis (H2): the finding's claims must be VERIFIED by running code,
-        # not trusted because an LLM wrote them — the cycle continues into
-        # node_verify, which pre-registers hypotheses and adjudicates.
-        state["finding_id"] = fid
-        state["finding_text"] = content[:4000]
-        state["action"] = "verify"
-    else:
-        state["action"] = "plan"
-    return state
+    ctx.meta["research_source"] = "llm"
+    state["bibtex"] = await _grounded_bibtex(ctx, resp.citations)
+    return await _finish_research(ctx, state, topic, resp.answer, resp.citations, "llm")
 
 
 # ---------------------------------------------------------------- verify (P16bis)
@@ -656,25 +764,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
         f"{tools_txt}\n{personal_rule}{recall_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
-        "Propose a concrete implementation plan for this repo. Reply ONLY with "
-        'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
-        '"steps": ["..."], "commit_message": "...", '
-        '"verify_cmds": ["<python -m pytest ... or python <workspace .py script> '
-        'that CHECKS the idea; exit 0 must mean the hypothesis holds>"], '
-        '"hypotheses": [{"hypothesis_id": "slug", "claim": "one testable claim", '
-        '"prediction": "what the measurement will show", '
-        '"metric": "snake_case_metric", "comparison": ">|>=|<|<=|==", '
-        '"threshold": 0.5, "code": "<FULL python source: computes the metric, '
-        'then prints EXACTLY one final line AGENTICS_RESULT: '
-        '{\\"<metric>\\": <number>} (standard library only, deterministic, '
-        'no network)>"}]} '
-        "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
-        "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
-        "is how your idea gets VERIFIED by running real code instead of an LLM's "
-        "opinion — declare at least one check for a code task. 'hypotheses' "
-        "(optional, max 2) makes the claim MEASURABLE: the criterion is "
-        "pre-registered, the protocol runs twice and the runner re-adjudicates "
-        "the measurement — a lying script cannot pass.)"
+        f"{PLAN_INSTRUCTION}"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
@@ -682,40 +772,43 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["error"] = state.get("error") or "plan parsing failed"
         state["done"] = True
         return state
-    state["plan"] = json.dumps(parsed, ensure_ascii=False)[:8000]
-    state["commit_message"] = parsed.get("commit_message", "update")
-    verify_cmds = [str(c) for c in (parsed.get("verify_cmds") or [])][:5]
-    state["verify_cmds"] = verify_cmds
-    hyp_raws = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:2]
-    state["hypotheses"] = hyp_raws
-    reuses = [n for n in parsed.get("reuses", []) if isinstance(n, str)][:10]
-    state["reuses"] = reuses
-    for name in reuses:
+    # The model proposed the plan (approach-first, extras of its own naming);
+    # normalize_plan extracts just the machine contract the lab consumes.
+    core = normalize_plan(parsed)
+    state["plan"] = json.dumps(core.parsed, ensure_ascii=False)[:8000]
+    state["commit_message"] = core.commit_message
+    state["verify_cmds"] = core.verify_cmds
+    state["hypotheses"] = core.hypotheses
+    state["reuses"] = core.reuses
+    state["expected_files"] = core.expected_files
+    state["plan_approach"] = core.approach
+    if core.extras:
+        state["plan_extras"] = json.dumps(core.extras, ensure_ascii=False)[:2000]
+    for name in core.reuses:
         ctx.memory.bump_tool_use(name)      # no-op if the name is not registered
-    expected_files = [f.get("path", "") for f in (parsed.get("files") or [])][:15]
-    expected_files = [f for f in expected_files if f]
-    state["expected_files"] = expected_files
     ctx.report(
         node="plan",
         intent={
             "goal": f"Implement task #{state.get('issue_number')}: {state.get('issue_title', '')}",
-            "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
-            "expected_files": expected_files,
-            "verify_cmds": verify_cmds,
-            "hypotheses": [str(h.get("claim", ""))[:120] for h in hyp_raws],
+            "approach": core.approach[:200],
+            "steps": core.steps[:8],
+            "expected_files": core.expected_files,
+            "verify_cmds": core.verify_cmds,
+            "hypotheses": [str(h.get("claim", ""))[:120] for h in core.hypotheses],
+            "extras": sorted(core.extras)[:6],
             "why": f"category={state.get('category', 'other')}",
         },
     )
     # P13 — lock the declared scope across the swarm: another agent already
     # planning the same files is stopped BEFORE burning LLM cycles on implement.
     locks = getattr(getattr(ctx, "local", None), "locks", None)
-    if locks is not None and expected_files:
+    if locks is not None and core.expected_files:
         ok, conflicts = await asyncio.to_thread(
-            locks.try_acquire_all, ctx.agent_id, expected_files)
+            locks.try_acquire_all, ctx.agent_id, core.expected_files)
         if not ok:
             ctx.memory.journal(ctx.agent_id, "lock_conflict", {
                 "task": state.get("issue_number"),
-                "files": expected_files,
+                "files": core.expected_files,
                 "held_by": conflicts,
             })
             return await _yield(
@@ -724,7 +817,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 f"{list(conflicts.items())[:3]} — pick another angle",
             )
         ctx.memory.journal(ctx.agent_id, "intent_bound", {
-            "task": state.get("issue_number"), "files": expected_files,
+            "task": state.get("issue_number"), "files": core.expected_files,
         })
     return state
 
@@ -1482,6 +1575,9 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
                         issue_number, ctx.agent_id, exc)
     ctx.meta["personal"].add_lesson(lesson, issue_number)
     ctx.memory.add_decision(ctx.agent_id, f"cycle {ctx.cycle} done", lesson[:200])
+    # Adaptive prompts: feed the cycle outcome back into the LLM-authored
+    # mission (failures accumulate → the mission is reworked next cycle).
+    bump_prompt_feedback(ctx, state)
     ctx.memory.journal(ctx.agent_id, "cycle_done", {
         "cycle": ctx.cycle, "summary": lesson[:300],
         "outcome": _trace_outcome(state),

@@ -86,3 +86,14 @@ hyperbrowser_timeout: 900
 # The API key lives in configs/secrets.yaml (gitignored) as
 #   hyperbrowser_api_key: hb_...
 # or in the HB_API_KEY environment variable. It is NEVER committed here.
+
+# --- Adaptive planning & role prompts (LLM-authored) -------------------------
+# The LLM writes its own role missions (cached swarm-wide in the role_prompts
+# table, reworked after repeated failures, conditioned on recent traces) and
+# PROPOSES each plan itself (approach-first, extra fields of its own naming)
+# on top of the minimal machine contract. The immutable collaboration rules
+# are appended by code to every prompt and cannot be rewritten by the model.
+adaptive_prompts: true
+role_prompt_ttl_hours: 24      # re-synthesize a mission after this many hours
+role_prompt_max_chars: 1600    # hard cap for a synthesized mission
+role_prompt_rework_failures: 2 # consecutive failed cycles trigger a rework

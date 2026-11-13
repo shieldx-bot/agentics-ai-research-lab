@@ -51,6 +51,8 @@ class ResearchState(TypedDict, total=False):
     verify_cmds: list[str]         # P16: commands the plan declares as checks
     hypotheses: list[dict]         # P16: measurable claims (criterion + protocol code)
     reuses: list[str]              # registry tools the plan says it reuses
+    plan_approach: str             # the model's own proposal (why this way, risks)
+    plan_extras: str               # JSON — plan fields beyond the machine contract
     # P16bis — empirical claim verification (researcher path)
     finding_id: int                # finding the claims come from
     finding_text: str              # bounded finding content for the verify prompt

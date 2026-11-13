@@ -242,3 +242,58 @@ PyGithub) proposal: dropped — rewriting the nodes onto the SQLite task board
 of truth shared by the dashboard, `events`, `watch` and `explain`. A
 standalone smoke script: dropped — `tests/test_local_review_merge.py` already
 is a real-git E2E that doubles as the offline health check.
+
+---
+
+## 8. Adaptive planning & role prompts (LLM-authored, `agentics/planning.py`)
+
+Two layers used to sit hardcoded between the swarm and the model: the static
+role missions (`ROLE_MISSIONS` + a fixed template) and the planning prompt,
+whose JSON schema the model merely filled in. Both are now authored by the
+LLM itself, with code owning only the safety rails.
+
+### Role prompts — written by the model, reworked by evidence
+
+- One ACTIVE mission per `(role, category)` lives in the shared `role_prompts`
+  table — every agent of that role/category reads the same text, so the swarm
+  stays coherent (one synthesis LLM call per TTL window, not per agent).
+- The mission is written by a "prompt architect" meta-prompt (`SYNTHESIS_META`)
+  that carries the role, the task category, the research domain, a digest of
+  the role's recent traces (`role_experience`: what was tried, what failed)
+  and, on a rework, the measured record of the previous mission ("has run N
+  cycles: S ended well, F failed").
+- Feedback loop: `node_reflect` feeds every finished cycle back into the
+  active mission. `error` counts a failure, `yield` is neutral (a lost race
+  is not the mission's fault), success decays the failure counter. After
+  `role_prompt_rework_failures` (default 2) failed cycles the mission is
+  superseded and the next cycle synthesizes a fresh one conditioned on what
+  went wrong. TTL (`role_prompt_ttl_hours`, default 24) refreshes missions
+  even without failures.
+- **Guardrails are code-owned** (`roles.GUARDRAILS`): appended to EVERY
+  system prompt after synthesis — never merged, never self-merge, protected
+  paths, no secrets. The model may rewrite its mission; it can never relax
+  the rules. `sanitize_mission` strips control characters and caps the
+  length before the text ever reaches a prompt.
+- Degradation: no LLM account, a failed synthesis or a refusal-length answer
+  falls back to the static `build_system_prompt` behavior — the adaptive lab
+  turns back into the pre-adaptive one, never into a crash.
+- Config: `adaptive_prompts: true`, `role_prompt_ttl_hours`,
+  `role_prompt_max_chars`, `role_prompt_rework_failures` (configs/lab.yaml;
+  env `ADAPTIVE_PROMPTS`, `ROLE_PROMPT_TTL_HOURS`, …).
+
+### Plans — proposed by the model, normalized by code
+
+- The plan prompt (`PLAN_INSTRUCTION`) asks the model to PROPOSE: field one
+  is `approach` — what will be done and why, alternatives considered and
+  rejected, risks, what counts as success. This is what the owner reads
+  first in the intent report.
+- The machine contract (`PLAN_CONTRACT`) is the only fixed part: `files`
+  (P13 scope locks), `steps` (intent), `commit_message`, `verify_cmds` and
+  `hypotheses` (P16 empirical verification), `reuses` (tool registry) — the
+  fields the lab consumes mechanically.
+- `normalize_plan` is a tolerant adapter: it extracts the contract with
+  defensive caps (runaway answers, not structure) and preserves everything
+  else the model adds — `state["plan_approach"]`, `state["plan_extras"]`
+  (JSON of the model's own fields, shown to the owner) — instead of dropping
+  them by a rigid schema. A plan without `verify_cmds`/`hypotheses` behaves
+  exactly like the pre-adaptive plans (backward compatible).

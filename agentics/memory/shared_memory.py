@@ -205,6 +205,67 @@ CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 CREATE INDEX IF NOT EXISTS idx_findings_issue ON findings(issue);
 CREATE INDEX IF NOT EXISTS idx_journal_agent ON journal(agent);
 CREATE INDEX IF NOT EXISTS idx_evidence_agent ON evidence(agent);
+-- P18 — peer panel review: agents evaluate each OTHER's MRs by vote. The
+-- panel state machine lives here so every thread (and the dashboard) reads
+-- the same truth: who voted, what was objected, what was defended.
+CREATE TABLE IF NOT EXISTS mr_panels (
+    mr_id INTEGER PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'voting',
+        -- voting | defense | approved | rejected
+    round INTEGER NOT NULL DEFAULT 1,
+    opened_ts REAL NOT NULL,
+    due_ts REAL,               -- defense deadline (only when state=defense)
+    defense TEXT DEFAULT '',   -- the author's submitted defense (JSON)
+    updated_ts REAL
+);
+CREATE TABLE IF NOT EXISTS panel_votes (
+    mr_id INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    voter TEXT NOT NULL,
+    vote TEXT NOT NULL,        -- accept | reject
+    reason TEXT DEFAULT '',
+    ts REAL NOT NULL,
+    PRIMARY KEY (mr_id, round, voter)
+);
+CREATE TABLE IF NOT EXISTS panel_objections (
+    mr_id INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    voter TEXT NOT NULL,
+    objection TEXT NOT NULL,
+    ts REAL NOT NULL,
+    PRIMARY KEY (mr_id, round, voter)
+);
+CREATE TABLE IF NOT EXISTS role_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    category TEXT NOT NULL,
+    mission TEXT NOT NULL,                  -- LLM-written operating instructions
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    reason TEXT NOT NULL DEFAULT '',        -- cold_start | rework | too_many_failures
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_role_prompts_active
+    ON role_prompts(role, category) WHERE status='active';
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    purpose TEXT NOT NULL DEFAULT '',       -- research | plan | implement | review | ...
+    ok INTEGER NOT NULL DEFAULT 1,          -- 1 = answered, 0 = provider failure
+    duration_s REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts, agent);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    event TEXT NOT NULL,                    -- merge | mr_reject | task_exempt | ...
+    detail TEXT NOT NULL DEFAULT ''         -- JSON, never trimmed, never rewritten
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 """
 
 
@@ -212,6 +273,10 @@ CREATE INDEX IF NOT EXISTS idx_evidence_agent ON evidence(agent);
 # rows every N inserts (never on each write — trimming is a rare bulk DELETE).
 _JOURNAL_TRIM_EVERY = 500
 _JOURNAL_KEEP_ROWS = 5000
+
+# P18 — LLM usage ledger self-trims the same way (the budget window only
+# needs recent rows; fail-streak scans the newest 50 of whatever remains).
+_LLM_USAGE_KEEP_ROWS = 5000
 
 # Evidence rows (P16 records wired in for hypothesis 3) self-trim the same way.
 _EVIDENCE_TRIM_EVERY = 500
@@ -270,6 +335,112 @@ class SharedMemory:
                     self._conn.execute(column)
                 except sqlite3.OperationalError:
                     pass  # column already exists
+
+    # ------------------------------------------------------------ role prompts
+    # Adaptive role prompts (LLM-authored, shared across the swarm): one active
+    # mission per (role, category), reworked after repeated failures. The
+    # immutable guardrails are appended by the planning layer, never stored.
+    def get_role_prompt(self, role: str, category: str) -> dict | None:
+        """The active mission for (role, category), with its measured record."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, category, mission, status, reason, ts, uses, "
+                "successes, failures FROM role_prompts "
+                "WHERE role=? AND category=? AND status='active'",
+                (role, category),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = ("id", "role", "category", "mission", "status", "reason",
+                "ts", "uses", "successes", "failures")
+        return dict(zip(keys, row))
+
+    def latest_role_prompt(self, role: str, category: str) -> dict | None:
+        """The newest mission row for (role, category) regardless of status —
+        its measured record conditions the next synthesis even after the row
+        was superseded for too many failures."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, category, mission, status, reason, ts, uses, "
+                "successes, failures FROM role_prompts "
+                "WHERE role=? AND category=? ORDER BY id DESC LIMIT 1",
+                (role, category),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = ("id", "role", "category", "mission", "status", "reason",
+                "ts", "uses", "successes", "failures")
+        return dict(zip(keys, row))
+
+    def store_role_prompt(self, role: str, category: str, mission: str,
+                          reason: str = "") -> int:
+        """Supersede the current active mission, insert the new one (atomic)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE role_prompts SET status='superseded' "
+                "WHERE role=? AND category=? AND status='active'",
+                (role, category),
+            )
+            cur = self._conn.execute(
+                "INSERT INTO role_prompts (role, category, mission, status, "
+                "reason, ts) VALUES (?,?,?,?,?,?)",
+                (role, category, mission, "active", reason, time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    def bump_role_prompt(self, role: str, category: str, success: bool,
+                         rework_after: int = 2) -> str:
+        """Feed one cycle outcome back into the active mission.
+
+        success -> successes+1 and failures decay by one (a single bad cycle
+        must not thrash a good prompt); failure -> failures+1, and once the
+        failures reach `rework_after` the mission is superseded so the next
+        cycle re-synthesizes it conditioned on what went wrong. Returns the
+        row status after the bump ('' when no active row exists)."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id, failures FROM role_prompts "
+                "WHERE role=? AND category=? AND status='active'",
+                (role, category),
+            ).fetchone()
+            if row is None:
+                return ""
+            row_id, failures = int(row[0]), int(row[1])
+            if success:
+                failures = max(0, failures - 1)
+                self._conn.execute(
+                    "UPDATE role_prompts SET uses=uses+1, successes=successes+1, "
+                    "failures=? WHERE id=?", (failures, row_id))
+                return "active"
+            failures += 1
+            if rework_after > 0 and failures >= rework_after:
+                self._conn.execute(
+                    "UPDATE role_prompts SET uses=uses+1, failures=?, "
+                    "status='superseded', reason='too_many_failures' WHERE id=?",
+                    (failures, row_id))
+                return "superseded"
+            self._conn.execute(
+                "UPDATE role_prompts SET uses=uses+1, failures=? WHERE id=?",
+                (failures, row_id))
+            return "active"
+
+    def role_experience(self, role: str, category: str, limit: int = 8) -> str:
+        """Recent traces of this (role, category) as digest lines for the
+        synthesis meta-prompt — what was tried, how it ended, why it failed."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT outcome, attempted, failure FROM traces "
+                "WHERE role=? AND category=? ORDER BY id DESC LIMIT ?",
+                (role, category, limit),
+            ).fetchall()
+        lines = []
+        for outcome, attempted, failure in reversed(rows):
+            tried = (attempted or "(nothing recorded)")[:160]
+            line = f"- [{outcome}] {tried}"
+            if failure:
+                line += f" (failure: {failure[:120]})"
+            lines.append(line)
+        return "\n".join(lines)
 
     # ------------------------------------------------------------ messages
     def post_message(self, agent: str, kind: str, content: str, issue: int | None = None) -> None:
@@ -470,6 +641,92 @@ class SharedMemory:
                 "SELECT verdict, COUNT(*) FROM evidence GROUP BY verdict"
             ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------- llm_usage (P18, budget)
+    def record_llm_call(self, agent: str, purpose: str, ok: bool,
+                        duration_s: float = 0.0) -> None:
+        """One LLM request made by one agent (P18 budget ledger). Self-trims
+        like the journal: the budget window only needs recent rows."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO llm_usage (ts, agent, purpose, ok, duration_s)"
+                " VALUES (?,?,?,?,?)",
+                (time.time(), agent, purpose[:60], 1 if ok else 0,
+                 float(duration_s)),
+            )
+            self._conn.execute(
+                "DELETE FROM llm_usage WHERE id NOT IN"
+                " (SELECT id FROM llm_usage ORDER BY id DESC LIMIT ?)",
+                (_LLM_USAGE_KEEP_ROWS,),
+            )
+
+    def llm_calls_in_window(self, window_s: float = 3600.0,
+                            agent: str | None = None) -> int:
+        """Calls made lab-wide (or by one agent) inside the sliding window —
+        the shared pool is what gets capped: every agent drains the SAME
+        cookie/quota pool, so the cap must be pool-wide too."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM llm_usage WHERE ts > ?"
+                + (" AND agent=?" if agent else ""),
+                (time.time() - window_s, agent) if agent
+                else (time.time() - window_s,),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def llm_fail_streak(self, agent: str) -> int:
+        """Consecutive failed calls by one agent (newest backwards) — the
+        circuit breaker counts provider failures, not 'answered but slow'."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ok FROM llm_usage WHERE agent=? ORDER BY id DESC LIMIT 50",
+                (agent,),
+            ).fetchall()
+        streak = 0
+        for (ok,) in rows:
+            if ok:
+                break
+            streak += 1
+        return streak
+
+    def last_llm_ok_ts(self, agent: str) -> float | None:
+        """When the agent last got a real answer — breaker cooldown anchor."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM llm_usage WHERE agent=? AND ok=1", (agent,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    # ------------------------------------------------- audit_log (P19, immutable)
+    def audit(self, agent: str, event: str, detail: dict | str = "") -> int:
+        """Append ONE row to the immutable audit log (P19).
+
+        Unlike the journal (trimmed feed) and evidence (trimmed ledger), this
+        table is NEVER trimmed and never updated in place: it is the lab's
+        compliance trail for the actions that change what gets merged, what
+        gets exempted, and what gets re-judged. Returns the row id."""
+        if isinstance(detail, dict):
+            detail = json.dumps(detail, ensure_ascii=False)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO audit_log (ts, agent, event, detail) VALUES (?,?,?,?)",
+                (time.time(), agent, event[:80], str(detail)[:2000]),
+            )
+            return int(cur.lastrowid or 0)
+
+    def audit_recent(self, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, agent, event, detail FROM audit_log"
+                " ORDER BY id DESC LIMIT ?", (int(limit),),
+            ).fetchall()
+        return [{"ts": r[0], "agent": r[1], "event": r[2], "detail": r[3]}
+                for r in rows]
+
+    def audit_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+        return int(row[0] if row else 0)
 
     # ------------------------------------------------- hypotheses (P16bis)
     def add_hypothesis(
@@ -1034,6 +1291,124 @@ class SharedMemory:
             self.set_task_status(task_id, "in_review")
         self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
         return True
+
+    # ------------------------------------------------------------ P18 peer panels
+    def ensure_panel(self, mr_id: int, opened_ts: float | None = None) -> dict:
+        """Create the panel row for an MR if missing (voting, round 1); return it.
+
+        Idempotent and lazy: legacy MRs opened before P18 get a panel the first
+        time any reviewer touches them, so no migration backfill is needed."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO mr_panels (mr_id, state, round, opened_ts) "
+                "VALUES (?, 'voting', 1, ?)",
+                (mr_id, opened_ts if opened_ts is not None else time.time()),
+            )
+        panel = self.get_panel(mr_id)
+        assert panel is not None  # just inserted
+        return panel
+
+    def get_panel(self, mr_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT mr_id, state, round, opened_ts, due_ts, defense, updated_ts "
+                "FROM mr_panels WHERE mr_id=?", (mr_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "mr_id": row[0], "state": row[1], "round": row[2],
+            "opened_ts": row[3], "due_ts": row[4],
+            "defense": json.loads(row[5] or "{}"), "updated_ts": row[6],
+        }
+
+    def set_panel(
+        self, mr_id: int, state: str | None = None, round: int | None = None,
+        due_ts: float | None = None, clear_due: bool = False,
+        defense: dict | None = None,
+    ) -> None:
+        """Patch the panel row; only the engine mutates state transitions."""
+        sets: list[str] = []
+        args: list = []
+        if state is not None:
+            sets.append("state=?"); args.append(state)
+        if round is not None:
+            sets.append("round=?"); args.append(round)
+        if clear_due:
+            sets.append("due_ts=NULL")
+        elif due_ts is not None:
+            sets.append("due_ts=?"); args.append(due_ts)
+        if defense is not None:
+            sets.append("defense=?"); args.append(json.dumps(defense)[:8000])
+        sets.append("updated_ts=?"); args.append(time.time())
+        args.append(mr_id)
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE mr_panels SET {', '.join(sets)} WHERE mr_id=?", args)
+
+    def record_panel_vote(
+        self, mr_id: int, round: int, voter: str, vote: str, reason: str = "",
+    ) -> bool:
+        """Record one reviewer's vote. The FIRST vote of a (mr, round, voter)
+        sticks — a reviewer cannot silently flip their verdict after the fact
+        (audit trail). Returns False when the vote already exists."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO panel_votes (mr_id, round, voter, vote, reason, ts) "
+                "VALUES (?,?,?,?,?,?)",
+                (mr_id, round, voter, vote, reason[:2000], time.time()),
+            )
+            return cur.rowcount > 0
+
+    def panel_votes(self, mr_id: int, round: int | None = None) -> list[dict]:
+        sql = "SELECT round, voter, vote, reason, ts FROM panel_votes WHERE mr_id=?"
+        args: list = [mr_id]
+        if round is not None:
+            sql += " AND round=?"
+            args.append(round)
+        sql += " ORDER BY ts, voter"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"round": r[0], "voter": r[1], "vote": r[2], "reason": r[3], "ts": r[4]}
+            for r in rows
+        ]
+
+    def record_panel_objection(
+        self, mr_id: int, round: int, voter: str, objection: str,
+    ) -> None:
+        """Upsert the objection behind a reject vote — what the author must
+        defend. The latest text wins (the reviewer refines while drafting)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO panel_objections (mr_id, round, voter, objection, ts) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(mr_id, round, voter) "
+                "DO UPDATE SET objection=excluded.objection, ts=excluded.ts",
+                (mr_id, round, voter, objection[:3000], time.time()),
+            )
+
+    def panel_objections(self, mr_id: int, round: int | None = None) -> list[dict]:
+        sql = "SELECT round, voter, objection, ts FROM panel_objections WHERE mr_id=?"
+        args: list = [mr_id]
+        if round is not None:
+            sql += " AND round=?"
+            args.append(round)
+        sql += " ORDER BY ts, voter"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"round": r[0], "voter": r[1], "objection": r[2], "ts": r[3]}
+            for r in rows
+        ]
+
+    def panels_in_state(self, *states: str) -> list[dict]:
+        """Panel rows in the given state(s), oldest first (the sweep's queue)."""
+        marks = ",".join("?" for _ in states)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT mr_id FROM mr_panels WHERE state IN ({marks}) ORDER BY mr_id",
+                tuple(states),
+            ).fetchall()
+        return [self.get_panel(r[0]) for r in rows if self.get_panel(r[0]) is not None]
 
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(

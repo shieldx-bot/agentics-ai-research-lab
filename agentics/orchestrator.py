@@ -24,6 +24,7 @@ from agentics.llm.errors import is_auth_failure
 from agentics.llm.session_host import BrowserSessionHost
 from agentics.local_ops import LocalClaimPolicy, LocalMergeQueue, LocalOps
 from agentics.memory.personal_memory import PersonalMemory
+from agentics.policies.budget import BudgetPolicy
 from agentics.memory.shared_memory import SharedMemory
 from agentics.memory.vector_store import VectorStore
 from agentics.policies.ownership import OwnershipPolicy
@@ -34,15 +35,22 @@ log = logging.getLogger("orchestrator")
 
 
 def _effective_agent_count(settings: Settings, available_accounts: int) -> int:
-    """Respect the Hyperbrowser client's single-session architecture."""
+    """Scale the swarm to the Hyperbrowser token pool (one session per token).
+
+    K tokens (settings.hyperbrowser_api_keys) allow K concurrent cloud
+    sessions, so K agents run in parallel. With a single token (or legacy
+    settings without the pool) the old single-session limit applies."""
     count = min(max(0, available_accounts), max(0, settings.max_agents))
-    if (settings.browser_backend or "local").lower() == "hyperbrowser" and count > 1:
-        log.warning(
-            "BROWSER_BACKEND=hyperbrowser currently supports one active session; "
-            "limiting this process to 1 agent (requested %d).",
-            count,
-        )
-        return 1
+    if (settings.browser_backend or "local").lower() == "hyperbrowser":
+        slots = max(1, len(getattr(settings, "hyperbrowser_api_keys", None) or []))
+        if count > slots:
+            log.warning(
+                "hyperbrowser token pool holds %d key(s): limiting this process "
+                "to %d parallel agent(s) (requested %d). Add tokens via "
+                "HB_API_KEYS to scale further.", slots, slots, count,
+            )
+            return slots
+        return max(count, 1) if count else 1
     return count
 
 
@@ -121,6 +129,11 @@ class Orchestrator:
                 "(Perplexity) and/or qwen-01.json… (Qwen) into accounts/ "
                 "(see accounts/README.md and docs/LLM_PROVIDERS.md)."
             )
+        if (self.settings.browser_backend or "").lower() == "hyperbrowser":
+            keys = getattr(self.settings, "hyperbrowser_api_keys", None) or []
+            if len(keys) > 1:
+                log.info("hyperbrowser token pool: %d tokens -> %d parallel agents",
+                         len(keys), n)
         roles = assign_roles(n, _role_map(self.settings))
         contexts: list[AgentContext] = []
         for i in range(n):
@@ -145,6 +158,13 @@ class Orchestrator:
                 claims=LocalClaimPolicy(self.memory, self.settings.claim_ttl_minutes),
                 merge_queue=LocalMergeQueue(
                     self.memory, self.settings.auto_merge, guard=self.local.guard),
+                budget=BudgetPolicy(
+                    self.memory,
+                    max_calls_per_hour=self.settings.llm_max_calls_per_hour,
+                    fail_streak_limit=self.settings.llm_fail_streak_limit,
+                    cooldown_s=self.settings.llm_breaker_cooldown_s,
+                    agent_id=agent_id,
+                ),
                 meta={"account": getattr(first, "name", "shared"), "personal": personal},
             )
             contexts.append(ctx)
