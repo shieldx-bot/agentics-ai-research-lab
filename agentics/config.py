@@ -272,6 +272,12 @@ class Settings:
     # finding; every angle still passes the P20 budget gate and the fan-out
     # is journalled. 1 keeps the single-ask behaviour.
     research_fanout: int = field(default_factory=lambda: _env_int("RESEARCH_FANOUT", 1))
+    # Solo-lab unblock: when the pool has fewer identities than angles
+    # (e.g. one Hyperbrowser token), the extra angle still runs — SEQUENTIALLY
+    # on the agent's own pinned view, never parallel on the same session.
+    # Off restores the strict single-ask behaviour for 1-identity pools.
+    research_same_view_angle: bool = field(
+        default_factory=lambda: _env_bool("RESEARCH_SAME_VIEW_ANGLE", True))
 
     @property
     def owner(self) -> str:

@@ -14,6 +14,11 @@ research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core aut
 # tokens of the pool — 2 = survey + 1 angle, 3 = all three. Every angle
 # passes the P20 budget gate; 1 disables the fan-out entirely.
 research_fanout: 2
+# Solo-lab unblock: when the pool has fewer identities than angles (e.g. ONE
+# Hyperbrowser token), the extra angle still runs — sequentially on the
+# agent's own pinned view, never parallel on one session. false restores the
+# strict single-ask behaviour for 1-identity pools.
+research_same_view_angle: true
 
 # --- Role assignment ------------------------------------------------------
 # Fixed mapping account index (1-based) -> role. Leave EMPTY (as below) for

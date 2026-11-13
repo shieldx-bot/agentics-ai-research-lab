@@ -34,6 +34,32 @@ def _key_from_url(url: str) -> str:
     return f"{re.sub(r'[^a-zA-Z0-9]', '', host)}{slug}"
 
 
+def canonical_url(url: str) -> str:
+    """Host-canonical form of a citation URL — for DUPLICATE detection only.
+
+    sqlite.org/wal.html and www.sqlite.org/wal.html are the same document;
+    so are dx.doi.org/10.x and doi.org/10.x. Live 2026-11-13 a merged
+    finding listed the WAL document twice under both host forms, which
+    inflates the citation list (and every denominator built on it) without
+    adding a resource. Normalisation: lower-case host, drop leading
+    ``www.`` / ``dx.``, drop the fragment (it never names another resource),
+    strip one trailing ``/``. Everything else — scheme, path, query — is
+    preserved; the ORIGINAL url stays the one we cite, this form is only
+    the dedup key."""
+    text = str(url)
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except Exception:  # noqa: BLE001 — a malformed URL dedups as itself
+        return text
+    if not parts.netloc:
+        return text
+    host = parts.netloc.lower().removeprefix("www.").removeprefix("dx.")
+    path = parts.path[:-1] if parts.path.endswith("/") and parts.path != "/" \
+        else parts.path
+    return urllib.parse.urlunsplit(
+        ("", host, path, parts.query, ""))
+
+
 def parse_citations(urls: list[str]) -> list[Citation]:
     out: list[Citation] = []
     for url in urls:

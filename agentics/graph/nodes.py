@@ -48,6 +48,7 @@ from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
+from agentics.research import diversity as research_diversity
 from agentics.research import free_tools
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
@@ -626,6 +627,37 @@ def _fanout_views(ctx: AgentContext, n_extra: int) -> list:
     return views
 
 
+async def _ask_angle(ctx: AgentContext, view, angle: tuple[str, str],
+                     base_query: str, budget) -> tuple[str, object] | None:
+    """One complementary angle ask — shared by both fan-out modes.
+
+    The angle passes the same P20 budget gate as the primary ask and is
+    recorded in the usage ledger; a blocked, failed or empty angle returns
+    None instead of breaking the finding."""
+    label, hint = angle
+    if budget is not None:
+        allowed, why = budget.can_ask(ctx.agent_id)
+        if not allowed:
+            log.info("[%s] fan-out angle '%s' skipped by budget: %s",
+                     ctx.agent_id, label, why)
+            return None
+    started = time.monotonic()
+    try:
+        r = await papers_mod.search_papers(
+            view,
+            f"{base_query}\n\n[Angle: {label}] {hint}",
+            purpose="research")
+    except Exception as exc:  # noqa: BLE001 — one angle must not kill the finding
+        log.warning("[%s] fan-out angle '%s' failed: %s", ctx.agent_id, label, exc)
+        return None
+    if budget is not None:
+        budget.record(ctx.agent_id, "research", bool(r and r.ok),
+                      time.monotonic() - started)
+    if r is None or not r.ok:
+        return None
+    return label, r
+
+
 async def _fanout_angles(ctx: AgentContext, base_query: str, n_extra: int,
                          budget) -> list[tuple[str, object]]:
     """Run the complementary research angles in parallel on the extra views.
@@ -638,28 +670,7 @@ async def _fanout_angles(ctx: AgentContext, base_query: str, n_extra: int,
         return []
 
     async def one(view, angle):
-        label, hint = angle
-        if budget is not None:
-            allowed, why = budget.can_ask(ctx.agent_id)
-            if not allowed:
-                log.info("[%s] fan-out angle '%s' skipped by budget: %s",
-                         ctx.agent_id, label, why)
-                return None
-        started = time.monotonic()
-        try:
-            r = await papers_mod.search_papers(
-                view,
-                f"{base_query}\n\n[Angle: {label}] {hint}",
-                purpose="research")
-        except Exception as exc:  # noqa: BLE001 — one angle must not kill the finding
-            log.warning("[%s] fan-out angle '%s' failed: %s", ctx.agent_id, label, exc)
-            return None
-        if budget is not None:
-            budget.record(ctx.agent_id, "research", bool(r and r.ok),
-                          time.monotonic() - started)
-        if r is None or not r.ok:
-            return None
-        return label, r
+        return await _ask_angle(ctx, view, angle, base_query, budget)
 
     results = await asyncio.gather(
         *(one(v, a) for v, a in zip(views, _FANOUT_ANGLES[:len(views)])))
@@ -674,22 +685,67 @@ async def _fanout_angles(ctx: AgentContext, base_query: str, n_extra: int,
     return ran
 
 
+async def _same_view_angles(ctx: AgentContext, base_query: str, n_extra: int,
+                            budget) -> list[tuple[str, object]]:
+    """Solo-lab unblock: extra angles SEQUENTIALLY on the agent's own view.
+
+    ``_fanout_views`` correctly refuses to fan out when the pool has fewer
+    identities than angles (one Hyperbrowser token = one cloud session),
+    which left solo deployments structurally unable to widen their source
+    diet (live 2026-11-13: research_fanout=2 configured, 0 angles ever
+    ran). Here the extra angle runs on the SAME pinned view — strictly one
+    after another, never concurrent on one session — passing the identical
+    budget gate; the first blocked or failed angle stops the loop so a dead
+    session is not hammered twice."""
+    if n_extra < 1 or ctx.llm is None:
+        return []
+    ran: list[tuple[str, object]] = []
+    for angle in _FANOUT_ANGLES[:n_extra]:
+        got = await _ask_angle(ctx, ctx.llm, angle, base_query, budget)
+        if got is None:
+            break
+        ran.append(got)
+    if ran:
+        ctx.meta["research_fanout"] = 1 + len(ran)
+        ctx.meta["research_fanout_same_view"] = len(ran)
+        try:
+            ctx.memory.journal(ctx.agent_id, "research_fanout_same_view",
+                               {"angles": [label for label, _ in ran]})
+        except Exception:  # noqa: BLE001 — telemetry must never gate harder
+            pass
+    return ran
+
+
 def _merge_research(primary, extras: list[tuple[str, object]]):
     """Merge parallel angle answers into the primary finding: primary text
     first, then each angle under its own heading; citations deduped in
     order. The merged shape is exactly the LLMResponse the rest of the
-    pipeline already consumes."""
+    pipeline already consumes.
+
+    Dedup keys on the CANONICAL host form (citations.canonical_url):
+    www.sqlite.org/x and sqlite.org/x are one document and must not occupy
+    two citation slots (live 2026-11-13: exactly that pair in one finding).
+    The first-seen original URL is kept for the citation list."""
     from agentics.llm.perplexity_client import LLMResponse
+    from agentics.research.citations import canonical_url
 
     parts = [primary.answer.rstrip()]
-    citations = list(primary.citations)
-    seen = set(citations)
+    citations: list[str] = []
+    seen: set[str] = set()
+    for c in primary.citations:
+        key = canonical_url(c) if c else ""
+        if not c or key in seen:
+            continue
+        seen.add(key)
+        citations.append(c)
     for label, r in extras:
         parts.append(f"## Supplementary angle — {label}\n{r.answer.strip()}")
         for c in r.citations:
-            if c and c not in seen:
-                seen.add(c)
-                citations.append(c)
+            key = canonical_url(c) if c else ""
+            if not c or key in seen:
+                continue
+            seen.add(key)
+            citations.append(c)
     return LLMResponse(
         answer="\n\n".join(parts),
         citations=citations,
@@ -879,11 +935,24 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
             state["summary"] = f"topic already covered by {len(known)} findings; skipping"
             state["done"] = True
             return state
+    # Breadth steering: the swarm's already-cited domains feed back into the
+    # query so the model can seek sources OUTSIDE the existing diet. Failure
+    # isolated — a broken memory degrades to an unsteered query.
+    breadth = ""
+    try:
+        domains = research_diversity.cited_domains(ctx.memory)
+        breadth = research_diversity.breadth_directive(domains)
+        if breadth:
+            ctx.memory.journal(ctx.agent_id, "research_breadth_steered",
+                               {"known_domains": len(domains)})
+    except Exception:  # noqa: BLE001 — steering must never gate research
+        breadth = ""
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
         + (f"\n\nProblem statement from the issue:\n{body[:400]}" if body else "")
         + (f"\n\n{knowledge}" if knowledge else "")
+        + breadth
     )
 
     if ctx.llm is None:
@@ -942,6 +1011,10 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     fanout = max(1, int(getattr(ctx.settings, "research_fanout", 1) or 1))
     if fanout > 1:
         extras = await _fanout_angles(ctx, query, fanout - 1, budget)
+        if not extras and getattr(ctx.settings, "research_same_view_angle", True):
+            # Pool too small for parallel views — run the angle on the
+            # agent's own identity, sequentially (solo-lab unblock).
+            extras = await _same_view_angles(ctx, query, fanout - 1, budget)
         if extras:
             log.info("[%s] research fan-out merged %d extra angle(s)",
                      ctx.agent_id, len(extras))
