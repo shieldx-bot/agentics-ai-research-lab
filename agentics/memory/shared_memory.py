@@ -799,9 +799,17 @@ class SharedMemory:
     def update_hypothesis(
         self, hyp_id: int, status: str, evidence_id: int | None = None,
         note: str = "", protocol_path: str | None = None,
+        agent: str | None = None,
     ) -> bool:
         """Move the hypothesis through its lifecycle:
-        proposed -> testing -> supported | refuted | inconclusive."""
+        proposed -> testing -> supported | refuted | inconclusive.
+
+        Settling to supported/refuted also runs the contradiction check: if
+        ANOTHER hypothesis with the SAME criterion settled to the OPPOSITE
+        verdict, a `claim_contradiction` alert is journaled — the swarm just
+        disagreed with itself on a measurable fact and the owner/panel must
+        see it."""
+        opposite = {"supported": "refuted", "refuted": "supported"}.get(status)
         with self._lock, self._conn:
             sets = ["status=?", "attempts=attempts+1"]
             args: list = [status]
@@ -817,7 +825,38 @@ class SharedMemory:
             args.append(hyp_id)
             cur = self._conn.execute(
                 f"UPDATE hypotheses SET {', '.join(sets)} WHERE id=?", args)
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+            if not (changed and opposite):
+                return changed
+            # contradiction check — same criterion, opposite settled verdict
+            row = self._conn.execute(
+                "SELECT agent, criterion FROM hypotheses WHERE id=?", (hyp_id,),
+            ).fetchone()
+            if row is None:
+                return changed
+            agent = agent or row[0] or "system"
+            try:
+                crit = json.dumps(json.loads(row[1] or "{}"), sort_keys=True)
+            except json.JSONDecodeError:
+                crit = row[1] or "{}"
+            other = self._conn.execute(
+                "SELECT id, claim, verdict_note FROM hypotheses "
+                "WHERE id!=? AND criterion=? AND status=? "
+                "ORDER BY id DESC LIMIT 1", (hyp_id, crit, opposite),
+            ).fetchone()
+            if other is None:
+                return changed
+            self._conn.execute(
+                "INSERT INTO journal (ts, agent, event, detail) VALUES (?,?,?,?)",
+                (time.time(), agent, "claim_contradiction", json.dumps({
+                    "hyp": hyp_id, "settled_to": status,
+                    "against_hyp": other[0],
+                    "against_claim": (other[1] or "")[:160],
+                    "against_note": (other[2] or "")[:160],
+                    "criterion": json.loads(crit),
+                }, ensure_ascii=False)),
+            )
+            return changed
 
     def get_hypothesis(self, hyp_id: int) -> dict | None:
         with self._lock:
@@ -895,6 +934,20 @@ class SharedMemory:
         return [{"id": r[0], "claim": r[1], "status": r[2], "note": r[3],
                  "criterion": json.loads(r[4] or "{}"), "evidence_id": r[5]}
                 for r in rows]
+
+    def settled_hypotheses(self, limit: int = 20,
+                           require_code: bool = False) -> list[dict]:
+        """Settled (supported|refuted) hypotheses, newest first — the replay
+        sweep's input. `require_code` keeps only claims whose protocol source
+        is stored (replayable), so P21-pruned legacy claims are skipped."""
+        sql = (f"SELECT {self.HYP_COLS} FROM hypotheses "
+               "WHERE status IN ('supported','refuted')")
+        if require_code:
+            sql += " AND protocol_code != ''"
+        sql += " ORDER BY id DESC LIMIT ?"
+        with self._lock:
+            rows = self._conn.execute(sql, (limit,)).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
 
 
     # ------------------------------------------------------------ decisions
