@@ -127,7 +127,7 @@ On the dashboard, the "Kiểm chứng thực nghiệm" card shows raw runs; the
 value and the settled status — pre-registration means the goalposts cannot
 move after seeing the numbers.
 
-## 7. Claim dedup — settled claims are reused, never re-run (H3 enforced)
+## 9. Claim dedup — settled claims are reused, never re-run (H3 enforced)
 
 Sharing verdicts is only half of H3; the other half is that the swarm never
 pays for the same experiment twice. Every hypothesis row stores a normalized
@@ -147,7 +147,7 @@ BEFORE running anything:
 Only `supported`/`refuted` count as settled: `inconclusive` claims always
 deserve a fresh run. Pinned by `tests/test_hypothesis_dedup.py`.
 
-## 8. Testing
+## 10. Testing
 
 
 `tests/test_verify_ops.py` (exit-code evidence), `tests/test_verify_metrics.py`
