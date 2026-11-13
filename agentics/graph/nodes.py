@@ -284,6 +284,21 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     if swept_panels:
         ctx.memory.journal(ctx.agent_id, "panel_sweep",
                            {"events": [list(e) for e in swept_panels[:10]]})
+    # P21 retention: workspaces of dead agents that hold nothing and carry no
+    # unpushed work get pruned here (agentics/policies/retention.py).
+    try:
+        from agentics.policies.retention import sweep_stale_workspaces
+        pruned_ws = sweep_stale_workspaces(
+            ctx.memory, ctx.settings.workspaces_dir,
+            ctx.settings.workspace_retention_minutes,
+            ctx.memory.active_agents(stale_after_s=300),
+            agent_id=ctx.agent_id)
+        if pruned_ws:
+            ctx.memory.post_message(
+                ctx.agent_id, "alert",
+                f"P21 pruned {len(pruned_ws)} idle workspace(s): {pruned_ws}")
+    except Exception:  # noqa: BLE001 — retention must never break the scan
+        pruned_ws = []
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
