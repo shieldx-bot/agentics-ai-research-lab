@@ -435,11 +435,19 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
         '"steps": ["..."], "commit_message": "...", '
         '"verify_cmds": ["<python -m pytest ... or python <workspace .py script> '
-        'that CHECKS the idea; exit 0 must mean the hypothesis holds>"]} '
+        'that CHECKS the idea; exit 0 must mean the hypothesis holds>"], '
+        '"hypotheses": [{"hypothesis_id": "slug", "claim": "one testable claim", '
+        '"prediction": "what the measurement will show", '
+        '"metric": "snake_case_metric", "comparison": ">|>=|<|<=|==", '
+        '"threshold": 0.5, "code": "<FULL python source: writes '
+        'json.dumps({\\"value\\": <number>}) to '
+        'research_notes/experiments/results/<hypothesis_id>.json>"}]} '
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
         "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
         "is how your idea gets VERIFIED by running real code instead of an LLM's "
-        "opinion — declare at least one check for a code task.)"
+        "opinion — declare at least one check for a code task. 'hypotheses' "
+        "(optional, max 2) makes the claim MEASURABLE: the runner re-judges the "
+        "criterion from the result JSON, a lying script cannot pass.)"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
@@ -451,6 +459,8 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     state["commit_message"] = parsed.get("commit_message", "update")
     verify_cmds = [str(c) for c in (parsed.get("verify_cmds") or [])][:5]
     state["verify_cmds"] = verify_cmds
+    hyp_raws = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:2]
+    state["hypotheses"] = hyp_raws
     reuses = [n for n in parsed.get("reuses", []) if isinstance(n, str)][:10]
     state["reuses"] = reuses
     for name in reuses:
@@ -465,6 +475,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
             "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
             "expected_files": expected_files,
             "verify_cmds": verify_cmds,
+            "hypotheses": [str(h.get("claim", ""))[:120] for h in hyp_raws],
             "why": f"category={state.get('category', 'other')}",
         },
     )
@@ -694,6 +705,46 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
                 "task": task_id,
                 "cmds": [e.cmd[:120] for e in inconclusive][:5]})
+
+    # P16 (hypothesis contract) — the richer experiment form: the plan may
+    # declare MEASURABLE hypotheses (metric + threshold + experiment code).
+    # ExperimentRunner re-judges the criterion from the experiment's result
+    # JSON, so a lying script cannot claim success. Every verdict lands in the
+    # same shared evidence table (H3) the reviewer, dashboard and CLI read.
+    hyp_raws = state.get("hypotheses") or []
+    if hyp_raws:
+        from agentics.verify.hypothesis import parse_hypothesis
+        from agentics.verify.runner import ExperimentRunner
+
+        runner = ExperimentRunner(ctx.workspace)
+        hyp_task = state.get("issue_number")
+        for raw in hyp_raws:
+            hyp, reason = parse_hypothesis(raw)
+            if hyp is None:                     # malformed proposal: never guessed through
+                ctx.memory.journal(ctx.agent_id, "p16_hypothesis_invalid",
+                                   {"task": hyp_task, "reason": reason[:200]})
+                continue
+            vr = await asyncio.to_thread(runner.run, hyp)
+            rec = vr.to_record()
+            await asyncio.to_thread(
+                ctx.memory.record_evidence, ctx.agent_id, hyp_task,
+                f"{hyp.script_path} -> {hyp.metric} {hyp.comparison} {hyp.threshold}",
+                rec["exit_code"] if rec["exit_code"] is not None else -1,
+                vr.verdict,
+                hypothesis=f"{hyp.claim} | prediction: {hyp.prediction}",
+                method="hypothesis_contract",
+                output=rec["reason"] or rec["evidence"][:300],
+                duration_s=vr.duration_s, artifact=hyp.result_path)
+            if vr.verdict == "refuted":
+                return await _yield(
+                    ctx, state,
+                    f"P16 hypothesis '{hyp.hypothesis_id}' REFUTED by measurement: "
+                    f"{rec['reason']} — the idea did not hold; fix the code or re-plan",
+                )
+            if vr.verdict == "inconclusive":
+                ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
+                    "task": hyp_task, "hypothesis": hyp.hypothesis_id,
+                    "reason": rec["reason"][:200]})
 
     try:
         pushed = await asyncio.to_thread(
