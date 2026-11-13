@@ -17,7 +17,9 @@ This module keeps the criterion OUTSIDE the protocol, as a pre-registered
   verdict is computed from data, never from an LLM's opinion;
 * `run_protocol` runs the script TWICE (a real researcher reruns the
   experiment): non-deterministic or unparsable output is `inconclusive`,
-  never silently accepted.
+  never silently accepted. Reproducibility is judged with `metrics_agree` —
+  agreement within measurement noise (last-float-bit jitter), not
+  bit-identical JSON.
 
 Everything rides on verify_ops primitives (RepoWorkspace.run_command with
 its allowlist, scrubbed environment and bounded lifetime) — no second
@@ -119,6 +121,38 @@ def _num(value: Any) -> float | None:
     return None
 
 
+# Numeric agreement window for the reproducibility gate: two runs of the
+# SAME protocol may still differ in the last float bits (summation order,
+# dict ordering feeding a mean). The gate is about SCIENTIFIC
+# reproducibility — the measurement agreeing within noise — not about
+# bit-identical JSON serialization.
+_REL_EPS = 1e-9
+
+
+def _agree(a: Any, b: Any) -> bool:
+    """One metric value pair agrees: numbers within noise, text exactly."""
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, bool) or isinstance(a, str) or isinstance(b, str):
+        return a == b
+    na, nb = _num(a), _num(b)
+    if na is not None and nb is not None:
+        return abs(na - nb) <= _REL_EPS * max(1.0, abs(na), abs(nb))
+    return a == b                     # lists / None / nested must match exactly
+
+
+def metrics_agree(a: dict, b: dict) -> bool:
+    """Two runs' metric dicts agree: same keys, values within float noise.
+
+    Non-numeric values must match exactly — a protocol flipping
+    ``"device": "cpu"`` to ``"device": "gpu"`` genuinely disagrees. A
+    missing/extra key is disagreement too: the runs measured different
+    things, which is exactly what the gate exists to catch."""
+    if set(a) != set(b):
+        return False
+    return all(_agree(a[k], b[k]) for k in a)
+
+
 def adjudicate(metrics: dict[str, Any], criterion: Criterion) -> tuple[str, str]:
     """Compare the measured metric against the criterion — machine verdict.
 
@@ -162,7 +196,7 @@ def run_protocol(
     Verdict rules (in order — safety first):
       * any run blocked (126) / timed out (124)  -> inconclusive;
       * any run that failed to parse a RESULT    -> inconclusive;
-      * runs disagree on the metrics             -> inconclusive
+      * runs disagree on the metrics (beyond float noise) -> inconclusive
         (non-reproducible evidence must not become `supported`);
       * otherwise the machine verdict of adjudicate() stands.
 
@@ -192,7 +226,8 @@ def run_protocol(
                 runs, {}, output_parts, total_duration, criterion)
         runs[-1]["metrics"] = parsed
         metrics = parsed
-    if len(runs) > 1 and any(r["metrics"] != runs[0]["metrics"] for r in runs[1:]):
+    if len(runs) > 1 and any(
+            not metrics_agree(r["metrics"], runs[0]["metrics"]) for r in runs[1:]):
         metrics = runs[0]["metrics"]
         return _protocol_evidence(
             script, last_exit, "inconclusive",

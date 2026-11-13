@@ -17,6 +17,7 @@ from agentics.verify_metrics import (
     RESULT_MARKER,
     Criterion,
     adjudicate,
+    metrics_agree,
     parse_metrics,
     run_protocol,
 )
@@ -147,3 +148,66 @@ def test_run_protocol_single_run_when_repeat_one(tmp_path):
     script = _script(ws, f"print({RESULT_MARKER!r} + '{{\"f1\": 1.0}}')\n")
     ev = run_protocol(ws, script, Criterion("f1", "==", 1.0), repeat=1)
     assert ev.verdict == "confirmed" and len(ev.meta["runs"]) == 1
+
+
+# ------------------------------------------------- reproducibility (noise)
+def test_metrics_agree_semantics():
+    assert metrics_agree({"p": 0.72}, {"p": 0.72 + 1e-15})      # float noise
+    assert metrics_agree({"p": 100}, {"p": 100.0})              # int vs float
+    assert not metrics_agree({"p": 0.72}, {"p": 0.69})          # real difference
+    assert not metrics_agree({"p": 0.72}, {"q": 0.72})          # different keys
+    assert not metrics_agree({"p": 0.72}, {"p": 0.72, "n": 1})  # extra metric
+    assert not metrics_agree({"device": "cpu"}, {"device": "gpu"})
+    assert metrics_agree({"device": "cpu", "acc": 0.9},
+                         {"device": "cpu", "acc": 0.9000000000000001})
+
+
+def test_run_protocol_float_noise_is_still_reproducible(tmp_path):
+    """Same measurement, last-float-bit jitter -> reproducible, not inconclusive.
+
+    json.dumps renders 0.72 and 0.72 + 1e-15 differently, so the old
+    bit-identical comparison read a deterministic protocol as
+    'not reproducible' — the gate is about the measurement, not the bytes."""
+    ws = _workspace(tmp_path)
+    code = (
+        "import json, pathlib\n"
+        "c = pathlib.Path('counter.txt')\n"
+        "n = int(c.read_text()) if c.exists() else 0\n"
+        "c.write_text(str(n + 1))\n"
+        "p = 0.72 if n == 0 else 0.72 + 1e-15\n"
+        "print('AGENTICS_RESULT: ' + json.dumps({'precision': p}))\n"
+    )
+    script = _script(ws, code)
+    ev = run_protocol(ws, script, Criterion("precision", ">=", 0.7))
+    assert ev.verdict == "confirmed" and ev.ok
+    assert ev.meta["metrics"]["precision"] == pytest.approx(0.72, rel=1e-12)
+
+
+def test_run_protocol_real_disagreement_stays_inconclusive(tmp_path):
+    ws = _workspace(tmp_path)
+    code = (
+        "import json, pathlib\n"
+        "c = pathlib.Path('counter.txt')\n"
+        "n = int(c.read_text()) if c.exists() else 0\n"
+        "c.write_text(str(n + 1))\n"
+        "p = 0.72 if n == 0 else 0.69\n"
+        "print('AGENTICS_RESULT: ' + json.dumps({'precision': p}))\n"
+    )
+    script = _script(ws, code)
+    ev = run_protocol(ws, script, Criterion("precision", ">=", 0.5))
+    assert ev.verdict == "inconclusive" and "reproducible" in ev.output
+
+
+def test_run_protocol_string_metric_flip_is_not_reproducible(tmp_path):
+    ws = _workspace(tmp_path)
+    code = (
+        "import json, pathlib\n"
+        "c = pathlib.Path('counter.txt')\n"
+        "n = int(c.read_text()) if c.exists() else 0\n"
+        "c.write_text(str(n + 1))\n"
+        "dev = 'cpu' if n == 0 else 'gpu'\n"
+        "print('AGENTICS_RESULT: ' + json.dumps({'acc': 0.9, 'device': dev}))\n"
+    )
+    script = _script(ws, code)
+    ev = run_protocol(ws, script, Criterion("acc", ">=", 0.5))
+    assert ev.verdict == "inconclusive" and "reproducible" in ev.output
