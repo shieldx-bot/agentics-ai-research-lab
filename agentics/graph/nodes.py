@@ -35,7 +35,9 @@ from agentics.peer_review import (
 from agentics.planning import (
     PLAN_INSTRUCTION,
     bump_prompt_feedback,
+    extras_state_json,
     normalize_plan,
+    plan_state_json,
     resolve_system_prompt,
 )
 from agentics.policies.guard import is_credential_path
@@ -1157,7 +1159,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # The model proposed the plan (approach-first, extras of its own naming);
     # normalize_plan extracts just the machine contract the lab consumes.
     core = normalize_plan(parsed)
-    state["plan"] = json.dumps(core.parsed, ensure_ascii=False)[:8000]
+    state["plan"] = plan_state_json(core)
     state["commit_message"] = core.commit_message
     state["verify_cmds"] = core.verify_cmds
     state["hypotheses"] = core.hypotheses
@@ -1165,7 +1167,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     state["expected_files"] = core.expected_files
     state["plan_approach"] = core.approach
     if core.extras:
-        state["plan_extras"] = json.dumps(core.extras, ensure_ascii=False)[:2000]
+        state["plan_extras"] = extras_state_json(core.extras)
     for name in core.reuses:
         ctx.memory.bump_tool_use(name)      # no-op if the name is not registered
     ctx.report(
@@ -1311,7 +1313,12 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     else:
         await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
-    plan = json.loads(state.get("plan") or "{}")
+    try:
+        plan = json.loads(state.get("plan") or "{}")
+    except json.JSONDecodeError:
+        state["error"] = "plan state is not valid JSON (corrupted dump)"
+        state["done"] = True
+        return state
     # The implement prompt is conditioned on the model's OWN proposal, not a
     # fixed template: every per-file ask carries the approach the planner
     # declared and the P16 checks/hypotheses that will judge the code.

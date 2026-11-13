@@ -76,7 +76,11 @@ async def main() -> None:
     mem = SharedMemory(scratch / "memory.db")
     host = BrowserSessionHost.from_settings(settings)
     ctx = build_ctx(settings, host, mem)
-    report = {"topic": settings.research_topic, "backend": "hyperbrowser"}
+    report: dict = {"topic": settings.research_topic, "backend": "hyperbrowser"}
+    out = scratch / "live_run_report.json"
+
+    def save() -> None:
+        out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
 
     t0 = time.monotonic()
     state = {}
@@ -91,6 +95,7 @@ async def main() -> None:
         "answer_chars": len(answer),
         "bibtex": state.get("bibtex", ""),
     }
+    save()          # research evidence survives a later-phase timeout
     print(f"[{time.monotonic() - t0:6.1f}s] research done: "
           f"{report['research']['answer_chars']} chars, "
           f"{len(report['research']['citations'])} citations")
@@ -129,8 +134,7 @@ async def main() -> None:
         await client.close()
     mem.close()
 
-    out = scratch / "live_run_report.json"
-    out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    save()
     print(f"report saved: {out} | total wall time: {time.monotonic() - t0:.0f}s")
 
 
