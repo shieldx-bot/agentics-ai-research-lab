@@ -426,3 +426,21 @@ def test_failure_investigation_dedupes_beyond_the_last_500_tasks(settings, mem):
     titles = [t["title"] for t in mem.list_tasks(limit=1000)
               if t["title"].startswith("Investigate failure")]
     assert titles == ["Investigate failure (code): boom"]
+
+
+def test_local_repo_requires_main_at_seed(settings, project):
+    """Seeding from a checkout without 'main' must fail AT SEED TIME with an
+    actionable error — previously it succeeded quietly and the lab crashed
+    later inside the integrator's first merge (raw CalledProcessError)."""
+    _git("branch", "-m", "main", "trunk", cwd=project)
+    repo = LocalRepo(settings)
+    with pytest.raises(RuntimeError, match="main"):
+        repo.ensure(src=project)
+
+
+def test_main_head_gives_an_actionable_error(settings):
+    """main_head() must explain WHAT is wrong (no readable main, where, why)
+    instead of raising a bare CalledProcessError."""
+    settings.local_repo_path.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(RuntimeError, match="main"):
+        LocalRepo(settings).main_head()

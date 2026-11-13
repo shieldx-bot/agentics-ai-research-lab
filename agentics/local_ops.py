@@ -172,6 +172,16 @@ class LocalRepo:
             ["git", "-C", str(self.path), "symbolic-ref", "HEAD", "refs/heads/main"],
             capture_output=True, text=True,
         )
+        # the whole local-mode stack (integrator merges, P10 default-branch
+        # rule, branch_name flow) assumes 'main' — fail HERE with an
+        # actionable message instead of a raw CalledProcessError later,
+        # deep inside the first merge
+        if not self.branch_exists("main"):
+            raise RuntimeError(
+                f"local origin seeded from {src} has no 'main' branch. The "
+                "local lab requires the checkout to carry main — create it "
+                "(git branch main && git checkout main) and restart the lab."
+            )
         self.ensure_guard()
         return self.path
 
@@ -207,8 +217,14 @@ class LocalRepo:
     def main_head(self) -> str:
         proc = subprocess.run(
             ["git", "-C", str(self.path), "rev-parse", "main"],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=False,
         )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"local origin {self.path} has no readable 'main' branch "
+                f"(git said: {proc.stderr.strip()[:200]}). It was probably "
+                "seeded from a checkout without main — re-seed the bare repo."
+            )
         return proc.stdout.strip()
 
     def branch_exists(self, branch: str) -> bool:
