@@ -14,7 +14,10 @@
 > `AGENTICS_RESULT: {"metric": <number>}`; the verdict is a machine
 > comparison of measured vs criterion — never an LLM's self-assessment.
 > Protocols run twice; non-reproducible or unparsable output is
-> `inconclusive` and can never pose as success.
+> `inconclusive` and can never pose as success. And the verdict does not
+> rest on one agent's word: ANOTHER agent independently re-runs the stored
+> protocol in its own workspace (P24/P24bis replication) before the claim
+> is marked `replicated`.
 >
 > **H3 — Can an agent share its verification results with every AI?**
 > Yes — verdicts land in the shared `evidence` + `hypotheses` tables,
@@ -22,6 +25,9 @@
 > dashboard, queryable via `agentics evidence` / `agentics hypotheses`, and
 > injected into EVERY agent's prompt as settled knowledge (supported facts
 > become reusable common ground; refuted claims stop being repeated).
+> Sharing is also enforced: the replication ledger tracks WHO re-ran WHAT,
+> so the swarm never pays for the same experiment twice — and a refuted
+> replication self-corrects the shared knowledge everywhere.
 
 The stack grew from several parallel contributors on this branch; this
 document describes how the pieces compose today.
@@ -270,3 +276,47 @@ disagreement, and does not alert.
 
 Tests: `tests/test_protocol_code.py`, `tests/test_replay.py` (including a
 real bare-origin/clone integration run — the exact `verify-all` sequence).
+
+## 13. P24/P24bis — INDEPENDENT replication by another agent (H2 closed twice)
+
+The P23 sweep re-checks claims over TIME from one workspace — a claim's
+verdict still rests on a single agent's word on day one. Independent
+replication is the other half: a DIFFERENT agent re-runs the claim in its
+OWN workspace, and only then does `verified_knowledge` flag it `replicated`.
+
+Two pieces, one rulebook:
+
+* **P24 ledger** (`SharedMemory`): `hypotheses.replication` +
+  `replication_attempts` — the canonical once-per-swarm bookkeeping.
+  `hypotheses_needing_replication(agent)` offers each agent the OLDEST
+  settled `supported` claim it did NOT author (author exclusion, retry
+  budget: an `inconclusive` replication is retried by a DIFFERENT peer up
+  to 2 attempts, then left alone).
+* **P24bis engine** (`agentics/verify/replication.py`):
+  `replicate_candidate` rebuilds the stored protocol in the peer's
+  workspace, runs the full two-run reproducibility gate, writes the
+  provenance ledger (`record_replication_detail`: who, measured metrics,
+  per-run detail) and the peer's own evidence row
+  (`method='replication'`), then applies the P17 asymmetry:
+
+| replication outcome | journal event | effect |
+| --- | --- | --- |
+| confirms | `replication_confirmed` | claim annotated `replicated` — author-confirmed becomes independently replicated |
+| refutes | `replication_refuted` | ledger closed: the author's evidence row is re-verdicted, the claim downgraded — `verified_knowledge` stops serving a dead claim |
+| inconclusive | `replication_inconclusive` | annotates only, NEVER refutes; another peer may retry within the budget |
+
+The live wiring is `node_verify` (`agentics/graph/nodes.py`): BEFORE any
+fresh-finding verification — and needing neither a finding nor an LLM —
+every researcher cycle feeds the P24 selector into the engine
+(`_replicate_settled`, up to 2 claims per cycle). A researcher with nothing
+new to verify still advances the swarm's trust in what it already knows.
+Self-replication is refused at BOTH layers (selector + engine).
+
+Composition with dedup (section 9): an agent that meets an already-settled
+claim replicates it once AND reuses the settled verdict — efficiency and
+trust do not compete.
+
+Tests: `tests/test_replication_ledger.py` (selection + bookkeeping),
+`tests/test_replication_memory.py`, `tests/test_replication_engine.py`,
+`tests/test_replication.py` (live node wiring, zero-LLM path), plus the
+dedup composition pinned in `tests/test_hypothesis_dedup.py`.

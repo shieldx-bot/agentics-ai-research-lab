@@ -1,7 +1,7 @@
 """P24 — independent replication through the live verify node.
 
 A researcher cycle with NOTHING new to verify still re-runs someone else's
-settled claim from its stored protocol (P23 source, P23 replay engine) in its
+settled claim from its stored protocol (P24 selector -> P24bis engine) in its
 own workspace: one agent's verdict is not knowledge — an independent re-run
 is. Fake LLM, real SharedMemory, real protocol execution; no network, no git.
 """
@@ -29,7 +29,7 @@ PASS_PROTOCOL = (
     "print('AGENTICS_RESULT:', json.dumps({'precision': correct / 200}))\n"
 )
 FAIL_PROTOCOL = PASS_PROTOCOL.replace("(i * 7) % 10 < 9", "(i * 7) % 10 < 4")
-CRASH_PROTOCOL = "import sys\nprint('boom')\nsys.exit(3)\n"
+NO_MARKER_PROTOCOL = "import sys\nprint('boom')\nsys.exit(3)\n"
 
 
 class FakeLLM:
@@ -111,14 +111,17 @@ def test_independent_replication_confirms(mem, tmp_path):
     out = asyncio.run(nodes.node_verify(ctx, _state()))
 
     assert "P24 replicated 1 claim(s) [confirmed:1]" in out["summary"]
-    assert out["verifications"][0]["replication"] is True
+    v = out["verifications"][0]
+    assert v["replication"] is True and v["claim"] != ""
+    assert v["hypothesis_id"] == hyp
     row = mem.get_hypothesis(hyp)
     assert row["replication"] == "confirmed" and row["replication_attempts"] == 1
-    assert row["status"] == "supported" and row["evidence_id"]  # stays settled
-    replays = [e for e in mem.latest_evidence() if e["method"] == "replay"]
-    assert len(replays) == 1 and replays[0]["hypothesis_id"] == hyp
-    events = _events(mem)
-    assert "claim_reconfirmed" in events and "hypothesis_replicated" in events
+    assert row["status"] == "supported"                    # stays settled
+    peers = [e for e in mem.latest_evidence() if e["method"] == "replication"]
+    assert len(peers) == 1 and peers[0]["hypothesis_id"] == hyp
+    detail = mem.replication_for_evidence(row["evidence_id"])
+    assert detail and detail["replicator"] == "a02"
+    assert "replication_confirmed" in _events(mem)
 
 
 def test_second_cycle_never_re_replicates(mem, tmp_path):
@@ -129,7 +132,7 @@ def test_second_cycle_never_re_replicates(mem, tmp_path):
     assert out["verifications"] == []
     assert out["summary"] == "verification skipped (no finding or no LLM)"
     assert sum(1 for e in mem.latest_evidence()
-               if e["method"] == "replay") == 1
+               if e["method"] == "replication") == 1
 
 
 def test_refuted_replication_closes_the_ledger(mem, tmp_path):
@@ -146,31 +149,47 @@ def test_refuted_replication_closes_the_ledger(mem, tmp_path):
     knowledge = {k["id"]: k for k in mem.verified_knowledge()}
     assert knowledge[hyp]["status"] == "refuted"
     events = _events(mem)
-    assert "claim_falsified" in events
-    assert "hypothesis_replication_refuted" in events
+    assert "replication_refuted" in events
 
 
-def test_unmeasured_replay_settles_inconclusive(mem, tmp_path):
-    """A protocol that RUNS but measures nothing: the P23 engine re-settles
-    the claim to inconclusive (claim_unstable) — it leaves verified_knowledge
-    and a fresh agent re-verifies it from scratch later."""
+def test_unmeasured_replication_never_overturns(mem, tmp_path):
+    """A protocol that runs but measures nothing: the engine only annotates
+    (replication_inconclusive) — it NEVER refutes. The 2-attempt retry budget
+    keeps the claim available for ANOTHER peer (the same peer cannot retry:
+    the provenance UNIQUE is per (evidence, replicator)); once the budget is
+    spent the ledger gives up on it."""
     hyp = _seed_supported(mem, "a01", "the method reaches >=0.9 precision",
-                          protocol=CRASH_PROTOCOL)   # exit 3, no marker
+                          protocol=NO_MARKER_PROTOCOL)
     ctx = _ctx(mem, tmp_path, agent_id="a02")
-    out = asyncio.run(nodes.node_verify(ctx, _state()))
-    assert "inconclusive:1" in out["summary"]
+    out1 = asyncio.run(nodes.node_verify(ctx, _state()))
+    assert "inconclusive:1" in out1["summary"]
     row = mem.get_hypothesis(hyp)
-    assert row["status"] == "inconclusive" and row["replication"] == "inconclusive"
-    assert "claim_unstable" in _events(mem)
-    # an inconclusive claim is no longer 'supported' — never re-picked
-    out2 = asyncio.run(nodes.node_verify(ctx, _state()))
-    assert out2["verifications"] == []
+    assert row["status"] == "supported"                    # never overturned
+    assert row["replication"] == "inconclusive" and row["replication_attempts"] == 1
+    assert "replication_inconclusive" in _events(mem)
+
+    # the SAME peer cannot retry (provenance UNIQUE) — attempts stay 1
+    asyncio.run(nodes.node_verify(ctx, _state()))
+    assert mem.get_hypothesis(hyp)["replication_attempts"] == 1
+
+    # a DIFFERENT peer legitimately takes the second attempt
+    ctx3 = _ctx(mem, tmp_path, agent_id="a03")
+    out3 = asyncio.run(nodes.node_verify(ctx3, _state()))
+    assert "inconclusive:1" in out3["summary"]
+    assert mem.get_hypothesis(hyp)["replication_attempts"] == 2
+
+    # budget spent — the ledger stops offering the claim
+    ctx4 = _ctx(mem, tmp_path, agent_id="a04")
+    out4 = asyncio.run(nodes.node_verify(ctx4, _state()))
+    assert out4["verifications"] == []
+    assert mem.get_hypothesis(hyp)["replication_attempts"] == 2
+    assert mem.get_hypothesis(hyp)["status"] == "supported"
 
 
-def test_crashed_replay_stays_supported_with_retry_budget(mem, tmp_path):
-    """A replay the WORKSPACE cannot even execute (runner crash): the engine
-    declines (replayed=False), the claim stays supported and the ledger's
-    2-attempt retry budget gives it two more chances before giving up."""
+def test_crashed_workspace_replay_is_inconclusive(mem, tmp_path):
+    """A workspace that cannot even execute the protocol: the engine declines
+    (runner error, no verdict) — the WIRING marks the attempt inconclusive so
+    the retry budget advances; the claim stays supported."""
     hyp = _seed_supported(mem, "a01", "the method reaches >=0.9 precision")
     ctx = _ctx(mem, tmp_path, agent_id="a02")
 
@@ -179,19 +198,12 @@ def test_crashed_replay_stays_supported_with_retry_budget(mem, tmp_path):
             raise RuntimeError("process group exploded")
 
     ctx.workspace = BrokenWS(tmp_path / "ws-broken")
-    out1 = asyncio.run(nodes.node_verify(ctx, _state()))
-    assert "inconclusive:1" in out1["summary"]
-    assert mem.get_hypothesis(hyp)["status"] == "supported"    # never overturned
-    assert mem.get_hypothesis(hyp)["replication_attempts"] == 1
-
-    out2 = asyncio.run(nodes.node_verify(ctx, _state()))       # retry #2
-    assert "inconclusive:1" in out2["summary"]
-    assert mem.get_hypothesis(hyp)["replication_attempts"] == 2
-
-    out3 = asyncio.run(nodes.node_verify(ctx, _state()))       # budget spent
-    assert out3["verifications"] == []
-    assert mem.get_hypothesis(hyp)["replication_attempts"] == 2
-    assert mem.get_hypothesis(hyp)["status"] == "supported"
+    out = asyncio.run(nodes.node_verify(ctx, _state()))
+    assert "inconclusive:1" in out["summary"]
+    row = mem.get_hypothesis(hyp)
+    assert row["status"] == "supported"
+    assert row["replication"] == "inconclusive"
+    assert row["replication_attempts"] == 1                # budget advanced
 
 
 def test_author_cannot_self_replicate(mem, tmp_path):
@@ -200,7 +212,7 @@ def test_author_cannot_self_replicate(mem, tmp_path):
     out = asyncio.run(nodes.node_verify(ctx, _state()))
     assert out["verifications"] == []
     assert sum(1 for e in mem.latest_evidence()
-               if e["method"] == "replay") == 0
+               if e["method"] == "replication") == 0
 
 
 def test_replication_composes_with_a_fresh_finding(mem, tmp_path):
@@ -223,7 +235,7 @@ def test_replication_composes_with_a_fresh_finding(mem, tmp_path):
 
     ctx = _ctx(mem, tmp_path, agent_id="a02", llm=PlanLLM())
     out = asyncio.run(nodes.node_verify(ctx, _state(
-        finding_text="Finding: ensembles reach ~0.95 precision...")))
+        finding_text="Finding: ensembles reach ~0.9 precision...")))
     assert "P24 replicated 1 claim(s)" in out["summary"]
     assert len(out["verifications"]) == 2
     assert out["verifications"][0]["replication"] is True

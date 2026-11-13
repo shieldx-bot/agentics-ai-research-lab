@@ -120,12 +120,13 @@ def test_second_cycle_reuses_the_settled_verdict(tmp_path, monkeypatch):
     assert repl["replication"] is True and repl["status"] == "confirmed"
     assert repl["evidence_id"] != rows[0]["id"]        # the replica's own row
     assert v["reused"] is True and v["status"] == "supported"
-    # after the P23 replay the claim's evidence pointer moved to the LATEST
-    # measurement (the independent replica's row) — reuse points there
-    assert v["evidence_id"] == repl["evidence_id"]
+    # the confirmed replication only ANNOTATES (P17 asymmetry): the claim's
+    # evidence pointer stays at the author's original row, and reuse points
+    # there too
+    assert v["evidence_id"] == rows[0]["id"]
     events = [j["event"] for j in mem.recent_journal(limit=15)]
     assert "hypothesis_reused" in events
-    assert "hypothesis_replicated" in events and "claim_reconfirmed" in events
+    assert "replication_confirmed" in events
 
 
 def test_a_genuinely_new_claim_still_runs(tmp_path, monkeypatch):
