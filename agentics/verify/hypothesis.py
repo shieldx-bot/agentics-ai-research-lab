@@ -78,7 +78,24 @@ class Hypothesis:
 
     @property
     def result_path(self) -> str:
-        return f"{RESULT_DIR}/{self.hypothesis_id}.json"
+        """Where the protocol may write its measured value (RESULT-FILE
+        convention: {"value": <number>}); the runner falls back to it when
+        the script prints no AGENTICS_RESULT marker."""
+        return f"{EXPERIMENT_DIR}/results/{self.hypothesis_id}.json"
+
+    # Flat aliases over the criterion — the plan contract (node_plan) speaks
+    # {metric, comparison, threshold}; the criterion keeps the canonical form.
+    @property
+    def metric(self) -> str:
+        return self.criterion.metric
+
+    @property
+    def comparison(self) -> str:
+        return self.criterion.op
+
+    @property
+    def threshold(self) -> float:
+        return self.criterion.target
 
     def to_json(self) -> str:
         return json.dumps(
@@ -98,6 +115,17 @@ class Hypothesis:
 def slugify(text: str, fallback: str = "hypothesis") -> str:
     slug = SLUG_RE.sub("-", (text or "").lower()).strip("-")[:40]
     return slug or fallback
+
+
+def claim_hash(claim: str) -> str:
+    """Stable identity of a claim (case/whitespace-insensitive).
+
+    The dedup key that lets the swarm recognize an already-settled hypothesis
+    however it is reworded: a supported or refuted claim is NOT re-run by the
+    next agent that meets it — the first verdict IS the shared verdict (H3:
+    never burn cycles re-verifying settled work)."""
+    normalized = " ".join((claim or "").lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def stable_id(claim: str, seed: str = "") -> str:
@@ -143,14 +171,15 @@ def parse_hypothesis(raw: object) -> tuple[Hypothesis | None, str]:
     # Criterion.from_dict — one vocabulary, one adjudicator.
     crit_raw = raw.get("criterion")
     if not isinstance(crit_raw, dict):
-        if raw.get("metric") is None:
-            return None, ("missing criterion object {metric, op, target} "
-                          "(or flat metric/comparison/threshold keys)")
-        crit_raw = {
-            "metric": raw.get("metric"),
-            "op": raw.get("comparison", ">="),
-            "target": raw.get("threshold"),
-        }
+        # Flat plan-declared shape (node_plan's contract): {metric, comparison,
+        # threshold} — the same criterion in a flatter coat; accept both so
+        # prompt and validator cannot drift apart.
+        if "metric" in raw and "comparison" in raw:
+            crit_raw = {"metric": raw.get("metric"), "op": raw.get("comparison"),
+                        "target": raw.get("threshold")}
+        else:
+            return None, "missing criterion object {metric, op, target}"
+
     try:
         criterion = Criterion.from_dict(crit_raw)
     except ValueError as exc:
@@ -192,6 +221,7 @@ __all__ = [
     "HYPOTHESIS_PROMPT_CONTRACT",
     "Hypothesis",
     "PROTOCOL_CONTRACT",
+    "claim_hash",
     "hypothesis_from_json",
     "parse_hypothesis",
     "slugify",

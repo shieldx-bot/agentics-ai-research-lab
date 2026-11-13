@@ -11,6 +11,7 @@ after cycle until the owner writes the STOP file.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from langgraph.graph import END, StateGraph
@@ -119,8 +120,79 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     return g
 
 
+def _node_digest(node: str, out: dict) -> str:
+    """One line the owner can read: what did this node just do?"""
+    task = out.get("issue_number")
+    head = f"#{task} " if task else ""
+    if node == "claim":
+        return f"{head}claimed '{out.get('issue_title', '')}'"[:200]
+    if node == "research":
+        return f"{head}researched '{out.get('issue_title', '')[:80]}'"[:200]
+    if node == "plan":
+        return f"{head}planned: {out.get('summary', '')[:140]}"
+    if node == "implement":
+        if out.get("yield_reason"):
+            return f"{head}yielded: {out['yield_reason'][:120]}"
+        if out.get("error"):
+            return f"{head}implement failed: {out['error'][:120]}"
+        return f"{head}implemented {len(out.get('changed_files', []))} file(s)"[:200]
+    if node == "open_pr":
+        return f"{head}opened MR !{out.get('pr_number')}"
+    if node == "review":
+        return f"reviewed !{out.get('pr_number', '')}: {out.get('review_verdict', '')}"[:200]
+    if node == "integrate":
+        return f"merged {out.get('summary', '')}"[:200]
+    if out.get("error"):
+        return f"{head}error: {out['error'][:140]}"
+    if out.get("summary"):
+        return f"{head}{out['summary'][:140]}"
+    return head + (out.get("action") or "done")
+
+
+def _node_payload(node: str, out: dict) -> dict:
+    """Structured fields for the journal row (dashboards filter on these)."""
+    payload: dict = {"node": node, "action": out.get("action", "")}
+    for key in ("issue_number", "pr_number", "yield_reason",
+                "experiment_verdict", "mechanical_review", "review_verdict"):
+        if out.get(key):
+            payload[key] = out[key]
+    if out.get("error"):
+        payload["error"] = out["error"][:400]
+    return payload
+
+
 async def run_cycle(ctx: AgentContext) -> ResearchState:
+    """Run one graph cycle, streaming node completions into the shared journal
+    (what/why each node just did) — `agentics watch` and the dashboard read
+    that feed, so the swarm is never a blackbox. Streaming must never break
+    a cycle: journal failures are swallowed (observability, not control flow).
+    """
     graph = build_research_graph(ctx).compile()
+    final: dict = {}
     # LangGraph runs synchronous I/O nodes in its executor and awaits async
     # LLM/research nodes on the graph event loop.
-    return await graph.ainvoke({})
+    async for chunk in graph.astream({}):
+        for node_name, update in chunk.items():
+            if not isinstance(update, dict):
+                continue
+            for key, value in update.items():
+                if key in ("papers", "citations") and isinstance(value, list):
+                    merged, seen = [], set()
+                    for item in [*final.get(key, []), *value]:
+                        k = json.dumps(item, sort_keys=True, ensure_ascii=False,
+                                       default=str) if not isinstance(item, str) else item
+                        if k not in seen:
+                            seen.add(k)
+                            merged.append(item)
+                    final[key] = merged
+                else:
+                    final[key] = value
+            try:
+                ctx.memory.journal(
+                    ctx.agent_id, "node",
+                    {"digest": _node_digest(node_name, final),
+                     **_node_payload(node_name, final)},
+                )
+            except Exception as exc:  # noqa: BLE001 — observability, not control flow
+                log.debug("could not journal node %s: %s", node_name, exc)
+    return final

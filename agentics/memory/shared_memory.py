@@ -209,6 +209,10 @@ CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
 _JOURNAL_TRIM_EVERY = 500
 _JOURNAL_KEEP_ROWS = 5000
 
+# Evidence rows (P16 records wired in for hypothesis 3) self-trim the same way.
+_EVIDENCE_TRIM_EVERY = 500
+_EVIDENCE_KEEP_ROWS = 2000
+
 
 @dataclass
 class Claim:
@@ -230,6 +234,7 @@ class SharedMemory:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._journal_inserts = 0      # drives the periodic journal trim
+        self._evidence_inserts = 0     # drives the periodic evidence trim
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
             for column in (
@@ -242,6 +247,8 @@ class SharedMemory:
                 "ALTER TABLE evidence ADD COLUMN hypothesis_id INTEGER",
                 "ALTER TABLE evidence ADD COLUMN metrics TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE evidence ADD COLUMN runs TEXT NOT NULL DEFAULT '[]'",
+                # P16bis dedup: normalized claim identity for reuse across agents
+                "ALTER TABLE hypotheses ADD COLUMN claim_hash TEXT DEFAULT ''",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -316,6 +323,13 @@ class SharedMemory:
                  float(duration_s), artifact[:300]),
             )
             ev_id = int(cur.lastrowid or 0)
+            self._evidence_inserts += 1
+            if self._evidence_inserts % _EVIDENCE_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM evidence WHERE id NOT IN "
+                    "(SELECT id FROM evidence ORDER BY id DESC LIMIT ?)",
+                    (_EVIDENCE_KEEP_ROWS,),
+                )
         if broadcast:
             self.post_message(
                 agent, "evidence",
@@ -364,15 +378,33 @@ class SharedMemory:
             ).fetchall()
         return [self._evidence_row(r) for r in rows]
 
-    def latest_evidence(self, limit: int = 30) -> list[dict]:
+    def latest_evidence(self, limit: int = 30, agent: str | None = None) -> list[dict]:
         """Newest evidence across every agent — the shared verdict feed
-        (newest first: the dashboard and agents care about the latest)."""
+        (newest first: the dashboard and agents care about the latest).
+        ``agent`` narrows the feed to one agent's recorded runs."""
+        sql = f"SELECT {self._EVIDENCE_COLS} FROM evidence"
+        args: list = []
+        if agent:
+            sql += " WHERE agent=?"
+            args.append(agent)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
-                "ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            rows = self._conn.execute(sql, args).fetchall()
         return [self._evidence_row(r) for r in rows]
+
+    def evidence_stats(self) -> dict:
+        """Confirmed/refuted/inconclusive counts — how sound is the lab's
+        evidence base? Dashboard health metric, cheap enough for every poll."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(verdict='confirmed'),0), "
+                "COALESCE(SUM(verdict='refuted'),0), "
+                "COALESCE(SUM(verdict='inconclusive'),0) FROM evidence"
+            ).fetchone()
+        return {"total": row[0], "confirmed": row[1],
+                "refuted": row[2], "inconclusive": row[3]}
 
     def evidence_search(self, term: str, limit: int = 30) -> list[dict]:
         """Cross-agent lookup: prior verdicts mentioning a term (hypothesis,
@@ -405,16 +437,44 @@ class SharedMemory:
 
         `criterion` is the structured acceptance test {"metric", "op",
         "target"[, "tolerance"]} — the machine verdict compares the measured
-        number against it, so the goalposts cannot move after the run."""
+        number against it, so the goalposts cannot move after the run.
+        The claim's normalized hash is stored so the next agent meeting the
+        same claim can reuse the settled verdict instead of re-running (H3)."""
+        from agentics.verify.hypothesis import claim_hash as _chash
+
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
-                "criterion, protocol_path, status) VALUES (?,?,?,?,?,?,?,?)",
+                "criterion, protocol_path, status, claim_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, task_id, finding_id, claim[:500],
                  json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
-                 status),
+                 status, _chash(claim)),
             )
             return int(cur.lastrowid or 0)
+
+    def settled_hypothesis_for_claim(self, claim: str) -> dict | None:
+        """The swarm's SETTLED verdict for this claim, if anyone already ran it.
+
+        Matches by normalized claim hash (case/whitespace-insensitive), so a
+        reworded duplicate still resolves to the first verdict. Only
+        supported/refuted hypotheses count as settled — inconclusive ones
+        deserve a fresh run. None means: nobody settled it, go verify."""
+        from agentics.verify.hypothesis import claim_hash as _chash
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, claim, status, verdict_note, evidence_id, agent, "
+                "task_id, criterion FROM hypotheses "
+                "WHERE claim_hash=? AND status IN ('supported','refuted') "
+                "ORDER BY id DESC LIMIT 1",
+                (_chash(claim),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "claim": row[1], "status": row[2],
+                "verdict_note": row[3], "evidence_id": row[4], "agent": row[5],
+                "task_id": row[6], "criterion": json.loads(row[7] or "{}")}
 
     def update_hypothesis(
         self, hyp_id: int, status: str, evidence_id: int | None = None,

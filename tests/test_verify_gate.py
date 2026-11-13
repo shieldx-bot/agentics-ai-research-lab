@@ -3,9 +3,9 @@
 Covers the seam between the LLM's plan text and the exit-code verdicts:
 `normalize_verify_cmds` (plan text -> safe argv, active interpreter only)
 and the production flow node_implement uses (normalize -> run_experiments
--> record_evidence), proven against a real RepoWorkspace. Without the
-normalizer, run_experiments wraps the plan's string as "/bin/sh -c", the
-guard rejects it (exit 126) and EVERY check would sit at "inconclusive".
+-> record_evidence), proven against a real RepoWorkspace. verify_ops itself
+coerces raw strings via coerce_cmd (same interpreter, no shells), so even a
+raw plan string runs instead of rotting at eternal 'inconclusive'.
 """
 
 import sys
@@ -82,19 +82,25 @@ def test_plan_string_reaches_confirmed_through_the_production_flow(lab):
     assert row["verdict"] == "confirmed"
 
 
-def test_raw_plan_string_without_normalizer_would_be_blocked(lab):
-    """Command handling, documented post-merge (reconciliation with main's
-    verify_ops): a raw string is argv-PARSED by ``coerce_cmd`` — a shell is
-    NEVER involved, so the declared check really runs instead of being
-    silently refused. The plan-time normalizer (normalize_verify_cmds) still
-    matters: it makes declared commands explicit argv lists and keeps
-    non-runnable strings (typos, shell syntax) from ever reaching the guard —
-    see the coercion and guard tests in test_prod_fixes.py."""
+def test_raw_plan_string_is_coerced_and_runs(lab):
+    """Contract evolution (5f2105c): verify_ops.coerce_cmd parses raw plan
+    strings into the allowlisted argv (active interpreter, no shells), so a
+    declared check can no longer rot at eternal 'inconclusive' — the string
+    runs and the verdict comes from the REAL exit code."""
     ws, mem = lab
     (ws.path / "check_ok.py").write_text("print(40 + 2)\n", encoding="utf-8")
     evs = run_experiments(ws, ["python check_ok.py"], timeout=240)
     assert evs[0].exit_code == 0 and evs[0].verdict == "confirmed"
-    assert "42" in evs[0].output
+    assert evs[0].cmd.startswith(sys.executable)   # coerced, not /bin/sh
+
+
+def test_non_python_string_command_is_rejected_without_running(lab):
+    """The allowlist still holds: anything that is not python/pytest is
+    refused (126 -> inconclusive) — never executed."""
+    ws, mem = lab
+    (ws.path / "check_ok.py").write_text("print(40 + 2)\n", encoding="utf-8")
+    evs = run_experiments(ws, ["rm -rf ."], timeout=240)
+    assert evs[0].exit_code == 126 and evs[0].verdict == "inconclusive"
 
 
 def test_refuted_check_is_recorded_for_everyone_to_see(lab):

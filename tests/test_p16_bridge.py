@@ -35,11 +35,12 @@ _VALID_RAW = {
     "metric": "hit_rate",
     "comparison": ">=",
     "threshold": 0.5,
+    # run_protocol contract: the protocol PRINTS its measurement as one final
+    # AGENTICS_RESULT line (deterministic — the runner runs it twice and
+    # non-reproducible output is inconclusive, never silently accepted).
     "code": (
-        "import json, pathlib\n"
-        "pathlib.Path('research_notes/experiments/results').mkdir(parents=True, exist_ok=True)\n"
-        "pathlib.Path('research_notes/experiments/results/cache-hit-rate.json')"
-        ".write_text(json.dumps({'value': 0.72}))\n"
+        "import json\n"
+        "print('AGENTICS_RESULT: ' + json.dumps({'hit_rate': 0.72}))\n"
     ),
 }
 
@@ -125,8 +126,11 @@ def test_confirmed_hypothesis_reaches_the_shared_ledger(tmp_path):
     assert row["verdict"] == "confirmed"
     assert row["method"] == "hypothesis_contract"
     assert "cache-hit-rate.py" in row["cmd"] and "hit_rate" in row["cmd"]
-    assert row["artifact"].endswith("cache-hit-rate.json")
+    # artifact = the protocol script itself (re-runnable by any other agent)
+    assert row["artifact"].endswith("cache-hit-rate.py")
     assert "hit_rate=0.72" in row["output"]
+    assert row["metrics"] == {"hit_rate": 0.72}      # attach_protocol_outcome
+    assert len(row["runs"]) == 2                     # reproducibility: 2 runs
     assert any(m["kind"] == "evidence" for m in mem.recent_messages())
 
 
@@ -154,6 +158,8 @@ def test_refuted_hypothesis_blocks_the_push(tmp_path):
     assert not ws.pushed
     assert "REFUTED" in state.get("yield_reason", "")
     assert mem.evidence_for_task(1)[0]["verdict"] == "refuted"
+    assert mem.get_hypothesis(
+        mem.list_hypotheses()[0]["id"])["status"] == "refuted"
 
 
 def test_malformed_hypothesis_is_journaled_never_guessed(tmp_path):
@@ -164,12 +170,15 @@ def test_malformed_hypothesis_is_journaled_never_guessed(tmp_path):
         _impl_ctx(mem, ws), _impl_state(hypotheses=[raw])))
     assert ws.pushed                                   # cycle survives
     assert mem.latest_evidence() == []                 # nothing recorded as evidence
+    assert mem.list_hypotheses() == []                 # never pre-registered either
     assert any(j["event"] == "p16_hypothesis_invalid"
                for j in mem.recent_journal(limit=10))
 
 
 def test_missing_result_json_is_inconclusive_not_refuted(tmp_path):
-    """A script that forgets to write its result cannot fake or fail the claim."""
+    """A protocol that prints no AGENTICS_RESULT line cannot fake or fail the
+    claim — a missing measurement is recorded as inconclusive, never as
+    success."""
     mem = SharedMemory(tmp_path / "m.db")
     ws = BridgeWorkspace(tmp_path)
     raw = dict(_VALID_RAW, code="print('measured nothing')\n")
@@ -193,3 +202,15 @@ def test_verify_cmds_and_hypotheses_coexist(tmp_path):
     methods = {r["method"] for r in mem.evidence_for_task(1)}
     assert methods == {"run_command", "hypothesis_contract"}
     assert "P16" in state["verification"]
+
+
+def test_protocol_file_joins_the_mr_record(tmp_path):
+    """The pushed branch carries the protocol file (git add -A); the MR record
+    must list it too, or the reviewer sees a file in the diff that the record
+    does not explain — the protocol IS the evidence's source code."""
+    mem = SharedMemory(tmp_path / "m.db")
+    ws = BridgeWorkspace(tmp_path)
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws), _impl_state(hypotheses=[_VALID_RAW])))
+    assert ws.pushed
+    assert "research_notes/experiments/cache-hit-rate.py" in state["changed_files"]

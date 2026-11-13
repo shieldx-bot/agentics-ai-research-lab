@@ -33,7 +33,9 @@ from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
-from agentics.verify_ops import run_experiments, summarize
+from agentics.verify_ops import (
+    cmds_from_evidence, run_experiments, summarize, verdict_for,
+)
 
 log = logging.getLogger("graph.nodes")
 
@@ -44,6 +46,7 @@ STOP_YIELD = "yield"
 def _memory_context(ctx: AgentContext) -> dict:
     msgs = ctx.memory.recent_messages(limit=15)
     findings = ctx.memory.list_findings(limit=10)
+    evs = ctx.memory.latest_evidence(limit=6)
     return {
         "messages": "\n".join(
             f"- [{m['agent']}|{m['kind']}] {m['content'][:200]}" for m in msgs
@@ -468,6 +471,25 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             results.append({"claim": claim, "status": "inconclusive",
                             "note": malformed or "malformed hypothesis spec"})
             continue
+        # H3 dedup — the swarm never re-runs a SETTLED claim: whichever agent
+        # meets the same hypothesis later inherits the first verdict instead of
+        # burning two protocol runs on it (verified_knowledge keeps the claim
+        # reusable; this gate keeps the ledger free of duplicate evidence).
+        prior = await asyncio.to_thread(
+            ctx.memory.settled_hypothesis_for_claim, claim)
+        if prior is not None:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_reused",
+                {"claim": claim[:160], "settled_by": prior["id"],
+                 "status": prior["status"], "evidence": prior["evidence_id"],
+                 "why": "claim already settled — reused, not re-run"})
+            results.append({"claim": claim, "status": prior["status"],
+                            "note": (f"reused settled verdict of h#{prior['id']} "
+                                     f"(by {prior['agent']}): "
+                                     f"{prior['verdict_note'][:120]}"),
+                            "reused": True, "hypothesis_id": prior["id"],
+                            "evidence_id": prior["evidence_id"]})
+            continue
         hyp_id = await asyncio.to_thread(
             ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
             task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
@@ -567,15 +589,17 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         '"hypotheses": [{"hypothesis_id": "slug", "claim": "one testable claim", '
         '"prediction": "what the measurement will show", '
         '"metric": "snake_case_metric", "comparison": ">|>=|<|<=|==", '
-        '"threshold": 0.5, "code": "<FULL python source: writes '
-        'json.dumps({\\"value\\": <number>}) to '
-        'research_notes/experiments/results/<hypothesis_id>.json>"}]} '
+        '"threshold": 0.5, "code": "<FULL python source: computes the metric, '
+        'then prints EXACTLY one final line AGENTICS_RESULT: '
+        '{\\"<metric>\\": <number>} (standard library only, deterministic, '
+        'no network)>"}]} '
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
         "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
         "is how your idea gets VERIFIED by running real code instead of an LLM's "
         "opinion — declare at least one check for a code task. 'hypotheses' "
-        "(optional, max 2) makes the claim MEASURABLE: the runner re-judges the "
-        "criterion from the result JSON, a lying script cannot pass.)"
+        "(optional, max 2) makes the claim MEASURABLE: the criterion is "
+        "pre-registered, the protocol runs twice and the runner re-adjudicates "
+        "the measurement — a lying script cannot pass.)"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
@@ -835,12 +859,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 "cmds": [e.cmd[:120] for e in inconclusive][:5]})
 
     # P16 (hypothesis contract) — the richer experiment form: the plan may
-    # declare MEASURABLE hypotheses (metric + threshold + experiment code).
-    # The measurement is judged by the shared machine adjudicator
-    # (verify_metrics.adjudicate), so a lying script cannot claim success.
-    # Every verdict lands in the same shared evidence table (H3) the
-    # reviewer, dashboard and CLI read, and settles the pre-registered
-    # hypothesis with the evidence row id (H2/H3 loop closed).
+    # declare MEASURABLE hypotheses (metric + threshold + protocol code).
+    # The register -> run -> settle composition (agentics/verify.experiment)
+    # pre-registers the claim with a frozen criterion, runs the protocol
+    # through verify_metrics.run_protocol (2 runs, reproducibility gate), and
+    # the verdict is re-adjudicated from the MEASUREMENT — a lying script
+    # cannot claim success. Every verdict lands in the shared evidence table
+    # (H3) the reviewer, dashboard and CLI read.
     hyp_raws = state.get("hypotheses") or []
     if hyp_raws:
         from agentics.verify.experiment import (
@@ -855,31 +880,62 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 ctx.memory.journal(ctx.agent_id, "p16_hypothesis_invalid",
                                    {"task": hyp_task, "reason": reason[:200]})
                 continue
-            # the plan's hypothesis payload does not know the task id — the
-            # state does; stamp it so the evidence settles onto the task
-            if hyp.task is None and hyp_task is not None:
-                hyp.task = int(hyp_task)
-            # pre-registration: the hypothesis enters the settlement table
-            # BEFORE the run, acceptance criterion frozen — the goalposts
-            # cannot move after the measurement is in.
+            # a plan-declared hypothesis belongs to THIS task — the proposal
+            # may omit the binding, the cycle supplies it (evidence rows must
+            # be findable per task by the reviewer / dashboard / CLI)
+            if hyp.task is None:
+                hyp.task = hyp_task
+            # H3 dedup: a claim the swarm already settled is inherited, not
+            # re-run. A supported claim must not cost two more protocol runs;
+            # a refuted claim must not sneak past the push gate by rerunning it.
+            prior = await asyncio.to_thread(
+                ctx.memory.settled_hypothesis_for_claim, hyp.claim)
+            if prior is not None:
+                ctx.memory.journal(ctx.agent_id, "hypothesis_reused", {
+                    "task": hyp_task, "claim": hyp.claim[:160],
+                    "settled_by": prior["id"], "status": prior["status"],
+                    "evidence": prior["evidence_id"],
+                })
+                if prior["status"] == "refuted":
+                    return await _yield(
+                        ctx, state,
+                        f"P16 hypothesis '{hyp.hypothesis_id}' is ALREADY REFUTED "
+                        f"by the swarm (h#{prior['id']}, evidence "
+                        f"#{prior['evidence_id']}) — do not re-assert a refuted "
+                        "claim; fix the code or re-plan",
+                    )
+                continue            # supported: reuse the verdict, proceed to push
+            # pre-registration (broadcast) -> protocol run -> settlement with
+            # evidence_id; supported claims become verified_knowledge, refuted
+            # ones stop being repeated by the swarm.
             hyp_id = await asyncio.to_thread(
                 register_hypothesis, ctx.memory, ctx.agent_id, hyp)
-            evidence = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
-            ev_id = await asyncio.to_thread(
-                settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, evidence)
-            note = (evidence.meta or {}).get("note", "") or evidence.output[:300]
-            # settlement: supported claims become reusable common ground,
-            # refuted claims stop being repeated (verified_knowledge -> prompts)
-            if evidence.verdict == "refuted":
+            ev = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
+            await asyncio.to_thread(
+                settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
+                method="hypothesis_contract")
+            # the protocol file rides the branch — the MR record must list it,
+            # or the reviewer sees a diff file the record does not explain
+            # (the protocol IS the evidence's source code)
+            state["changed_files"] = sorted(
+                set(state.get("changed_files") or []) | {hyp.script_path})
+            note = (ev.meta.get("note") or ev.output[:160]) if ev.meta else ev.output[:160]
+            # the verdict rides the MR body too: the reviewer and the owner
+            # see it in the verification line, not only in the evidence table
+            state["verification"] = (
+                f"{state.get('verification', '')} | "
+                f"P16 {hyp.hypothesis_id}: {ev.verdict} ({note[:120]})"
+            )[:500]
+            if ev.verdict == "refuted":
                 return await _yield(
                     ctx, state,
                     f"P16 hypothesis '{hyp.hypothesis_id}' REFUTED by measurement: "
                     f"{note} — the idea did not hold; fix the code or re-plan",
                 )
-            if evidence.verdict == "inconclusive":
+            if ev.verdict == "inconclusive":
                 ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
                     "task": hyp_task, "hypothesis": hyp.hypothesis_id,
-                    "evidence": ev_id, "reason": note[:200]})
+                    "reason": note[:200]})
 
     try:
         pushed = await asyncio.to_thread(
@@ -1040,6 +1096,44 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # evidence), so the verdict weighs measurements, not just author claims.
     ev_rows = ctx.memory.evidence_for_task(candidate.get("task_id"))
 
+    # P16 / hypothesis 1: the reviewer RE-RUNS the author's declared checks in
+    # their OWN workspace against the MR branch — a real reviewer runs the
+    # paper's code instead of trusting the recorded output. Re-runs are
+    # recorded as evidence with method="reviewer_rerun" (hypothesis 3).
+    rerun_digest = rerun_note = ""
+    rerun_refuted = False
+    rerun_rows = cmds_from_evidence(ev_rows, max_cmds=3, exclude_agent=ctx.agent_id)
+    rerun_ws = getattr(ctx, "workspace", None)
+    if rerun_rows and candidate.get("branch") and hasattr(rerun_ws, "run_checks_on_branch"):
+        try:
+            reruns = await asyncio.to_thread(
+                rerun_ws.run_checks_on_branch, candidate["branch"],
+                [argv for _, argv, _ in rerun_rows], 300)
+            rerun_counts: dict[str, int] = {}
+            for (cmd_str, _argv, hypothesis), (argv, code, out, secs) in zip(rerun_rows, reruns):
+                ev_verdict = verdict_for(code)
+                rerun_counts[ev_verdict] = rerun_counts.get(ev_verdict, 0) + 1
+                rerun_refuted = rerun_refuted or ev_verdict == "refuted"
+                await asyncio.to_thread(
+                    ctx.memory.record_evidence, ctx.agent_id, candidate.get("task_id"),
+                    cmd_str, code, ev_verdict,
+                    hypothesis=hypothesis or candidate.get("title", ""),
+                    method="reviewer_rerun", output=out, duration_s=secs)
+            rerun_note = (f"[P16 reviewer re-ran {len(reruns)} check(s) on branch "
+                          f"{candidate['branch']}: {rerun_counts}]")
+        except Exception as exc:  # noqa: BLE001 — a re-run failure must never kill the review
+            rerun_note = f"[P16 reviewer re-run unavailable: {exc}]"
+            try:
+                await asyncio.to_thread(
+                    ctx.memory.record_evidence, ctx.agent_id,
+                    candidate.get("task_id"), "reviewer re-run", 128,
+                    "inconclusive",
+                    hypothesis=candidate.get("title", ""),
+                    method="reviewer_rerun", output=str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+    rerun_digest = rerun_note
+
     # P10 layers 3+4: protected paths never reach main via any MR — rejected
     # here, before the LLM is even asked.
     guard = getattr(getattr(ctx, "local", None), "guard", None)
@@ -1052,36 +1146,73 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         comment = (f"P10 protected paths in diff (branch re-scan): {violations[:5]} "
                    "— cannot be approved (owner-only code)")
     else:
-        files_desc = "\n".join(f"- {f}" for f in diff_files[:30])
-        ev_desc = ""
-        if ev_rows:
-            ev_lines = [
-                f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
-                f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
-                for e in ev_rows[-6:]
-            ]
-            ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
-                       + "\n".join(ev_lines))
-        prompt = (
-            f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
-            f"Files:\n{files_desc}\n\n"
-            f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
-            f"{ev_desc}\n\n"
-            'Reply ONLY JSON: {"verdict": "approve|request_changes", '
-            '"comment": "..."}'
-        )
-        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
-        if state.get("error"):             # reviewer unreachable — retry next cycle
-            state["done"] = True
-            return state
-        parsed = parse_json_block(answer)
-        verdict = parsed.get("verdict", "request_changes")
-        comment = parsed.get("comment", "auto review")
-        if ev_rows:                        # P16: make the evidence trail explicit
-            counts: dict[str, int] = {}
-            for e in ev_rows:
-                counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
-            comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
+        # Mechanical tier-2 gate — the reviewer is a real reviewer: it RUNS the
+        # full suite (merge main+MR in a throw-away copy + pytest) BEFORE any
+        # LLM opinion, complementing the declared-checks re-run above (which
+        # only re-executes what the author declared — this gate catches an MR
+        # with NO declared checks at all). Mirrors the owner's `agentics mr
+        # merge` and the Integrator's drain gate.
+        ws = getattr(ctx, "workspace", None)
+        verify_tier2 = getattr(ws, "verify_merge", None)
+        mech_ok, mech_note = True, "tier-2 not run: workspace cannot verify_merge"
+        if verify_tier2 is not None:
+            try:
+                mech_ok, mech_note = await asyncio.to_thread(
+                    verify_tier2, candidate["branch"])
+            except Exception as exc:  # noqa: BLE001 — an untestable MR is a failing MR
+                mech_ok, mech_note = False, f"mechanical check error: {exc}"
+        state["mechanical_review"] = "pass" if mech_ok else f"fail: {mech_note[:300]}"
+        if not mech_ok:
+            verdict = "request_changes"
+            comment = f"Mechanical review failed before LLM review: {mech_note}"
+        else:
+            files_desc = "\n".join(f"- {f}" for f in diff_files[:30])
+            ev_desc = ""
+            if ev_rows:
+                ev_lines = [
+                    f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
+                    f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
+                    for e in ev_rows[-6:]
+                ]
+                ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
+                           + "\n".join(ev_lines))
+                if rerun_note:
+                    ev_desc += f"\n\nReviewer's own re-runs: {rerun_note}"
+            prompt = (
+                f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
+                f"Files:\n{files_desc}\n\n"
+                f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
+                f"{ev_desc}\n\n"
+                + ("Mechanical check: tier-2 tests PASSED on main+MR (you ran them "
+                   "yourself — trust measurements over prose).\n\n"
+                   if verify_tier2 is not None else
+                   "Mechanical check: tier-2 NOT run in this context — weigh the "
+                   "author's recorded verification and the P16 evidence.\n\n")
+                + 'Reply ONLY JSON: {"verdict": "approve|request_changes", '
+                '"comment": "..."}'
+            )
+            answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
+            if state.get("error"):             # reviewer unreachable — retry next cycle
+                state["done"] = True
+                return state
+            parsed = parse_json_block(answer)
+            verdict = parsed.get("verdict", "request_changes")
+            comment = parsed.get("comment", "auto review")
+            if verify_tier2 is not None:
+                comment = f"[mechanical: tier-2 passed] {comment}"
+            if ev_rows:                        # P16: make the evidence trail explicit
+                counts: dict[str, int] = {}
+                for e in ev_rows:
+                    counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
+                comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
+
+
+    if rerun_refuted and verdict == "approve":
+        # Evidence overrides model opinion: an independent re-run that refutes
+        # the author's check can never be approved, whatever the LLM says.
+        verdict = "request_changes"
+        comment = (f"{rerun_digest} the author's check FAILED in the reviewer's "
+                   f"own workspace — evidence overrides model opinion. {comment}")
 
     if verdict == "approve":
         await asyncio.to_thread(

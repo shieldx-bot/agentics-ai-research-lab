@@ -132,17 +132,22 @@ def _file_measurement(workspace, h: Hypothesis):
 
 
 def settle_hypothesis(memory, agent: str, hyp_id: int, h: Hypothesis,
-                      evidence: Evidence) -> int:
+                      evidence: Evidence, method: str | None = None) -> int:
     """Record the run as shared knowledge and close the hypothesis lifecycle.
 
     Returns the evidence row id. Every agent sees the verdict via the
     record_evidence broadcast (H3) and the settled claim via
     verified_knowledge() — refuted claims stop being repeated, supported
-    claims become reusable common ground."""
+    claims become reusable common ground.
+
+    `method` overrides the evidence row's method label (the coder-path bridge
+    records "hypothesis_contract"; the researcher protocol path keeps the
+    runner's own "protocol")."""
     ev_id = memory.record_evidence(
         agent, h.task, evidence.cmd, evidence.exit_code, evidence.verdict,
-        hypothesis=h.claim, method="hypothesis_contract", output=evidence.output,
-        duration_s=evidence.duration_s, artifact=h.result_path,
+        hypothesis=f"{h.claim} | prediction: {h.prediction}",
+        method=method or evidence.method, output=evidence.output,
+        duration_s=evidence.duration_s, artifact=h.script_path,
     )
     memory.attach_protocol_outcome(
         ev_id,

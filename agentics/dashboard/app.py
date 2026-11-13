@@ -49,6 +49,10 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             "counts": memory.evidence_counts(),
             "recent": memory.latest_evidence(limit=12),
         },
+        "hypotheses": {
+            "counts": memory.hypothesis_counts(),
+            "recent": memory.list_hypotheses(limit=12),
+        },
         "alerts": [
             e for e in memory.recent_journal(limit=120)
             if e.get("event") in ("integrity_drift", "scope_violation",
@@ -144,6 +148,9 @@ _HTML = """<!doctype html>
   <div class="card" style="grid-column:1/-1"><h2>Kiểm chứng thực nghiệm (P16 — bằng chứng chạy thật, không phải lời nói LLM)</h2>
     <div class="kv" id="evcounts"></div>
     <table id="evidence" style="margin-top:8px"><thead><tr><th>ID</th><th>Task</th><th>Agent</th><th>Verdict</th><th>Lệnh kiểm chứng</th><th>Exit</th></tr></thead><tbody></tbody></table></div>
+  <div class="card" style="grid-column:1/-1"><h2>Giả thuyết đã đăng ký (P16bis — tiêu chí chốt TRƯỚC khi chạy, máy chấm sau khi đo)</h2>
+    <div class="kv" id="hypcounts"></div>
+    <table id="hypotheses" style="margin-top:8px"><thead><tr><th>ID</th><th>Trạng thái</th><th>Giả thuyết</th><th>Tiêu chí</th><th>Đo được</th></tr></thead><tbody></tbody></table></div>
   <div class="card"><h2>Cảnh báo guard / intent (P10/P13/P14)</h2>
     <div class="acts" id="alerts"></div></div>
   <div class="card"><h2>Bộ nhớ (trí nhớ chung)</h2>
@@ -209,6 +216,20 @@ function render(s){
     <td><span class="pill ${e.verdict==='confirmed'?'merged':e.verdict==='refuted'?'failed':'claimed'}">${esc(e.verdict)}</span>${e.verdict_by?` <span class="kv">(${esc(e.verdict_by)})</span>`:''}</td>
     <td class="dt">${esc(e.cmd)}</td><td>${e.exit_code}</td></tr>`).join("")
     || '<tr><td colspan="6" class="kv">trống</td></tr>';
+  const hyp = s.hypotheses || {counts:{}, recent:[]};
+  const hc = hyp.counts || {};
+  document.getElementById("hypcounts").innerHTML = Object.keys(hc).length
+    ? Object.entries(hc).map(([k,v])=>`<span class="pill ${k==='supported'?'merged':k==='refuted'?'failed':k==='proposed'?'open':'claimed'}">${esc(k)}: <b>${v}</b></span>`).join(" ")
+    : '<span class="kv">chưa có giả thuyết nào — researcher sẽ đăng ký giả thuyết + tiêu chí định lượng trước khi chạy protocol (P16bis)</span>';
+  document.querySelector("#hypotheses tbody").innerHTML = (hyp.recent||[]).map(h=>{
+    const c = h.criterion || {};
+    const crit = c.metric ? `${esc(c.metric)} ${esc(c.op)} ${c.target}` : '-';
+    const measured = (h.verdict_note||'').replace(/^measured /,'');
+    return `<tr><td>#${h.id}</td>
+    <td><span class="pill ${h.status==='supported'?'merged':h.status==='refuted'?'failed':h.status==='proposed'?'open':'claimed'}">${esc(h.status)}</span></td>
+    <td class="dt">${esc(h.claim)}</td><td class="dt">${crit}</td>
+    <td class="dt">${esc(measured||'-')}</td></tr>`;}).join("")
+    || '<tr><td colspan="5" class="kv">trống</td></tr>';
   const alerts = s.alerts||[];
   document.getElementById("alerts").innerHTML = alerts.length
     ? alerts.slice().reverse().map(e=>`

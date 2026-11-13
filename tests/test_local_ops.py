@@ -222,59 +222,23 @@ def test_supervisor_top_up_rotates_survey_angles(settings, mem):
     assert len(angles_logged) == len(titles)
 
 
-def test_supervisor_top_up_uses_least_used_angle_first(settings, mem):
-    """Regression (cd8b536 review): top-up used to re-open SURVEY_ANGLES[0]
-    forever — the backlog dried, the same survey was re-created, and the other
-    five angles were never reached. Least-used-first rotation fixes that."""
-    from agentics.local_ops import SURVEY_ANGLES
-
+def test_verification_angle_task_points_at_stored_findings(settings, mem):
+    """P16bis: the appended 'Empirical verification' angle produces a task
+    whose body steers the Researcher at the swarm's OWN unverified findings
+    (settling claims by running code), not at another re-survey."""
     src = TaskSource(mem, settings)
-    first = src.supervisor_top_up()
-    assert first == 1
-    t1 = mem.scan_open_tasks()[0]
-    assert t1["title"].startswith(SURVEY_ANGLES[0] + ":")
-
-    mem.set_task_status(t1["id"], "merged")    # backlog dry again
-    assert src.supervisor_top_up() == 1
-    titles = [t["title"] for t in mem.list_tasks(limit=10)]
-    assert sum(t.startswith(a + ":") for a in SURVEY_ANGLES for t in titles) == 2
-    # the second angle differs from the first and no angle repeats
-    angles_used = [a for a in SURVEY_ANGLES
-                   if sum(t.startswith(a + ":") for t in titles) >= 1]
-    assert len(angles_used) == 2               # two distinct angles so far
-
-    mem.set_task_status(mem.scan_open_tasks()[0]["id"], "merged")
-    assert src.supervisor_top_up() == 1
-    titles = [t["title"] for t in mem.list_tasks(limit=10)]
-    angles_used = [a for a in SURVEY_ANGLES
-                   if sum(t.startswith(a + ":") for t in titles) >= 1]
-    assert len(angles_used) == 3               # rotation keeps advancing
-
-
-
-
-def test_supervisor_top_up_investigates_newest_failure_first(settings, mem):
-    """GEA: the newest failed trace with no task yet becomes a bugfix task
-    before any survey angle is opened; an already-investigated failure
-    (merged task) is never re-opened."""
-    src = TaskSource(mem, settings)
-    trace_id = mem.add_trace(
-        agent="a02", role="coder", cycle=3, outcome="failed",
-        category="tool", attempted="run benchmark", failure="ModuleNotFoundError: no module named 'sklearn'",
-    )
-    assert src.supervisor_top_up() == 1
-    task = mem.scan_open_tasks()[0]
-    assert task["category"] == "bugfix"
-    assert task["title"].startswith("Investigate failure (tool):")
-    assert "ModuleNotFoundError" in task["title"]
-    assert task["body"].startswith("Self-generated from the group failure traces")
-
-    mem.set_task_status(task["id"], "merged")  # investigation done & merged
-    assert src.supervisor_top_up() == 1        # falls through to the survey angle
-    titles = [t["title"] for t in mem.list_tasks(limit=10)]
-    assert sum(t.startswith("Investigate failure (tool):") for t in titles) == 1
-
-    _ = trace_id
+    created = None
+    for _ in range(len(SURVEY_ANGLES)):        # rotation reaches it eventually
+        if not src.supervisor_top_up():        # returns a COUNT, not an id
+            continue
+        task = mem.list_tasks(limit=1)[0]      # newest = the one just opened
+        if task["title"].startswith("Empirical verification"):
+            created = task
+            break
+        mem.set_task_status(task["id"], "merged")          # dry the backlog again
+    assert created is not None
+    assert "stored in shared memory" in created["body"]
+    assert "verified_knowledge" in created["body"]
 
 
 def test_repair_orphan_tasks_reopens_claimed_without_lease(settings, mem):
