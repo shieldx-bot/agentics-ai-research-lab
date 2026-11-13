@@ -46,6 +46,21 @@ def _seed_into(mem: SharedMemory) -> None:
     mem.journal("orchestrator", "broadcast", "noise from machinery")
     mem.journal("owner", "manual_maintenance", {"swept": []})
 
+    # --- backlog: one open + one closed task (G1 close rate) -----------------
+    t1 = mem.create_task("task open", agent="seed")
+    t2 = mem.create_task("task closed", agent="seed")
+    mem.set_task_status(t2, "closed")
+    # the MR flow below flips tasks 1/2 to in_review — add one truly merged
+    t3 = mem.create_task("task merged", agent="seed")
+    mem.set_task_status(t3, "merged")
+
+    # --- hypotheses: one supported, one still proposed (G2 resolution) -------
+    h1 = mem.add_hypothesis("a01", "claim one", {"metric": "m", "op": ">=",
+                                                 "target": 1})
+    mem.add_hypothesis("a02", "claim two pending", {"metric": "m",
+                                                    "op": ">=", "target": 1})
+    mem.update_hypothesis(h1, "supported")
+
     # --- two MRs with panels: one approved cross-agent, one rejected ---------
     engine = PeerPanel(mem, panel_size=2)
     mr_ok = mem.open_review(task_id=1, title="good", body="b", author="a01",
@@ -106,6 +121,10 @@ def test_coordination_and_task_group():
     # authors with terminal outcomes: a01, a04, a02 = 3 of 4 active agents
     assert r["agents_active"] == 4
     assert abs(c["solution_diversity"] - 3 / 4) < 1e-9
+    # backlog: 1 merged/closed of 3 tasks (2 sit in_review from the panels)
+    assert abs(c["task_close_rate"] - 1 / 3) < 1e-9 and c["tasks_open"] == 1
+    # balance = 1 - busiest-agent share of non-system journal events
+    assert 0.0 <= c["workload_balance"] < 1.0
 
 
 def test_convergence_dynamics_group():
@@ -114,6 +133,9 @@ def test_convergence_dynamics_group():
     assert abs(d["convergence_correctness"] - 0.5) < 1e-9   # 1 of 2 approved
     # approved closed in round 1; rejected went through the defense (round 2)
     assert d["mean_panel_rounds"] == 1.5
+    # one hypothesis decided (supported) of two registered
+    assert abs(d["hypothesis_resolution_rate"] - 0.5) < 1e-9
+    assert d["hypotheses_total"] == 2
 
 
 def test_trajectory_and_handoff_group():
@@ -123,7 +145,11 @@ def test_trajectory_and_handoff_group():
     assert h["total_cycles"] == 4 and h["productive_cycles"] == 3
     assert abs(h["productive_vs_looping"] - 3 / 4) < 1e-9
     assert h["trajectory_length_nodes"] == 3 / 4            # 3 node events / 4 cycles
-    assert abs(h["handoff_churn"] - 1 / 2) < 1e-9           # 1 release / 2 claims
+    # handoff churn (release/claim) was removed: tautological in this codebase
+    assert "handoff_churn" not in h
+    dur = h["mean_cycle_duration_s"]
+    assert dur is None or dur >= 0
+    assert h["claim_stability"] == 0.0                      # 2 claims, 0 reconfirms
     assert h["claim_friction_events"] == 1
 
 
@@ -136,8 +162,13 @@ def test_resilience_group_and_cost():
     # a04 errored once and its next cycle_done exists → full recovery
     assert res["error_recovery_rate"] == 1.0
     assert res["plan_retry_recovered"] == 1
+    # no evidence rows yet -> honest None; no role-prompt feedback either
+    assert res["evidence_pass_rate"] is None
+    assert res["role_prompt_success_rate"] is None
     cost = r["groups"]["governance_cost"]
     assert cost["llm_calls"] == 3
+    assert cost["llm_purpose_spread"] == 3                    # research/plan/review
+    assert abs(cost["llm_top_purpose_share"] - 1 / 3) < 1e-9
     assert abs(cost["llm_mean_duration_s"] - 95 / 3) < 1e-9
     assert abs(cost["llm_calls_per_merged"] - 3 / 2) < 1e-9
     assert abs(cost["llm_seconds_per_merged"] - 95 / 2) < 1e-9
@@ -189,9 +220,33 @@ def test_empty_lab_reports_honest_nones():
     assert r["agents_active"] == 0
     g = r["groups"]
     assert g["coordination_task"]["task_completion_rate"] is None
+    assert g["coordination_task"]["task_close_rate"] is None
+    assert g["coordination_task"]["workload_balance"] is None
     assert g["trajectory_handoff"]["productive_vs_looping"] is None
+    assert g["trajectory_handoff"]["mean_cycle_duration_s"] is None
     assert g["governance_cost"]["incoherence_rate"] is None
     assert g["resilience_scalability"]["llm_ok_rate"] is None
+    assert g["resilience_scalability"]["evidence_pass_rate"] is None
+    assert g["resilience_scalability"]["role_prompt_success_rate"] is None
+    assert g["convergence_dynamics"]["hypothesis_resolution_rate"] is None
+
+
+def test_evidence_and_role_prompt_rates():
+    mem = _seed_lab()
+    ev = mem.record_evidence("a01", task_id=1, cmd="true", exit_code=0,
+                             verdict="confirmed", hypothesis="h",
+                             method="m", output="ok")
+    mem.record_evidence("a01", task_id=1, cmd="false", exit_code=1,
+                        verdict="refuted", hypothesis="h", method="m",
+                        output="bad")
+    mem.store_role_prompt("coder", "code", mission="do the thing")
+    mem.bump_role_prompt("coder", "code", success=True)
+    mem.bump_role_prompt("coder", "code", success=False)
+    r = evaluate_swarm(mem)
+    res = r["groups"]["resilience_scalability"]
+    assert res["evidence_total"] == 2
+    assert res["evidence_pass_rate"] == 0.5
+    assert res["role_prompt_success_rate"] == 0.5
 
 
 def test_report_is_json_serializable_and_snapshots_roundtrip():
@@ -222,6 +277,12 @@ def test_percent_rows_map_to_percent_scale():
     assert by[(4, "Replication kiểm chứng (P24)")]["pct"] is None
     # count without a natural denominator keeps '—'
     assert by[(1, "Số nhóm việc (category)")]["pct"] is None
+    # new metrics land on the same percent scale (1 supported of 2 hypotheses)
+    assert by[(2, "Giả thuyết đã quyết (P24)")]["pct"] == 50.0
+    assert by[(1, "Tỷ lệ đóng nhiệm vụ (backlog)")]["pct"] == 33.3
+    assert by[(4, "Evidence thông kiểm chứng")]["pct"] is None
+    # churn row is gone, replaced by duration + claim stability
+    assert not any("churn" in r["metric"] for r in rows)
     # every row carries a reading guide and a health direction
     assert all(r["hint"] and isinstance(r["good_high"], bool) for r in rows)
 

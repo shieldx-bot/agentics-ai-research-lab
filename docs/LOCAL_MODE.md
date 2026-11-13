@@ -217,22 +217,39 @@ from its own immutable traces — no LLM, read-only — in five groups:
 1. **Coordination & task** — merge rate (judged traces), share of decided
    panels that had >= 2 distinct reviewers (cross-agent verification),
    citation-domain coverage of findings, share of active agents that ever
-   produced a terminal outcome;
+   produced a terminal outcome, task close rate over the backlog
+   (closed+merged+failed / all tasks), workload balance (1 − share of the
+   busiest agent's journal events — 100% would mean a perfectly even load);
 2. **Convergence & dynamics** — panel approval rate (converged to correct),
-   mean vote rounds and mean cycle to a verdict, defense save rate;
+   mean vote rounds and mean cycle to a verdict, defense save rate,
+   hypothesis resolution rate (supported+refuted / all registered, P24);
 3. **Trajectory & handoff** — productive-vs-looping cycle ratio
    (`cycle_done` outcomes vs `no_change`), node events per cycle
-   (trajectory length), claim churn and lock friction, cycle-error share;
+   (trajectory length), mean cycle wall-clock duration (per-agent
+   `cycle_done` deltas, gaps > 1h excluded), claim stability
+   (`claim_reconfirmed` / claims — renewals in good order), lock friction,
+   cycle-error share;
 4. **Resilience & scale** — LLM ok-rate, budget-breaker trips, error
    recovery (a `cycle error` followed by that agent's next `cycle_done`),
-   plan-retry/rework recovery, replication counts, and the scalability
+   plan-retry/rework recovery, evidence pass rate (confirmed evidence /
+   all evidence runs), role-prompt learning success (P11: mission bumps
+   that stayed active / all bumps), replication counts, and the scalability
    elasticity **S = %ΔP / %ΔN** across persisted snapshots at different
    swarm sizes (S > 1 → superlinear);
 5. **Governance & cost** — quality gap (distinct objectors on rejected vs
    approved panels), peer-substantiated incoherence rate (objection stood
-   after defense / author conceded), LLM calls + wall-clock seconds per
-   merged MR (cookie providers expose no token counts — the ledger's
-   honest units).
+   after defense / author conceded), LLM purpose spread and top-purpose
+   concentration (is one role dominating the ledger?), LLM calls +
+   wall-clock seconds per merged MR (cookie providers expose no token
+   counts — the ledger's honest units).
+
+Metrics pruned as INCOMPATIBLE with this codebase (the machinery does not
+exist, so they could only ever fabricate noise): potential-field
+cohesion/repulsion, context-survival-at-handoff (handoff payloads are not
+journaled), per-tool path/detour efficiency (no per-tool-call telemetry),
+classifier-based toxicity, token-denominated cost, and handoff churn
+(release/claim — a tautology here, since a release is only ever logged
+after its own claim; replaced by claim stability + cycle duration).
 
 Flags: `--days N` (window), `--json` (full machine-readable report),
 `--no-save` (don't persist). Every real evaluation appends one row to

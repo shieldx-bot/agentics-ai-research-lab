@@ -483,6 +483,20 @@ class SharedMemory:
                 (failures, row_id))
             return "active"
 
+    def role_prompt_stats(self) -> dict[str, int]:
+        """Aggregate outcome feedback over the role-prompt ledger (swarm_eval).
+
+        successes/failures are the P11 self-learning loop's own bookkeeping:
+        how often did an evolved mission survive its cycle without rework."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(uses),0), "
+                "COALESCE(SUM(successes),0), COALESCE(SUM(failures),0) "
+                "FROM role_prompts"
+            ).fetchone()
+        return {"prompts": row[0], "uses": row[1], "successes": row[2],
+                "failures": row[3]}
+
     def role_experience(self, role: str, category: str, limit: int = 8) -> str:
         """Recent traces of this (role, category) as digest lines for the
         synthesis meta-prompt — what was tried, how it ended, why it failed."""

@@ -11,15 +11,25 @@ no LLM, no new machinery, purely read-only aggregation:
 2. convergence & dynamics — panel rounds/cycles to a verdict, approval rate,
                            defense save rate;
 3. trajectory & handoff  — productive-vs-looping cycles, trajectory length,
-                           claim churn/friction, cycle-error share;
+                           cycle duration, claim stability/friction,
+                           cycle-error share;
 4. resilience & scale    — LLM ok-rate, budget-breaker trips, error
-                           recovery, replication counts, scalability
-                           elasticity S = (%ΔP / %ΔN) across snapshots;
+                           recovery, evidence pass rate, role-prompt
+                           learning success, replication counts,
+                           scalability elasticity S = (%ΔP / %ΔN);
 5. governance & cost     — quality gap (objectors on rejected vs approved),
-                           peer-substantiated incoherence rate, cost per
-                           merged MR in the honest units the ledger has
-                           (calls + wall-clock seconds; cookie providers
-                           expose no token counts).
+                           peer-substantiated incoherence rate, LLM purpose
+                           spread, cost per merged MR in the honest units
+                           the ledger has (calls + wall-clock seconds; cookie
+                           providers expose no token counts).
+
+Pruned as incompatible with THIS codebase (machinery does not exist, so
+they could only ever fabricate noise): potential-field cohesion/repulsion,
+context-survival-at-handoff (handoff payloads are not journaled),
+per-tool path/detour efficiency (no per-tool-call telemetry), classifier-
+based toxicity (no such model in the lab), token-denominated cost (cookie
+providers expose no token counts), and handoff churn release/claim — a
+tautology here, since every release is logged only after its claim.
 
 `evaluate_swarm` returns a plain JSON-able dict grouped exactly like the
 taxonomy above; `save_snapshot`/`scalability_S` persist each evaluation so
@@ -90,9 +100,18 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
                   if (e["detail"].get("outcome") or "") in _PRODUCTIVE_OUTCOMES]
     node_events = [e for e in events if e["event"] == "node"]
     claim_events = [e for e in events if e["event"] in ("claim", "handoff")]
-    release_events = [e for e in events if e["event"] == "release"]
+    reconfirm_events = [e for e in events if e["event"] == "claim_reconfirmed"]
     friction_events = [e for e in events if e["event"] in (
         "lock_conflict", "claim_unstable", "claim_replay_blocked")]
+    # mean cycle wall-clock: per-agent deltas between successive cycle_done,
+    # ignoring gaps > 1h (idle/restart gaps are not cycle work)
+    cycle_durations: list[float] = []
+    last_done: dict[str, float] = {}
+    for e in cycle_done:
+        prev = last_done.get(e["agent"])
+        last_done[e["agent"]] = e["ts"]
+        if prev is not None and 0 < e["ts"] - prev < 3600:
+            cycle_durations.append(e["ts"] - prev)
     breaker_events = [e for e in events if e["event"] == "budget_breaker_open"]
     retry_recovered = [e for e in events if e["event"] == "plan_retry_recovered"]
     rework_starts = [e for e in events if e["event"] == "rework_start"]
@@ -136,6 +155,26 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
         if nxt is not None:
             recovered += 1
 
+    # ---- workload balance & backlog (G1) -------------------------------
+    agent_event_counts: dict[str, int] = {}
+    for e in events:
+        if e["agent"] not in _SYSTEM_AGENTS:
+            agent_event_counts[e["agent"]] = \
+                agent_event_counts.get(e["agent"], 0) + 1
+    total_agent_events = sum(agent_event_counts.values())
+    top_share = (max(agent_event_counts.values()) / total_agent_events
+                 if total_agent_events else None)
+    tasks_all = mem.task_counts()
+    tasks_closed = sum(tasks_all.get(s, 0)
+                       for s in ("closed", "merged", "failed", "done"))
+    tasks_total = sum(tasks_all.values())
+
+    hyp_counts = mem.hypothesis_counts()
+    hyp_decided = hyp_counts.get("supported", 0) + hyp_counts.get("refuted", 0)
+    hyp_total = sum(hyp_counts.values())
+    ev_stats = mem.evidence_stats()
+    rp = mem.role_prompt_stats()
+
     merged = tstats["by_outcome"].get("merged", 0)
 
     report = {
@@ -162,6 +201,10 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
                          ("merged", "rejected", "failed")}),
                     max(1, agent_count)),
                 "category_spread": len(tstats["by_category"]),
+                "task_close_rate": _rate(tasks_closed, tasks_total),
+                "tasks_open": tasks_all.get("open", 0),
+                "workload_balance": (1.0 - top_share)
+                                    if top_share is not None else None,
             },
             # ---------------------------------------------------- G2
             "convergence_dynamics": {
@@ -172,6 +215,8 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
                      if t["outcome"] in ("merged", "rejected", "failed")]),
                 "defense_save_rate": pstats["defense_save_rate"],
                 "panels_defended": pstats["defended"],
+                "hypothesis_resolution_rate": _rate(hyp_decided, hyp_total),
+                "hypotheses_total": hyp_total,
             },
             # ---------------------------------------------------- G3
             "trajectory_handoff": {
@@ -179,7 +224,9 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
                 "productive_cycles": len(productive),
                 "total_cycles": len(cycle_done),
                 "trajectory_length_nodes": _rate(len(node_events), len(cycle_done)),
-                "handoff_churn": _rate(len(release_events), len(claim_events)),
+                "mean_cycle_duration_s": _mean(cycle_durations),
+                "claim_stability": _rate(len(reconfirm_events),
+                                         len(claim_events) or None),
                 "claim_friction_events": len(friction_events),
                 "cycle_error_share": _rate(len(cycle_errors),
                                            len(cycle_done) + len(cycle_errors)),
@@ -191,6 +238,12 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
                 "error_recovery_rate": _rate(recovered, errored_agents),
                 "plan_retry_recovered": len(retry_recovered),
                 "rework_starts": len(rework_starts),
+                "evidence_pass_rate": _rate(ev_stats["confirmed"],
+                                            ev_stats["total"]),
+                "evidence_total": ev_stats["total"],
+                "evidence_confirmed": ev_stats["confirmed"],
+                "role_prompt_success_rate": _rate(
+                    rp["successes"], rp["successes"] + rp["failures"]),
                 "replication_counts": mem.replication_counts(),
             },
             # ---------------------------------------------------- G5
@@ -200,6 +253,11 @@ def evaluate_swarm(mem: SharedMemory, *, since_ts: float = 0.0,
                 "incoherence_rate": _incoherence_rate(pstats["rejected_why"],
                                                       pstats["decided"]),
                 "llm_calls": llm["calls"],
+                "llm_purpose_spread": len(llm.get("by_purpose") or {}),
+                "llm_top_purpose_share": _rate(
+                    max((p["calls"] for p in (llm.get("by_purpose") or {})
+                         .values()), default=0),
+                    llm["calls"] or None),
                 "llm_mean_duration_s": llm["mean_duration_s"],
                 "llm_seconds_per_merged": (llm["total_duration_s"] / merged)
                                           if merged else None,
@@ -303,6 +361,10 @@ def percent_rows(report: dict) -> list[dict]:
         "100%: mọi agent đều có kết quả — không hội tụ sớm quanh một hướng")
     add(1, "Số nhóm việc (category)", str(c.get("category_spread") or 0),
         None, True, "bầy tự chia bao nhiêu loại công việc")
+    rate = c.get("task_close_rate")
+    add(1, "Tỷ lệ đóng nhiệm vụ (backlog)",
+        f"open={c.get('tasks_open') or 0}" if rate is not None else "—",
+        _pct(rate), True, "backlog không chất đống task mở mãi không đóng")
 
     # --- G2 convergence & dynamics ----------------------------------------
     rate = d.get("convergence_correctness")
@@ -325,16 +387,26 @@ def percent_rows(report: dict) -> list[dict]:
         f"{d['mean_trace_cycle']:.1f}" if d.get("mean_trace_cycle")
         is not None else "—", None, False,
         "số chu kỳ để bầy cho ra một kết quả được chấm")
+    rate = d.get("hypothesis_resolution_rate")
+    n_hyp = d.get("hypotheses_total") or 0
+    add(2, "Giả thuyết đã quyết (P24)",
+        _frac(round(rate * n_hyp) if rate is not None else None,
+              n_hyp or None), _pct(rate), True,
+        "100%: không giả thuyết nào treo mãi không kiểm chứng")
 
     # --- G3 trajectory & handoff ------------------------------------------
     rate = h.get("productive_vs_looping")
     add(3, "Chu kỳ sinh sản lượng",
         _frac(h.get("productive_cycles"), h.get("total_cycles")),
         _pct(rate), True, "≥50%: đa số chu kỳ tạo giá trị, không kẹt vòng lặp")
-    rate = h.get("handoff_churn")
-    add(3, "Churn chuyển giao (release/claim)",
-        f"{rate:.2f}x" if rate is not None else "—", _pct(rate), False,
-        ">100%: nhả claim nhiều hơn nhận — bầy đang xoay vòng không ăn khớp")
+    dur = h.get("mean_cycle_duration_s")
+    add(3, "Thời lượng chu kỳ trung bình",
+        f"{dur:.0f}s" if dur is not None else "—", None, False,
+        "thấp: bầy quyết nhanh, không sa lầy trong một chu kỳ")
+    rate = h.get("claim_stability")
+    add(3, "Ổn định claim (reconfirm/claim)",
+        f"{rate:.2f}x" if rate is not None else "—", None, True,
+        "claim được gia hạn đúng hạn thay vì bị nhả — phối hợp ăn khớp")
     rate = h.get("cycle_error_share")
     add(3, "Chu kỳ lỗi", f"{rate:.2f}" if rate is not None else "—",
         _pct(rate), False, "thấp: quỹ đạo xử lý ổn định, ít vỡ chu kỳ")
@@ -353,6 +425,14 @@ def percent_rows(report: dict) -> list[dict]:
     add(4, "Phục hồi sau lỗi chu kỳ",
         _frac(None, None), _pct(rate), True,
         "100%: không agent nào chết một chiều sau một lần lỗi")
+    rate = r.get("evidence_pass_rate")
+    add(4, "Evidence thông kiểm chứng",
+        _frac(r.get("evidence_confirmed"), r.get("evidence_total")),
+        _pct(rate), True,
+        "tỷ lệ evidence chạy máy xác nhận được — nền tảng chống ảo giác")
+    rate = r.get("role_prompt_success_rate")
+    add(4, "Role-prompt sống qua chu kỳ (P11)", "—", _pct(rate), True,
+        "mission tự học còn dùng được — thích nghi thay vì bị thay")
     repl_ok = repl.get("replicated")
     add(4, "Replication kiểm chứng (P24)",
         _frac(repl_ok, repl_total or None),
@@ -369,6 +449,9 @@ def percent_rows(report: dict) -> list[dict]:
         f"{r.get('plan_retry_recovered') or 0} / "
         f"{r.get('rework_starts') or 0}", None, False,
         "tự chữa kế hoạch / làm lại có chủ đích")
+    rate = c.get("workload_balance")
+    add(1, "Cân bằng khối lượng (1 − share agent top)", "—", _pct(rate),
+        True, "100%: mọi agent gánh đều — không có agent độc chiếm bầy")
 
     # --- G5 governance & cost ----------------------------------------------
     rate = v.get("incoherence_rate")
@@ -383,6 +466,13 @@ def percent_rows(report: dict) -> list[dict]:
     add(5, "Quality gap (objectors: rejected − approved)",
         f"{gap:+.2f}" if gap is not None else "—", None, True,
         ">0: panel bắt lỗi đúng chỗ hỏng, không bắt vì mood")
+    add(5, "Đa dạng mục đích LLM (số purpose)",
+        str(v.get("llm_purpose_spread") or 0), None, True,
+        "bầy dùng LLM cho bao nhiêu loại việc — 1 nghĩa là dính một vai")
+    top = v.get("llm_top_purpose_share")
+    add(5, "Mức tập trung purpose hàng đầu",
+        f"{top:.0%}" if top is not None else "—", None, False,
+        "cao: một purpose thống trị ledger — phân bố vai lệch")
     cpm = v.get("llm_calls_per_merged")
     add(5, "LLM calls / mỗi MR merge",
         f"{cpm:.1f}" if cpm is not None else "—", None, False,

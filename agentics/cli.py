@@ -542,6 +542,10 @@ def _print_swarm_eval(report: dict, memory) -> None:
     t1.add_row("Độ đa dạng giải pháp (tác giả có kết quả / agent)",
                _fmt(c["solution_diversity"], pct=True))
     t1.add_row("  số nhóm công việc (category)", str(c["category_spread"]))
+    t1.add_row("Tỷ lệ đóng nhiệm vụ (backlog)", _fmt(c["task_close_rate"], pct=True))
+    t1.add_row("  task đang mở", str(c["tasks_open"]))
+    t1.add_row("Cân bằng khối lượng (1 − share agent top)",
+               _fmt(c["workload_balance"], pct=True))
     console.print(t1)
 
     t2 = Table(title="2. Động lực học & hội tụ (Convergence & Dynamics)")
@@ -553,6 +557,9 @@ def _print_swarm_eval(report: dict, memory) -> None:
     t2.add_row("Chu kỳ trung bình của kết quả đầu ra", _fmt(d["mean_trace_cycle"]))
     t2.add_row("Tỷ lệ defense cứu được MR", _fmt(d["defense_save_rate"], pct=True))
     t2.add_row("  panel có bảo vệ (round 2)", str(d["panels_defended"]))
+    t2.add_row("Giả thuyết đã quyết (P24)",
+               _fmt(d["hypothesis_resolution_rate"], pct=True))
+    t2.add_row("  tổng giả thuyết", str(d["hypotheses_total"]))
     console.print(t2)
 
     t3 = Table(title="3. Quỹ đạo & luồng thông tin (Trajectory & Handoff)")
@@ -564,7 +571,8 @@ def _print_swarm_eval(report: dict, memory) -> None:
     t3.add_row("  chu kỳ sinh sản lượng / tổng",
                f"{h['productive_cycles']} / {h['total_cycles']}")
     t3.add_row("Độ dài quỹ đạo (node/chu kỳ)", _fmt(h["trajectory_length_nodes"]))
-    t3.add_row("Churn chuyển giao (release/claim)", _fmt(h["handoff_churn"]))
+    t3.add_row("Thời lượng chu kỳ trung bình", _fmt(h["mean_cycle_duration_s"]))
+    t3.add_row("Ổn định claim (reconfirm/claim)", _fmt(h["claim_stability"]))
     t3.add_row("Ma sát claim (lock conflict/unstable/replay)", str(h["claim_friction_events"]))
     t3.add_row("Tỷ lệ chu kỳ lỗi", _fmt(h["cycle_error_share"], pct=True))
     console.print(t3)
@@ -579,6 +587,11 @@ def _print_swarm_eval(report: dict, memory) -> None:
     t4.add_row("Phục hồi sau lỗi chu kỳ", _fmt(r["error_recovery_rate"], pct=True))
     t4.add_row("plan_retry_recovered / rework_start",
                f"{r['plan_retry_recovered']} / {r['rework_starts']}")
+    t4.add_row("Evidence thông kiểm chứng",
+               _fmt(r["evidence_pass_rate"], pct=True))
+    t4.add_row("  evidence đã chạy", str(r["evidence_total"]))
+    t4.add_row("Role-prompt sống qua chu kỳ (P11)",
+               _fmt(r["role_prompt_success_rate"], pct=True))
     t4.add_row("Replication (P24)", repl or _fmt(None))
     t4.add_row("Độ co giãn quy mô S = %ΔP/%ΔN", _fmt(r.get("scalability_S")))
     note = r.get("scalability_note") or ""
@@ -601,6 +614,8 @@ def _print_swarm_eval(report: dict, memory) -> None:
                _fmt(v["incoherence_rate"], pct=True))
     t5.add_row("Lý do reject", why or _fmt(None))
     t5.add_row("LLM calls / mean duration", f"{v['llm_calls']} / {mean_dur}")
+    t5.add_row("Đa dạng mục đích LLM (số purpose)", str(v["llm_purpose_spread"]))
+    t5.add_row("Mức tập trung purpose hàng đầu", _fmt(v["llm_top_purpose_share"], pct=True))
     t5.add_row("Chi phí mỗi MR merge (calls / giây)",
                f"{per_merged_calls} / {per_merged_secs}")
     t5.add_row("  đơn vị đo", f"[dim]{v['cost_unit_note']}[/]")
