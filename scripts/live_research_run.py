@@ -1,15 +1,25 @@
-"""Live research run — the real RESEARCHER cycle over Hyperbrowser cloud browser.
+"""Live research run — the real RESEARCHER cycle over the configured browser backend.
 
 Runs the actual graph nodes (node_start -> node_research -> node_plan) with
-only GitHub/workspace edges stubbed: the LLM edge is fully live (Perplexity
-through a Hyperbrowser stealth session), memory is a real SharedMemory.
+only GitHub/workspace edges stubbed: the LLM edge is fully live (the
+Perplexity cookie pool) and memory is a real SharedMemory.
+
+Backends (LIVE_BACKEND, default: hyperbrowser when HB_API_KEY is set,
+else the free local cookie WebSocket):
+    local        raw cookie WebSocket from THIS machine — free, no key,
+                 needs a residential IP (Perplexity 403-blocks datacenters)
+    hyperbrowser stealth cloud browser (residential proxy) — works from
+                 datacenter IPs, needs HB_API_KEY / HB_API_KEYS
 
 Env:
-    HB_API_KEY   Hyperbrowser API key (required)
+    HB_API_KEY   Hyperbrowser API key (enables the hyperbrowser backend)
+    LIVE_BACKEND backend override: "local" | "hyperbrowser" (optional)
     LIVE_TOPIC   research topic override (optional)
+    LIVE_REPORT  report path override (default: data/live_run_report.json)
 
 Usage:
-    HB_API_KEY=... python scripts/live_research_run.py
+    HB_API_KEY=... python scripts/live_research_run.py   # cloud backend
+    python scripts/live_research_run.py                  # local cookies
 """
 from __future__ import annotations
 
@@ -46,7 +56,17 @@ def build_ctx(settings: Settings, host: BrowserSessionHost, mem: SharedMemory):
     """AgentContext-shaped namespace with GitHub/workspace edges stubbed."""
     from types import SimpleNamespace
 
-    return SimpleNamespace(
+    def _report(node: str = "", status: str = "working", task_id: int | None = None,
+                task_title: str | None = None, intent: dict | None = None,
+                event: str = "", detail: str | dict = "", **_) -> None:
+        # same contract as AgentContext.report (agents/base.py): live state +
+        # optional journal entry, so the dashboard shows the run while it goes
+        mem.report("live-r01", Role.RESEARCHER.value, node=node, status=status,
+                   cycle=0, task_id=task_id, task_title=task_title, intent=intent)
+        if event:
+            mem.journal("live-r01", event, detail)
+
+    ctx = SimpleNamespace(
         agent_id="live-r01",
         role=Role.RESEARCHER,
         settings=settings,
@@ -60,17 +80,27 @@ def build_ctx(settings: Settings, host: BrowserSessionHost, mem: SharedMemory):
         merge_queue=None,
         cycle=0,
         meta={"personal": FakePersonal()},
-        # node_start announces intent through ctx.report(node=..., status=...,
-        # intent=...); the orchestrator renders it, the live script drops it
-        report=lambda **kw: None,
-        heartbeat=lambda *a, **k: None,
+        heartbeat=lambda status="working": None,
     )
+    ctx.report = _report
+    return ctx
 
 
 async def main() -> None:
     settings = Settings()
-    settings.browser_backend = "hyperbrowser"
-    settings.hyperbrowser_api_key = os.environ["HB_API_KEY"]
+    hb_key = os.environ.get("HB_API_KEY", "") or settings.hyperbrowser_api_key
+    backend = os.environ.get("LIVE_BACKEND", "").lower() or (
+        "hyperbrowser" if hb_key else "local")
+    if backend not in ("local", "hyperbrowser"):
+        print(f"ERROR: unknown LIVE_BACKEND {backend!r} (local | hyperbrowser)")
+        sys.exit(2)
+    settings.browser_backend = backend
+    if backend == "hyperbrowser":
+        if not hb_key:
+            print("ERROR: LIVE_BACKEND=hyperbrowser needs HB_API_KEY "
+                  "(or LIVE_BACKEND=local for the free cookie WebSocket)")
+            sys.exit(2)
+        settings.hyperbrowser_api_key = hb_key
     settings.research_topic = os.environ.get("LIVE_TOPIC", DEFAULT_TOPIC)
     settings.ensure_dirs()
 
@@ -78,7 +108,7 @@ async def main() -> None:
     mem = SharedMemory(scratch / "memory.db")
     host = BrowserSessionHost.from_settings(settings)
     ctx = build_ctx(settings, host, mem)
-    report = {"topic": settings.research_topic, "backend": "hyperbrowser"}
+    report = {"topic": settings.research_topic, "backend": backend}
 
     t0 = time.monotonic()
     state = {}
@@ -90,6 +120,7 @@ async def main() -> None:
     report["research"] = {
         "done": state.get("done"), "error": state.get("error", ""),
         "citations": state.get("citations", []),
+        "answer": answer,
         "answer_chars": len(answer),
         "bibtex": state.get("bibtex", ""),
     }
@@ -131,7 +162,8 @@ async def main() -> None:
         await client.close()
     mem.close()
 
-    out = Path("/home/z/my-project/download/hb_test/live_run_report.json")
+    out = Path(os.environ.get(
+        "LIVE_REPORT", str(REPO / "data" / "live_run_report.json")))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"report saved: {out} | total wall time: {time.monotonic() - t0:.0f}s")
