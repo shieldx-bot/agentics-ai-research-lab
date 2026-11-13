@@ -875,6 +875,11 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             await asyncio.to_thread(
                 settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
                 method="hypothesis_contract")
+            # the protocol file rides the branch — the MR record must list it,
+            # or the reviewer sees a diff file the record does not explain
+            # (the protocol IS the evidence's source code)
+            state["changed_files"] = sorted(
+                set(state.get("changed_files") or []) | {hyp.script_path})
             note = (ev.meta.get("note") or ev.output[:160]) if ev.meta else ev.output[:160]
             if ev.verdict == "refuted":
                 return await _yield(

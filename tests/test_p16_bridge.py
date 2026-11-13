@@ -213,4 +213,4 @@ def test_protocol_file_joins_the_mr_record(tmp_path):
     state = asyncio.run(nodes.node_implement(
         _impl_ctx(mem, ws), _impl_state(hypotheses=[_VALID_RAW])))
     assert ws.pushed
-    assert "research_notes/experiments/cache-hit-rate-h1.py" in state["changed_files"]
+    assert "research_notes/experiments/cache-hit-rate.py" in state["changed_files"]
