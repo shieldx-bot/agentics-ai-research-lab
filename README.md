@@ -158,17 +158,24 @@ sẽ không ai lặp lại). Owner xem bằng `agentics evidence` /
 
 **Free research tools — nguồn bằng chứng thật, không cần API key:** node
 research không còn phụ thuộc mạng sống/chết của cookie LLM. Khi LLM fail,
-finding được dựng từ metadata thật của **arXiv / OpenAlex / Crossref** (tác
-giả, năm, abstract, số trích dẫn — fetch từ API chính thức, không phải LLM
-đẻ ra) và BibTeX được làm giàu bằng metadata nhà xuất bản thay vì scrape thẻ
-title. Kèm thêm HuggingFace datasets (tìm dữ liệu thật cho protocol kiểm
-chứng), Wikipedia (định nghĩa thuật ngữ) và DuckDuckGo (web fallback) — tất
-cả keyless, degrade graceful, tôn trọng rate limit. Owner dùng trực tiếp:
+finding được dựng từ metadata thật của **arXiv / OpenAlex / Crossref /
+Semantic Scholar / Europe PMC** (tác giả, năm, abstract, số trích dẫn —
+fetch từ API chính thức, không phải LLM đẻ ra) và BibTeX được làm giàu bằng
+metadata nhà xuất bản thay vì scrape thẻ title. `search_all` chạy 3 nguồn
+song song trên 3 budget rate-limit độc lập rồi lấp chỗ trống theo tầng —
+OpenAlex bị 429 trên IP datacenter không còn làm rỗng finding. Kèm
+**verification toolkit**: HuggingFace datasets + models (dữ liệu và weights
+thật cho protocol), GitHub repo search (ý tưởng đã có code chưa? repo tham
+chiếu để clone vào sandbox) và PyPI package lookup (version thật để pin vào
+`verify_cmds` — tái lập P16) — tất cả keyless, degrade graceful, tôn trọng
+rate limit. Owner dùng trực tiếp:
 
 ```bash
 python -m agentics.cli papers "ML for NFV"                       # bảng bài báo + BibTeX thật
 python -m agentics.cli papers --doi 10.1109/netsoft48620.2020.9165348
 python -m agentics.cli papers "intrusion detection" --datasets
+python -m agentics.cli papers "nfv scheduler" --github            # repo tham chiếu
+python -m agentics.cli papers --pypi scikit-learn                 # version thật để pin
 ```
 
 Chi tiết: [docs/FREE_TOOLS.md](docs/FREE_TOOLS.md).

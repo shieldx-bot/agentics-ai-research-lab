@@ -1077,11 +1077,14 @@ def mr_merge(
 
 @app.command("papers")
 def papers(
-    query: str = typer.Argument(None, help="Search phrase (scholarly / datasets / web)"),
+    query: str = typer.Argument(None, help="Search phrase (scholarly / datasets / models / repos / web)"),
     source: str = typer.Option("all", "--source", "-s",
-                               help="Scholarly source: all | arxiv | openalex | crossref"),
+                               help="Scholarly source: all | arxiv | openalex | crossref | semanticscholar | europepmc"),
     max_results: int = typer.Option(8, "--max", help="Rows per source"),
     datasets: bool = typer.Option(False, "--datasets", help="Search Hugging Face datasets instead"),
+    models: bool = typer.Option(False, "--models", help="Search Hugging Face models instead"),
+    github: bool = typer.Option(False, "--github", help="Search GitHub repos instead (reference implementations)"),
+    pypi: str = typer.Option("", "--pypi", help="One PyPI package: existence + latest real version to pin"),
     web: bool = typer.Option(False, "--web", help="DuckDuckGo web search instead"),
     define: bool = typer.Option(False, "--define", help="Wikipedia summary of the term instead"),
     doi: str = typer.Option("", "--doi", help="Resolve one DOI to real-metadata BibTeX"),
@@ -1089,17 +1092,21 @@ def papers(
     """Search the FREE keyless research tools directly (no LLM cookies).
 
     Same sources the agents fall back to when the LLM pools are dead —
-    arXiv / OpenAlex / Crossref return real publisher metadata (authors,
-    year, abstract, citation counts), never LLM-generated text. Quick way
-    to sanity-check the evidence path before starting a run.
+    arXiv / OpenAlex / Crossref / Semantic Scholar / Europe PMC return real
+    publisher metadata (authors, year, abstract, citation counts), never
+    LLM-generated text. GitHub/PyPI/HuggingFace ground the verification
+    side: reference implementations to clone, datasets/models to feed a
+    protocol, real dependency versions to pin. Quick way to sanity-check
+    the evidence path before starting a run.
     """
     setup_logging("ERROR")
     settings = _settings()
     if not getattr(settings, "free_tools_enabled", True):
         console.print("[red]Free tools are disabled[/] — set FREE_TOOLS_ENABLED=1")
         raise typer.Exit(1)
-    if not any((query, datasets, web, define, doi)):
-        console.print("Nothing to search — give QUERY or one of --datasets/--web/--define/--doi")
+    if not any((query, datasets, models, github, pypi, web, define, doi)):
+        console.print("Nothing to search — give QUERY or one of "
+                      "--datasets/--models/--github/--pypi/--web/--define/--doi")
         raise typer.Exit(1)
     import asyncio as _aio
     from agentics.research import free_tools as ft
@@ -1108,6 +1115,17 @@ def papers(
         if doi:
             bib = await ft.crossref_bibtex(doi, settings=settings)
             console.print(bib or f"[yellow]no BibTeX found for DOI {doi}[/]")
+            return
+        if pypi:
+            info = await ft.pypi_package_info(pypi, settings=settings)
+            if not info:
+                console.print(f"[yellow]no PyPI package named '{pypi}'[/]")
+                return
+            console.print(f"[bold]{info['name']}=={info['version']}[/] "
+                          f"(requires Python {info['requires_python'] or '?'})")
+            if info["summary"]:
+                console.print(info["summary"])
+            console.print(f"[dim]pin: {info['name']}=={info['version']}{(' — ' + info['home_page']) if info['home_page'] else ''}[/]")
             return
         if define:
             info = await ft.wikipedia_summary(query or "", settings=settings)
@@ -1126,6 +1144,29 @@ def papers(
                 table.add_row(r["id"], str(r["downloads"] or 0), str(r["likes"] or 0), r["url"])
             console.print(table if rows else "[yellow]no datasets found[/]")
             return
+        if models:
+            rows = await ft.hf_models_search(query or "", max_results, settings=settings)
+            table = Table(title=f"Hugging Face models: {query}")
+            for col in ("model", "downloads", "likes", "task", "url"):
+                table.add_column(col, overflow="fold")
+            for r in rows:
+                table.add_row(r["id"], str(r["downloads"] or 0), str(r["likes"] or 0),
+                              r["pipeline_tag"] or "-", r["url"])
+            console.print(table if rows else "[yellow]no models found[/]")
+            return
+        if github:
+            rows = await ft.github_repo_search(query or "", max_results, settings=settings)
+            table = Table(title=f"GitHub repos: {query} (reference implementations)")
+            for col in ("repo", "stars", "language", "license", "last push", "url"):
+                table.add_column(col, overflow="fold")
+            for r in rows:
+                table.add_row(f"{r['repo']}", str(r["stars"] if r["stars"] is not None else "-"),
+                              r["language"] or "-", r["license"] or "-", r["pushed_at"] or "-", r["url"])
+            console.print(table if rows else "[yellow]no repos found[/]")
+            for r in rows:
+                if r["description"]:
+                    console.print(f"[dim]{r['repo']}: {r['description']}[/]")
+            return
         if web:
             rows = await ft.ddg_web_search(query or "", max_results, settings=settings)
             for i, r in enumerate(rows, 1):
@@ -1140,6 +1181,10 @@ def papers(
             hits = await ft.openalex_search(query or "", max_results, settings=settings)
         elif source == "crossref":
             hits = await ft.crossref_works(query or "", max_results, settings=settings)
+        elif source == "semanticscholar":
+            hits = await ft.semantic_scholar_search(query or "", max_results, settings=settings)
+        elif source == "europepmc":
+            hits = await ft.europepmc_search(query or "", max_results, settings=settings)
         else:
             hits = await ft.search_all(query or "", max_results, settings=settings)
         if not hits:

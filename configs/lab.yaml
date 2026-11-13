@@ -76,10 +76,12 @@ integrity_interval_s: 20
 pplx_timeout: 180
 
 # --- Free keyless research tools (docs/FREE_TOOLS.md) -------------------------
-# Official publisher APIs (arXiv / OpenAlex / Crossref / HuggingFace /
-# Wikipedia / DuckDuckGo): real metadata, no key. node_research falls back
-# to them when the LLM pools are dead, and every finding's BibTeX is grounded
-# in publisher metadata instead of scraped <title> tags.
+# Official publisher APIs (arXiv / OpenAlex / Crossref / Semantic Scholar /
+# Europe PMC / GitHub / PyPI / HuggingFace / Wikipedia / DuckDuckGo): real
+# metadata, no key. node_research falls back to them when the LLM pools are
+# dead; search_all runs three scholarly budgets in parallel and the
+# verification toolkit (repos / PyPI pins / datasets / models) grounds every
+# finding in real code + data instead of scraped <title> tags.
 free_tools_enabled: true
 free_tools_timeout: 15
 # Optional polite-pool email for OpenAlex/Crossref (recommended in prod).
