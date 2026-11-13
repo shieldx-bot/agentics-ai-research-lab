@@ -294,20 +294,22 @@ def normalize_plan(parsed: dict, caps: dict | None = None) -> PlanCore:
     core = PlanCore()
     if not isinstance(parsed, dict):
         return core
-    core.parsed = parsed
+    core.parsed = parsed          # verbatim (identity kept for observability)
     core.approach = str(parsed.get("approach", "") or "")[:APPROACH_MAX]
-    core.steps = [str(s) for s in (parsed.get("steps") or [])][:16]
-    core.commit_message = str(parsed.get("commit_message") or "update")
-    core.verify_cmds = [str(c) for c in (parsed.get("verify_cmds") or [])
+    core.steps = [str(s)[:STEP_MAX] for s in (parsed.get("steps") or [])][:16]
+    core.commit_message = str(parsed.get("commit_message") or "update")[:COMMIT_MAX]
+    core.verify_cmds = [str(c)[:CMD_MAX] for c in (parsed.get("verify_cmds") or [])
                         if str(c).strip()][:caps["verify_cmds"]]
-    core.hypotheses = [h for h in (parsed.get("hypotheses") or [])
-                       if isinstance(h, dict)][:caps["hypotheses"]]
+    core.hypotheses = [
+        _bounded_hypothesis(h) for h in (parsed.get("hypotheses") or [])
+        if isinstance(h, dict)
+    ][:caps["hypotheses"]]
     core.reuses = [n for n in (parsed.get("reuses")
                    or parsed.get("reusable_tools") or [])
                    if isinstance(n, str)][:caps["reuses"]]
     files = parsed.get("files") or []
     core.expected_files = [
-        f.get("path", "") for f in files
+        f.get("path", "")[:PATH_MAX] for f in files
         if isinstance(f, dict) and f.get("path")
     ][:caps["files"]]
     core.extras = {
@@ -315,3 +317,90 @@ def normalize_plan(parsed: dict, caps: dict | None = None) -> PlanCore:
         if k not in _PLAN_KEYS
     }
     return core
+
+
+# Defensive per-item length caps for the machine contract. These bound the
+# typed core fields by construction: a verbose model must not turn one plan
+# field into a 50 KB string that later cannot fit the graph state.
+STEP_MAX = 300
+CMD_MAX = 300
+COMMIT_MAX = 200
+PATH_MAX = 300
+HYP_CODE_MAX = 6000
+
+
+def _bounded_hypothesis(h: dict) -> dict:
+    """One hypothesis with the free-text fields length-bounded (the `code`
+    protocol is the big one — full python source)."""
+    out = dict(h)
+    for key in ("claim", "prediction", "metric", "comparison"):
+        if key in out:
+            out[key] = str(out[key])[:CMD_MAX]
+    if "code" in out:
+        out["code"] = str(out["code"])[:HYP_CODE_MAX]
+    return out
+
+
+PLAN_STATE_CAP = 20000
+
+
+def plan_state_json(core: PlanCore, cap: int = PLAN_STATE_CAP) -> str:
+    """The full proposal as graph state — GUARANTEED-parseable JSON.
+
+    node_implement reloads this with json.loads, so a size cap that silently
+    truncates mid-string used to turn a good plan into a crash (a real live
+    run hit exactly that at the old 8000-char slice). Order of shrinking:
+    compact full dump -> drop the model's extra fields (approach + machine
+    contract kept) -> drop hypotheses (they live on separately in
+    ``state["hypotheses"]``) -> minimal valid dump. Never returns broken
+    JSON; only a pathologically small ``cap`` can force the last step."""
+    text = json.dumps(core.parsed, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= cap:
+        return text
+    # Overflow: rebuild the machine contract from the BOUNDED core fields
+    # (core.parsed keeps the model's raw values verbatim and is never the
+    # source of the slim dump).
+    files = core.parsed.get("files")
+    slim: dict = {
+        "approach": core.approach,
+        "steps": core.steps,
+        "commit_message": core.commit_message,
+        "verify_cmds": core.verify_cmds,
+        "hypotheses": core.hypotheses,
+        "reuses": core.reuses,
+    }
+    if isinstance(files, list):
+        slim["files"] = [
+            {"path": str(f.get("path", ""))[:PATH_MAX],
+             "change": str(f.get("change", "new"))[:40]}
+            for f in files[:PLAN_CAPS["files"]] if isinstance(f, dict)
+        ]
+    text = json.dumps(slim, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= cap:
+        return text
+    slim.pop("hypotheses", None)
+    text = json.dumps(slim, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= cap:
+        return text
+    minimal = {
+        "approach": core.approach[:200],
+        "commit_message": core.commit_message,
+        "steps": core.steps[:4],
+        "_note": "plan exceeded the state cap; the full proposal stays in "
+                 "the typed state fields (verify_cmds, hypotheses, files…)",
+    }
+    return json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
+
+
+def extras_state_json(extras: dict, cap: int = 2000) -> str:
+    """The model's own extra plan fields for state — always-valid JSON.
+
+    Display-only surface (dashboard / owner), but tests and readers
+    json.loads it: on overflow the value degrades to a key summary instead
+    of a broken half-string."""
+    text = json.dumps(extras, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= cap:
+        return text
+    summary = {"_note": "extras exceeded the state cap; keys only",
+               "keys": sorted(str(k) for k in extras)[:20]}
+    return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))

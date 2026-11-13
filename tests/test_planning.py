@@ -367,3 +367,158 @@ def test_reflect_feeds_cycle_outcome_into_the_mission(mem):
     nodes.node_reflect(ctx, {"category": "code", "summary": "ok"})
     row = mem.get_role_prompt("coder", "code")
     assert row["successes"] == 1 and row["failures"] == 0  # decayed
+
+
+# ------------------------------------------------- always-parseable dumps
+def _big_plan(approach_size: int = 0, extras: dict | None = None) -> dict:
+    plan = {
+        "approach": "x" * approach_size,
+        "files": [{"path": "experiments/a.py", "change": "new"}],
+        "steps": ["step one"],
+        "commit_message": "m",
+        "verify_cmds": ["python experiments/a.py"],
+    }
+    if extras:
+        plan.update(extras)
+    return plan
+
+
+def test_plan_state_json_always_parses_even_when_huge():
+    """The live-run regression: an 8000-char slice corrupted a verbose plan."""
+    huge = _big_plan(extras={"memory_record": {"blob": "y" * 40000}})
+    core = planning.normalize_plan(huge)
+    state_plan = planning.plan_state_json(core)
+    parsed = json.loads(state_plan)              # must never raise
+    assert "memory_record" not in parsed         # extras dropped, contract kept
+    assert core.approach[:50] in state_plan
+    assert parsed["verify_cmds"] == ["python experiments/a.py"]
+
+
+def test_plan_state_json_small_plan_is_the_full_dump():
+    core = planning.normalize_plan(
+        _big_plan(approach_size=50, extras={"risks": ["1GB inputs"]}))
+    state_plan = planning.plan_state_json(core)
+    loaded = json.loads(state_plan)
+    assert loaded["risks"] == ["1GB inputs"]
+    assert loaded["approach"] == "x" * 50
+
+
+def test_plan_state_json_tiny_cap_falls_back_to_a_valid_minimal_dump():
+    core = planning.normalize_plan(_big_plan(approach_size=4000))
+    out = planning.plan_state_json(core, cap=500)
+    loaded = json.loads(out)                     # still valid JSON
+    assert loaded["commit_message"] == "m"
+    assert "_note" in loaded
+
+
+def test_extras_state_json_overflow_degrades_to_key_summary():
+    small = planning.extras_state_json({"risks": ["r1"]})
+    assert json.loads(small) == {"risks": ["r1"]}
+    big = planning.extras_state_json({"blob": "z" * 5000})
+    loaded = json.loads(big)
+    assert loaded["keys"] == ["blob"]
+
+
+def test_normalize_plan_bounds_every_field():
+    plan = {
+        "approach": "a" * 5000,
+        "steps": ["s" * 5000],
+        "commit_message": "c" * 5000,
+        "verify_cmds": ["python " + "v" * 5000],
+        "files": [{"path": "p/" + "f" * 5000, "change": "new"}],
+        "hypotheses": [{"claim": "h" * 5000, "code": "print(1)\n" * 2000}],
+    }
+    core = planning.normalize_plan(plan)
+    assert len(core.steps[0]) == planning.STEP_MAX
+    assert len(core.commit_message) == planning.COMMIT_MAX
+    assert len(core.verify_cmds[0]) == planning.CMD_MAX
+    assert len(core.expected_files[0]) == planning.PATH_MAX
+    assert len(core.hypotheses[0]["code"]) == planning.HYP_CODE_MAX
+
+
+def test_plan_state_json_oversize_hypothesis_protocols_stay_parseable():
+    """Two 6KB protocols + a 40KB extra: slim path keeps the contract and
+    the state dump still loads."""
+    plan = _big_plan(extras={"memory_record": {"blob": "y" * 40000}})
+    plan["hypotheses"] = [
+        {"claim": f"c{i}", "metric": "precision", "comparison": ">=",
+         "threshold": 0.9, "code": "print(1)  #" + "x" * 6000}
+        for i in range(2)
+    ]
+    core = planning.normalize_plan(plan)
+    out = planning.plan_state_json(core)
+    loaded = json.loads(out)
+    assert "memory_record" not in loaded
+    assert len(loaded["hypotheses"]) == 2
+    assert loaded["hypotheses"][0]["code"].startswith("print(1)")
+
+
+# ------------------------------------------------- plan parse resilience
+def test_plan_retries_once_when_the_model_answers_in_prose(mem, monkeypatch):
+    """Live-run resilience: prose answers happen; one strict reminder turns
+    most of them into the JSON contract. A recovered retry is journalled."""
+    from agentics.graph import nodes
+
+    good = json.dumps({
+        "approach": "Chunk then parse.",
+        "files": [{"path": "experiments/p.py", "change": "new"}],
+        "steps": ["chunk"], "commit_message": "feat: chunked parser",
+        "verify_cmds": ["python experiments/p.py"],
+    })
+    asks: list[str] = []
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        asks.append(prompt)
+        if len(asks) == 1:
+            return "Here is my plan, hope you like it!", []
+        return good, []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    state = asyncio.run(nodes.node_plan(
+        ctx, {"issue_number": 1, "issue_title": "t", "category": "code",
+              "papers": [{"answer": ""}]}))
+    assert len(asks) == 2                        # exactly ONE retry
+    assert "not one JSON object" in asks[1]      # strict reminder appended
+    assert json.loads(state["plan"])["approach"] == "Chunk then parse."
+    assert not state.get("error")
+    events = [e["event"] for e in mem.recent_journal(limit=10)]
+    assert "plan_retry_recovered" in events
+
+
+def test_plan_after_a_failed_retry_still_ends_the_cycle(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    asks: list[str] = []
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        asks.append(prompt)
+        return "still not json", []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    state = asyncio.run(nodes.node_plan(
+        ctx, {"issue_number": 1, "issue_title": "t", "category": "code",
+              "papers": [{"answer": ""}]}))
+    assert len(asks) == 2
+    assert state["error"] == "plan parsing failed" and state["done"]
+
+
+def test_plan_provider_failure_does_not_retry(mem, monkeypatch):
+    """A provider error recorded in state must not burn a second ask."""
+    from agentics.graph import nodes
+
+    asks: list[str] = []
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        asks.append(prompt)
+        state["error"] = "llm plan call failed: cookie cooling down"
+        return "", []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    state = asyncio.run(nodes.node_plan(
+        ctx, {"issue_number": 1, "issue_title": "t", "category": "code",
+              "papers": [{"answer": ""}]}))
+    assert len(asks) == 1                        # no retry on provider failure
+    assert state["error"].startswith("llm plan call failed")

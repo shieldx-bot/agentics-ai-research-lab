@@ -363,3 +363,116 @@ def test_ask_raises_ui_error_on_silent_empty_answer(tmp_path, monkeypatch):
     with pytest.raises(hb.HyperbrowserUIError, match="no answer text"):
         asyncio_run(client.ask("hello"))
     assert torn_down == [1]           # session rebuilt on the next ask
+
+
+# ------------------------------------------------- orphan session sweep
+class _FakeSessions:
+    """sessions.create/list/stop fake — records every call."""
+
+    def __init__(self, create_error=None, active_ids=(), stop_ok=True):
+        self.create_error = create_error
+        self.active_ids = list(active_ids)
+        self.stop_ok = stop_ok
+        self.created = 0
+        self.stopped: list[str] = []
+
+    def create(self, _params):
+        self.created += 1
+        if self.create_error is not None and self.created <= 1:
+            raise self.create_error
+
+        class _S:
+            id = f"s{self.created}"
+            ws_endpoint = "wss://cdp"
+        return _S()
+
+    def list(self, _params):
+        ids = list(self.active_ids)   # bind before the nested class (its
+        class _R:                     # self would be _R, not the fake)
+            def model_dump(self):     # their helper reads model_dump()
+                return {"sessions": [{"id": sid, "status": "active"}
+                                     for sid in ids]}
+        return _R()
+
+    def stop(self, sid):
+        if not self.stop_ok:
+            raise RuntimeError("already stopped")
+        self.stopped.append(sid)
+
+
+def _client_with(tmp_path, sessions, monkeypatch):
+    """A client whose Hyperbrowser SDK constructor returns the fake."""
+    import agentics.llm.hyperbrowser_client as hb
+    import hyperbrowser as hb_sdk
+
+    fake_hb = type("HB", (), {"sessions": sessions})()
+    # _ensure_session does `from hyperbrowser import Hyperbrowser` at call
+    # time, so the SDK module itself must be patched.
+    monkeypatch.setattr(hb_sdk, "Hyperbrowser", lambda api_key=None: fake_hb)
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path, browser_backend="hyperbrowser",
+                  hyperbrowser_api_key="hb_x"),
+    )
+    hb._ACTIVE_BY_KEY.pop(client.api_key, None)
+    return client
+
+
+def _stop_at_playwright(monkeypatch):
+    """_ensure_session builds the CDP connection after create — stop there."""
+    import playwright.async_api as papi
+
+    class _NoPW:
+        async def start(self):
+            raise RuntimeError("stop at playwright")
+
+    monkeypatch.setattr(papi, "async_playwright", lambda: _NoPW())
+
+
+def test_ensure_session_sweeps_orphans_and_retries(tmp_path, monkeypatch):
+    """The live incident: a killed process leaves its session running; the
+    token's single slot is busy; create fails with 'Maximum number of
+    active sessions (1) reached'. The client sweeps and retries ONCE."""
+    _stop_at_playwright(monkeypatch)
+    fake = _FakeSessions(
+        create_error=RuntimeError(
+            "Maximum number of active sessions (1) reached. Please close "
+            "some sessions before creating new ones."),
+        active_ids=("orphan-1", "orphan-2"),
+    )
+    client = _client_with(tmp_path, fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="stop at playwright"):
+        asyncio_run(client._ensure_session())
+    assert fake.created == 2                       # create -> sweep -> retry
+    # the sweep stops exactly the two orphans; the later teardown also stops
+    # the freshly created session, so only the first two entries matter
+    assert fake.stopped[:2] == ["orphan-1", "orphan-2"]
+
+
+def test_ensure_session_only_sweeps_on_the_session_cap_error(tmp_path, monkeypatch):
+    fake = _FakeSessions(create_error=RuntimeError("quota exhausted"))
+    client = _client_with(tmp_path, fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="quota"):
+        asyncio_run(client._ensure_session())
+    assert fake.created == 1 and fake.stopped == []
+
+
+def test_ensure_session_retries_even_when_the_sweep_frees_nothing(tmp_path, monkeypatch):
+    """Their loop always retries once after the sweep — even when the server
+    lists no active sessions (a stop may still be propagating)."""
+    _stop_at_playwright(monkeypatch)
+    fake = _FakeSessions(
+        create_error=RuntimeError("Maximum number of active sessions (1) reached."),
+        active_ids=(),                                # server lists nothing
+    )
+    client = _client_with(tmp_path, fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="stop at playwright"):
+        asyncio_run(client._ensure_session())
+    assert fake.created == 2                      # retried once regardless
+
+
+def test_sweep_tolerates_a_failing_stop(tmp_path, monkeypatch):
+    fake = _FakeSessions(stop_ok=False, active_ids=("ghost",))
+    client = _client_with(tmp_path, fake, monkeypatch)
+    assert asyncio_run(client._stop_leaked_sessions()) is None  # never raises
+    assert fake.stopped == []
