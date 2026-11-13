@@ -104,39 +104,6 @@ def coerce_cmd(cmd: str | list[str]) -> tuple[list[str] | None, str]:
     )
 
 
-def run_experiment(workspace, cmd: list[str] | str, timeout: int = 300) -> Evidence:
-    """Run one verification command in the agent workspace; return evidence.
-
-    Verdict comes from the process exit code, NOT from any model:
-      * 0    -> confirmed   (the check the plan declared actually passed)
-      * 124  -> inconclusive (timed out)
-      * 126  -> inconclusive (command rejected by the guard — e.g. protected
-                path; the agent must re-plan, never "believes" success)
-      * else -> refuted (the hypothesis did not hold under test)
-
-    Plan-JSON strings are coerced to argv (see coerce_cmd) — a shell is
-    never involved, so a declared check either really runs or is recorded
-    as inconclusive with the reason. node_implement additionally normalizes
-    the plan's list via normalize_verify_cmds (active interpreter only)."""
-    argv, reason = coerce_cmd(cmd)
-    if argv is None:
-        return Evidence(
-            cmd=str(cmd)[:400], exit_code=EXIT_BLOCKED, verdict="inconclusive",
-            output=f"command rejected: {reason}",
-        )
-    started = time.monotonic()
-    exit_code, output = workspace.run_command(argv, timeout=timeout)
-    duration = time.monotonic() - started
-    return Evidence(
-        cmd=" ".join(argv),
-        exit_code=int(exit_code),
-        verdict=_verdict_for(int(exit_code)),
-        output=output,
-        duration_s=duration,
-        ok=int(exit_code) == 0,
-    )
-
-
 def verdict_for(exit_code: int) -> str:
     """Public verdict mapping — the reviewer re-run reuses the exact same
     semantics as the author's run (one exit code, one verdict, no opinions)."""
@@ -177,7 +144,7 @@ def cmds_from_evidence(
     return uniq[-max_cmds:]
 
 
-def run_experiment(workspace, cmd: list[str], timeout: int = 300) -> Evidence:
+def run_experiment(workspace, cmd: list[str] | str, timeout: int = 300) -> Evidence:
     """Run one verification command in the agent workspace; return evidence.
 
     Verdict comes from the process exit code, NOT from any model:
