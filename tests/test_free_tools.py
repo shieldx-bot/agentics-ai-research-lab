@@ -181,6 +181,111 @@ def test_crossref_works_fields(monkeypatch):
     assert h.abstract == "Clean markup test."     # JATS tags stripped
 
 
+# ---------------------------------------------------------------- Semantic Scholar / Europe PMC
+def test_semantic_scholar_fields(monkeypatch):
+    data = {"total": 2, "data": [
+        {"paperId": "aaa111", "title": "NFV Failure Prediction",
+         "abstract": " Deep learning  on NFV telemetry. ",
+         "year": 2024, "venue": "IEEE NetSoft", "citationCount": 17,
+         "authors": [{"name": "Jane Doe"}, {"name": "John Roe"}],
+         "externalIds": {"DOI": "10.1/s2", "ArXiv": "2401.99999"},
+         "url": "https://www.semanticscholar.org/paper/aaa111"},
+        {"paperId": "bbb222", "title": "No DOI Preprint",
+         "year": 2023, "externalIds": {"ArXiv": "2312.00001"},
+         "authors": [], "citationCount": 0},
+        {"paperId": "ccc333", "title": "  "},        # blank title dropped
+    ]}
+
+    async def fake_json(url, params=None, **kw):
+        assert "semanticscholar" in url
+        assert params["fields"].startswith("title,abstract")
+        assert params["limit"] == 5
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    hits = asyncio.run(ft.semantic_scholar_search("nfv", 5))
+    assert len(hits) == 2                          # blank title skipped
+    h = hits[0]
+    assert h.source == "semanticscholar" and h.cited_by == 17 and h.year == 2024
+    assert h.doi == "10.1/s2"
+    assert h.url == "https://doi.org/10.1/s2"      # DOI beats arXiv id for the URL
+    assert h.authors == ["Jane Doe", "John Roe"] and h.venue == "IEEE NetSoft"
+    assert h.abstract == "Deep learning on NFV telemetry."
+    assert hits[1].url == "https://arxiv.org/abs/2312.00001"  # arXiv fallback
+
+
+def test_semantic_scholar_disabled_or_empty(monkeypatch):
+    calls = []
+
+    async def fake_json(url, **kw):
+        calls.append(url)
+        return {"data": []}
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.semantic_scholar_search("q", 3, off)) == []
+    assert asyncio.run(ft.semantic_scholar_search("", 3)) == []
+    asyncio.run(ft.semantic_scholar_search("q", 3))
+    asyncio.run(ft.semantic_scholar_search("q", 3))   # cache hit -> one call only
+    assert len(calls) == 1
+
+
+def test_europepmc_fields(monkeypatch):
+    data = {"hitCount": 1, "resultList": {"result": [{
+        "id": "42943362", "source": "MED", "pmid": "42943362",
+        "title": "Auto-scaling NFV with Reinforcement Learning",
+        "authorString": "Jane Doe, John Roe, Extra Author",
+        "abstractText": "<p>RL scaling of <i>VNF</i> targets.</p>",
+        "pubYear": "2025", "journalTitle": "IEEE TNSM",
+        "doi": "10.1/epmc", "citedByCount": 4,
+    }]}}
+
+    async def fake_json(url, params=None, **kw):
+        assert "europepmc" in url
+        assert params["format"] == "json" and params["pageSize"] == 5
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    hits = asyncio.run(ft.europepmc_search("nfv scaling", 5))
+    h = hits[0]
+    assert h.source == "europepmc" and h.year == 2025 and h.cited_by == 4
+    assert h.doi == "10.1/epmc" and h.url == "https://doi.org/10.1/epmc"
+    assert h.venue == "IEEE TNSM"
+    assert h.abstract == "RL scaling of VNF targets."  # markup stripped
+    assert h.authors == ["Jane Doe", "John Roe", "Extra Author"]
+
+
+def test_europepmc_no_doi_uses_article_url(monkeypatch):
+    data = {"resultList": {"result": [{
+        "id": "PPR001", "source": "PPR", "title": "Preprint Only",
+        "pubYear": "2024", "authorString": "Alan Smithee",
+    }]}}
+
+    async def fake_json(url, **kw):
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    hits = asyncio.run(ft.europepmc_search("preprint", 3))
+    assert hits[0].url == "https://europepmc.org/article/PPR/PPR001"
+    assert hits[0].doi == "" and hits[0].cited_by is None
+
+
+def test_europepmc_disabled_or_empty(monkeypatch):
+    calls = []
+
+    async def fake_json(url, **kw):
+        calls.append(url)
+        return None
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.europepmc_search("q", 3, off)) == []
+    assert asyncio.run(ft.europepmc_search("", 3)) == []
+    assert asyncio.run(ft.europepmc_search("q", 3)) == []
+    assert asyncio.run(ft.europepmc_search("q", 3)) == []  # cached miss
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------- BibTeX enrichment
 SECOND_ARXIV_ENTRY = """  <entry>
     <id>http://arxiv.org/abs/2401.67890</id>
@@ -266,6 +371,9 @@ def test_search_all_dedups_and_fills_from_crossref(monkeypatch):
         return [_hit("openalex", "Same Paper", "https://doi.org/10.1/x", "10.1/x"),
                 _hit("openalex", "Only OpenAlex", "https://doi.org/10.1/y", "10.1/y")]
 
+    async def s2(query, max_results=8, settings=None):
+        return [_hit("semanticscholar", "Same Paper", "https://doi.org/10.1/x", "10.1/x")]
+
     crossref_called = []
 
     async def crossref(query, max_results=8, settings=None):
@@ -274,10 +382,39 @@ def test_search_all_dedups_and_fills_from_crossref(monkeypatch):
 
     monkeypatch.setattr(ft, "arxiv_search", arxiv)
     monkeypatch.setattr(ft, "openalex_search", openalex)
+    monkeypatch.setattr(ft, "semantic_scholar_search", s2)
     monkeypatch.setattr(ft, "crossref_works", crossref)
     merged = asyncio.run(ft.search_all("q", 8))
     assert [h.title for h in merged] == ["Same Paper", "Only OpenAlex", "Crossref Fill"]
     assert crossref_called == ["q"]
+
+
+def test_search_all_fills_from_europepmc_when_first_tiers_short(monkeypatch):
+    """Crossref ALSO exhausted (e.g. shared-IP budget) -> Europe PMC licks in.
+    Three independent budgets, one never empties the finding."""
+
+    async def empty(query, max_results=8, settings=None):
+        return []
+
+    async def epmc(query, max_results=8, settings=None):
+        return [_hit("europepmc", "EPMC Survival", "https://europepmc.org/article/MED/1"),
+                _hit("europepmc", "EPMC Second", "https://doi.org/10.2/a", "10.2/a")]
+
+    for name in ("arxiv_search", "openalex_search", "semantic_scholar_search",
+                 "crossref_works"):
+        monkeypatch.setattr(ft, name, empty)
+    monkeypatch.setattr(ft, "europepmc_search", epmc)
+    merged = asyncio.run(ft.search_all("q", 8))
+    assert [h.title for h in merged] == ["EPMC Survival", "EPMC Second"]
+
+
+def test_answer_text_lists_sources_dynamically():
+    """The fallback answer names the sources that ACTUALLY answered."""
+    hits = [_hit("semanticscholar", "S2 Paper", "https://doi.org/10.3/s", "10.3/s"),
+            _hit("europepmc", "EPMC Paper", "https://doi.org/10.3/e", "10.3/e")]
+    text = ft._answer_text("nfv", hits)
+    assert "europepmc, semanticscholar" in text
+    assert "not generated by a language model" in text
 
 
 def test_fallback_research_shape(monkeypatch):

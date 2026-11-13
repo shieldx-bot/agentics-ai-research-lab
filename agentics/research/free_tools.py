@@ -14,14 +14,18 @@ ground truth, never generated. They complement the cookie-based LLM pools:
 
 Sources (all keyless, free; no account, no token):
 
-| Source      | Endpoint                          | Politeness                     |
-| ----------- | --------------------------------- | ------------------------------ |
-| arXiv       | export.arxiv.org/api/query        | 3 s between calls, shared lock |
-| OpenAlex    | api.openalex.org/works            | mailto polite-pool parameter   |
-| Crossref    | api.crossref.org/works, doi.org   | mailto polite-pool parameter   |
-| HuggingFace | huggingface.co/api/datasets       | plain GET                      |
-| Wikipedia   | en.wikipedia.org/api/rest_v1      | plain GET                      |
-| DuckDuckGo  | html.duckduckgo.com/html/         | best-effort, graceful failure  |
+| Source           | Endpoint                                 | Politeness                     |
+| ---------------- | ---------------------------------------- | ------------------------------ |
+| arXiv            | export.arxiv.org/api/query               | 3 s between calls, shared lock |
+| OpenAlex         | api.openalex.org/works                   | mailto polite-pool parameter   |
+| Crossref         | api.crossref.org/works, doi.org          | mailto polite-pool parameter   |
+| SemanticScholar  | api.semanticscholar.org/graph/v1/paper   | anonymous pool, 429 retried    |
+| EuropePMC        | ebi.ac.uk/europepmc/webservices/rest     | plain GET, generous budget     |
+| HuggingFace      | huggingface.co/api/{datasets,models}     | plain GET                      |
+| Wikipedia        | en.wikipedia.org/api/rest_v1             | plain GET                      |
+| DuckDuckGo       | html.duckduckgo.com/html/                | best-effort, graceful failure  |
+| GitHub (repos)   | api.github.com/search/repositories       | 1 call / 6.5 s, shared lock    |
+| PyPI             | pypi.org/pypi/<name>/json                | plain GET                      |
 
 Transport is ``aiohttp`` (already a core dependency) with a per-request
 timeout; every function degrades gracefully (returns ``[]``/``None``) so a
@@ -386,6 +390,106 @@ async def crossref_bibtex(doi: str, settings=None) -> str:
     return (body or "").strip()
 
 
+# ---------------------------------------------------------------- Semantic Scholar
+async def semantic_scholar_search(query: str, max_results: int = 8, settings=None) -> list[PaperHit]:
+    """Search Semantic Scholar's public graph — real citation counts, TLDR.
+
+    OpenAlex is documented to 429 on shared datacenter IPs (FREE_TOOLS.md
+    §5); Semantic Scholar runs a separate anonymous pool, so it fills the
+    same scholarly role from an independent budget. DOI/arXiv ids from
+    ``externalIds`` keep the citation URLs resolvable for BibTeX grounding.
+    """
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("s2", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    data = await _get_json(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        params={
+            "query": query,
+            "limit": max(1, min(int(max_results), 20)),
+            "fields": "title,abstract,year,authors,url,venue,citationCount,externalIds",
+        },
+        settings=settings,
+    )
+    hits: list[PaperHit] = []
+    for p in ((data or {}).get("data") or [])[: max(1, int(max_results))]:
+        title = " ".join((p.get("title") or "").split())
+        if not title:
+            continue
+        ext = p.get("externalIds") or {}
+        doi = (ext.get("DOI") or "").strip()
+        arx = (ext.get("ArXiv") or "").strip()
+        url = f"https://doi.org/{doi}" if doi else (
+            f"https://arxiv.org/abs/{arx}" if arx else (p.get("url") or ""))
+        hits.append(PaperHit(
+            source="semanticscholar",
+            title=title,
+            url=url,
+            year=p.get("year"),
+            authors=[(a.get("name") or "") for a in (p.get("authors") or [])],
+            abstract=" ".join((p.get("abstract") or "").split())[:1200],
+            venue=(p.get("venue") or "").strip() or "Semantic Scholar",
+            doi=doi,
+            cited_by=p.get("citationCount"),
+        ))
+    _cache_put(key, hits)
+    return hits
+
+
+# ---------------------------------------------------------------- Europe PMC
+async def europepmc_search(query: str, max_results: int = 8, settings=None) -> list[PaperHit]:
+    """Search Europe PMC — full abstracts + preprints from a third budget.
+
+    Covers biomed/CS/math literature OpenAlex and Crossref index thinly;
+    ``authorString`` is real metadata, never invented. Second-tier filler
+    in ``search_all`` so a finding still exists when the other pools are
+    exhausted.
+    """
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("europepmc", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    data = await _get_json(
+        "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+        params={
+            "query": query,
+            "format": "json",
+            "pageSize": max(1, min(int(max_results), 25)),
+        },
+        settings=settings,
+    )
+    hits: list[PaperHit] = []
+    results = (((data or {}).get("resultList") or {}).get("result") or [])[: max(1, int(max_results))]
+    for r in results:
+        title = " ".join((r.get("title") or "").split())
+        if not title:
+            continue
+        doi = (r.get("doi") or "").strip()
+        src = (r.get("source") or "").strip()
+        aid = (r.get("id") or "").strip()
+        url = f"https://doi.org/{doi}" if doi else (
+            f"https://europepmc.org/article/{src}/{aid}" if src and aid else "")
+        pub_year = (r.get("pubYear") or "").strip()
+        hits.append(PaperHit(
+            source="europepmc",
+            title=title,
+            url=url,
+            year=int(pub_year) if pub_year.isdigit() else None,
+            authors=[a.strip() for a in (r.get("authorString") or "").split(",") if a.strip()][:12],
+            abstract=" ".join(re.sub(r"<[^>]+>", " ", r.get("abstractText") or "").split())[:1200],
+            venue=(r.get("journalTitle") or "").strip() or "Europe PMC",
+            doi=doi,
+            cited_by=r.get("citedByCount"),
+        ))
+    _cache_put(key, hits)
+    return hits
+
+
 # ---------------------------------------------------------------- BibTeX enrichment
 def _bibtex_entry(key: str, hit: PaperHit, eprint: str = "") -> str:
     fields = [f"  title = {{{hit.title}}},"]
@@ -600,9 +704,10 @@ def _dedup(hits: list[PaperHit]) -> list[PaperHit]:
 
 
 def _answer_text(query: str, hits: list[PaperHit]) -> str:
+    sources = ", ".join(sorted({h.source for h in hits})) or "official APIs"
     lines = [
         f"Ground-truth literature on '{query}' fetched from keyless official APIs "
-        "(arXiv, OpenAlex, Crossref) — metadata below is real and verifiable, "
+        f"({sources}) — metadata below is real and verifiable, "
         "not generated by a language model.",
         "",
     ]
@@ -622,15 +727,21 @@ def _answer_text(query: str, hits: list[PaperHit]) -> str:
 
 
 async def search_all(query: str, max_results: int = 8, settings=None) -> list[PaperHit]:
-    """arXiv + OpenAlex in parallel, Crossref only when they came up short."""
-    arxiv, openalex = await asyncio.gather(
+    """arXiv + OpenAlex + Semantic Scholar in parallel; Crossref and Europe
+    PMC only when the first three came up short (independent rate budgets,
+    so one exhausted pool never empties a finding)."""
+    arxiv, openalex, s2 = await asyncio.gather(
         arxiv_search(query, max_results, settings),
         openalex_search(query, max_results, settings),
+        semantic_scholar_search(query, max_results, settings),
     )
-    merged = _dedup(arxiv + openalex)
+    merged = _dedup(arxiv + openalex + s2)
     if len(merged) < 3:
         crossref = await crossref_works(query, max_results, settings)
         merged = _dedup(merged + crossref)
+    if len(merged) < 3:
+        epmc = await europepmc_search(query, max_results, settings)
+        merged = _dedup(merged + epmc)
     return merged[:max_results]
 
 
