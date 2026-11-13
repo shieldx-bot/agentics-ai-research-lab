@@ -28,6 +28,18 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
     for a in agents:
         a["age_s"] = max(0, int(now - a["last_ts"]))
     reviews = memory.recent_reviews(limit=12)
+    # P19 — attach the peer-panel state so the owner sees WHO voted, WHAT the
+    # round is and how long the author has left to defend.
+    for r in reviews:
+        panel = memory.get_panel(r["id"])
+        if panel:
+            counts: dict[str, int] = {}
+            for v in memory.panel_votes(r["id"], round=panel["round"]):
+                counts[v["vote"]] = counts.get(v["vote"], 0) + 1
+            panel["votes"] = counts
+            if panel["state"] == "defense" and panel["due_ts"]:
+                panel["defense_left_s"] = max(0, int(panel["due_ts"] - now))
+        r["panel"] = panel
     return {
         "ts": now,
         "mode": "local-only (no GitHub)",
@@ -66,7 +78,8 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             if e.get("event") in ("integrity_drift", "scope_violation",
                                   "lock_conflict", "task_repair",
                                   "merge_failed", "p16_inconclusive",
-                                  "p16_hypothesis_invalid")
+                                  "p16_hypothesis_invalid",
+                                  "panel_rejected", "panel_sweep")
         ][:12],
         "memory": memory.memory_stats(),
         "activity": memory.recent_journal(limit=40),
@@ -149,7 +162,7 @@ _HTML = """<!doctype html>
     <div class="kv" id="taskcounts"></div>
     <table id="tasks"><thead><tr><th>#</th><th>Trạng thái</th><th>Tiêu đề</th><th>Agent</th></tr></thead><tbody></tbody></table></div>
   <div class="card"><h2>MR pipeline (review &amp; merge)</h2>
-    <table id="reviews"><thead><tr><th>MR</th><th>Trạng thái</th><th>Tác giả → Reviewer</th><th>Task</th></tr></thead><tbody></tbody></table></div>
+    <table id="reviews"><thead><tr><th>MR</th><th>Trạng thái</th><th>Tác giả → Reviewer</th><th>Task</th><th>Panel P19 (đánh giá lẫn nhau)</th></tr></thead><tbody></tbody></table></div>
   <div class="card"><h2>Claims &amp; Merge queue</h2>
     <div class="kv" id="claims"></div>
     <div class="kv" id="mq" style="margin-top:8px"></div></div>
@@ -202,10 +215,17 @@ function render(s){
     <tr><td>${t.id}</td><td><span class="pill ${esc(t.status)}">${esc(t.status)}</span></td>
     <td>${esc(t.title)}${t.exempt?' <span class="pill open">owner-exempt</span>':''}</td>
     <td>${esc(t.claimed_by||"-")}</td></tr>`).join("") || '<tr><td colspan="4" class="kv">trống</td></tr>';
-  document.querySelector("#reviews tbody").innerHTML = (s.reviews||[]).map(r=>`
-    <tr><td>#${r.id}</td><td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>
-    <td>${esc(r.author)} → ${esc(r.reviewer||"chờ")}</td><td>${r.task_id??'-'}</td></tr>`).join("")
-    || '<tr><td colspan="4" class="kv">chưa có MR nào</td></tr>';
+  document.querySelector("#reviews tbody").innerHTML = (s.reviews||[]).map(r=>{
+    const p = r.panel;
+    const panelCell = p
+      ? `<span class="pill ${esc(p.state)}">${esc(p.state)} r${p.round}</span> `
+        + Object.entries(p.votes||{}).map(([k,v])=>`${esc(k)}:${v}`).join(" ")
+        + (p.defense_left_s !== undefined ? ` · bảo vệ còn ${Math.round(p.defense_left_s/60)}p` : "")
+      : '<span class="kv">trước P19</span>';
+    return `<tr><td>#${r.id}</td><td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>
+    <td>${esc(r.author)} → ${esc(r.reviewer||"chờ")}</td><td>${r.task_id??'-'}</td>
+    <td>${panelCell}</td></tr>`;
+  }).join("") || '<tr><td colspan="5" class="kv">chưa có MR nào</td></tr>';
   document.getElementById("claims").innerHTML = (s.claims||[]).length
     ? (s.claims||[]).map(c=>`task #${c.task} → <b>${esc(c.agent)}</b> (${esc(c.branch)}) · còn ${c.expires_in_s}s`).join("<br>")
     : "không có claim nào đang giữ";

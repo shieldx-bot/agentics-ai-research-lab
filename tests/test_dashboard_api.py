@@ -163,3 +163,27 @@ def test_alerts_card_covers_repairs_and_p16_suspicions(mem, settings):
                   "p16_hypothesis_invalid", "integrity_drift"):
         assert event in events
     assert "lock_conflict" not in events            # none recorded here
+
+
+def test_state_shows_peer_panel_progress(mem, settings):
+    """P19: the owner sees the panel state, the votes and the defense clock."""
+    from agentics.peer_review import PeerPanel
+
+    mr_id = mem.open_review(task_id=None, title="[a04] work", body="b",
+                            author="a04", branch="agent/a04/task-1-x", files=[])
+    for agent in ("a02", "a03"):
+        mem.heartbeat(agent, "reviewer", 1)
+    panel = PeerPanel(mem, panel_size=2, defense_ttl_minutes=30)
+    panel.cast_vote(mr_id, "a02", "accept")            # 1/2 -> waiting
+    panel.cast_vote(mr_id, "a03", "reject", "no evidence on the branch")
+    s = _state(mem, settings)
+    row = next(r for r in s["reviews"] if r["id"] == mr_id)
+    assert row["panel"]["state"] == "defense"
+    assert row["panel"]["round"] == 1
+    assert row["panel"]["votes"] == {"accept": 1, "reject": 1}
+    assert row["panel"]["defense_left_s"] >= 0
+
+
+def test_alerts_card_covers_panel_rejections(mem, settings):
+    mem.journal("peer-panel", "panel_rejected", {"mr": 3, "why": "defense incomplete"})
+    assert "panel_rejected" in [a["event"] for a in _state(mem, settings)["alerts"]]
