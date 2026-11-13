@@ -179,6 +179,17 @@ class Settings:
     # visible before failing an ask with a diagnostic error (challenge page,
     # logged-out wall, or a UI markup change).
     hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
+    # Free keyless research tools (docs/FREE_TOOLS.md): arXiv / OpenAlex /
+    # Crossref / HuggingFace datasets / Wikipedia / DuckDuckGo. They ground
+    # research in real publisher metadata and keep node_research alive when
+    # every LLM cookie is dead. No account or token required for any source.
+    free_tools_enabled: bool = field(default_factory=lambda: _env_bool("FREE_TOOLS_ENABLED", True))
+    free_tools_timeout: float = field(
+        default_factory=lambda: _env_float("FREE_TOOLS_TIMEOUT", 15.0)
+    )
+    # Optional polite-pool contact for OpenAlex/Crossref (a plain email).
+    # Not required, but it puts the calls in the friendlier rate-limit tier.
+    free_tools_mailto: str = field(default_factory=lambda: _env("FREE_TOOLS_MAILTO"))
 
     @property
     def owner(self) -> str:
