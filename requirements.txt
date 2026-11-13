@@ -5,6 +5,7 @@ PyGithub>=2.5.0
 GitPython>=3.1.43
 aiohttp>=3.10.0
 websockets>=13.0
+hyperbrowser>=1.15.0
 PyYAML>=6.0.1
 python-dotenv>=1.0.1
 typer>=0.12.5
@@ -16,6 +17,8 @@ uvicorn>=0.30.0
 # VPS). Missing SDK = every LLM ask dies with ModuleNotFoundError; tests pass
 # because they stub the client, so this MUST stay a hard requirement.
 hyperbrowser>=1.15
+# The client drives the cloud session over Playwright CDP (docs/LLM_PROVIDERS.md).
+playwright>=1.45
 
 # Vector memory (optional but recommended)
 chromadb>=0.5.0

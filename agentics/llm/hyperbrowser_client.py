@@ -94,6 +94,16 @@ def _open_backend_circuit(reason: str, cooldown_s: int = 300) -> None:
     _BACKEND_COOLDOWN_REASON = reason[:180]
 
 
+def _session_died(exc: Exception) -> bool:
+    """Playwright's target-closed family: the CDP link to the cloud browser
+    dropped mid-ask (session duration cap, network blip). The stale handle
+    still looks alive on our side, so the ask must rebuild the session."""
+    text = str(exc)
+    if "Target page, context or browser has been closed" in text:
+        return True
+    return type(exc).__name__ in ("TargetClosedError", "TargetClosed")
+
+
 def _raw_cookie_export(account: CookieAccount) -> list | dict:
     """Prefer the raw cookie-editor export (CDP accepts it verbatim); fall
     back to the normalized name->value mapping when no file is available."""
@@ -212,7 +222,26 @@ class HyperbrowserClient:
             # one session per token: evict the current holder of THIS token
             # (holders on other tokens keep their sessions — that is the pool)
             await holder._teardown()
-        sess = await asyncio.to_thread(self._hb.sessions.create, self._session_params())
+        sess = None
+        for attempt in (1, 2):
+            try:
+                sess = await asyncio.to_thread(
+                    self._hb.sessions.create, self._session_params())
+                break
+            except Exception as exc:
+                if "Maximum number of active sessions" not in str(exc) or attempt == 2:
+                    raise
+                # A cap-sized token (1 session) hits 429 when a previous ask's
+                # session is still propagating its stop() on HB's side, or a
+                # crashed run leaked one. Sessions on THIS key can only be
+                # ours — one session per token by design (_ACTIVE_BY_KEY) —
+                # so stopping them is self-healing, never disruptive.
+                log.warning(
+                    "hyperbrowser session cap hit for this token; "
+                    "stopping leaked session(s) and retrying once")
+                await self._stop_leaked_sessions()
+        if sess is None:
+            raise RuntimeError("hyperbrowser session creation failed")
         self._session_id = sess.id
         log.info("hyperbrowser session %s created for %s", sess.id, self.account.name)
         try:
@@ -228,6 +257,23 @@ class HyperbrowserClient:
             await self._teardown()
             raise
         _ACTIVE_BY_KEY[self.api_key] = self
+
+    async def _stop_leaked_sessions(self) -> None:
+        """Stop every session still active on THIS token, then give HB's
+        active-session counter a few seconds to reflect the stops."""
+        try:
+            resp = await asyncio.to_thread(self._hb.sessions.list, None)
+            dump = resp.model_dump() if hasattr(resp, "model_dump") else {}
+            for s in dump.get("sessions", []) or []:
+                status = str(s.get("status") or "").lower()
+                if status in ("active", "running", "state_active"):
+                    try:
+                        await asyncio.to_thread(self._hb.sessions.stop, s["id"])
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(5)
 
     async def _teardown(self) -> None:
         self._page = None
@@ -427,27 +473,37 @@ class HyperbrowserClient:
                     f"Hyperbrowser/Perplexity frontend circuit open for {remaining}s: "
                     f"{_BACKEND_COOLDOWN_REASON}"
                 )
-            try:
-                await self._ensure_session()
-                await self._goto_home()
-                prefix = _ACADEMIC_PREFIX if mode == "academic" else ""
-                if system:
-                    prefix += "[Instructions] " + system.strip()[:800] + " "
-                await self._submit(prefix + query)
-                answer, citations = await self._collect_answer()
-                if not answer:
-                    # A silent submit failure (Enter swallowed, answer markup
-                    # moved) must not masquerade as an LLM answer: downstream
-                    # nodes would parse "" into a JSON crash (node_plan) or a
-                    # wasted cycle (node_verify). Raised as a UI outage so the
-                    # session host fails over without cooling the account.
-                    raise HyperbrowserUIError(
-                        "Perplexity produced no answer text after "
-                        f"{self.answer_wait_s}s (submit may have failed silently)"
-                    )
-            except Exception:
-                await self._teardown()               # next ask rebuilds cleanly
-                raise
+            for attempt in (0, 1):
+                try:
+                    await self._ensure_session()
+                    await self._goto_home()
+                    prefix = _ACADEMIC_PREFIX if mode == "academic" else ""
+                    if system:
+                        prefix += "[Instructions] " + system.strip()[:800] + " "
+                    await self._submit(prefix + query)
+                    answer, citations = await self._collect_answer()
+                    if not answer:
+                        # A silent submit failure (Enter swallowed, answer markup
+                        # moved) must not masquerade as an LLM answer: downstream
+                        # nodes would parse "" into a JSON crash (node_plan) or a
+                        # wasted cycle (node_verify). Raised as a UI outage so the
+                        # session host fails over without cooling the account.
+                        raise HyperbrowserUIError(
+                            "Perplexity produced no answer text after "
+                            f"{self.answer_wait_s}s (submit may have failed silently)"
+                        )
+                    break
+                except Exception as exc:
+                    await self._teardown()               # next ask rebuilds cleanly
+                    # A dead CDP link (cloud session hit its duration cap, or a
+                    # network blip) still LOOKS alive on our side — without the
+                    # rebuild, every later node of the cycle would fail with
+                    # "Target page ... closed" against the stale handle.
+                    if attempt == 0 and _session_died(exc):
+                        log.warning("hyperbrowser session died mid-ask (%s); "
+                                    "rebuilding the cloud session once", str(exc)[:120])
+                        continue
+                    raise
         return LLMResponse(
             answer=answer,
             citations=citations,
