@@ -1055,6 +1055,50 @@ class SharedMemory:
                 (max(0.0, min(100.0, float(novelty))), hyp_id))
         return cur.rowcount > 0
 
+    def nearest_discovery_ancestor(self, hyp_id: int) -> dict | None:
+        """The NEAREST discovery root in this hypothesis's lineage (the row
+        itself when it IS a discovery). Bandit feedback input: a branch
+        settle must credit/debit the discovery it grew from.
+
+        Cycle-safe (visited set); returns the full discovery row or None
+        when no ancestor is flagged."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, parents, discovery FROM hypotheses").fetchall()
+            pm: dict[int, list[int]] = {}
+            for pid, praw, _disc in rows:
+                try:
+                    pm[pid] = json.loads(praw or "[]")
+                except json.JSONDecodeError:
+                    pm[pid] = []
+        frontier_ids = [int(hyp_id)]
+        seen: set[int] = set()
+        while frontier_ids:
+            pid = frontier_ids.pop(0)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            row = self.get_hypothesis(pid)
+            if row is not None and row.get("discovery"):
+                return row
+            frontier_ids.extend(pm.get(pid, []))
+        return None
+
+    def discovery_reinforce(self, disc_id: int, bonus: float = 5.0) -> float:
+        """Boost a discovery's novelty when a branch settles SUPPORTED
+        (bandit reward: evidence that the finding is real and worth digging
+        into). Capped at 100. Returns the new novelty."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT novelty FROM hypotheses WHERE id=?", (disc_id,)
+            ).fetchone()
+            nov = min(100.0, float(row[0] or 0.0) + max(0.0, float(bonus))) \
+                if row else 0.0
+            self._conn.execute(
+                "UPDATE hypotheses SET novelty=?, discovery=1 WHERE id=?",
+                (nov, disc_id))
+        return nov
+
     def settled_hypothesis_for_claim(self, claim: str) -> dict | None:
         """The swarm's SETTLED verdict for this claim, if anyone already ran it.
 
@@ -1598,9 +1642,27 @@ class SharedMemory:
                     "WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit)
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                # DISCOVERY notes are PINNED above the stream: the world
+                # model is the swarm's context, and its breakthroughs must
+                # not age out under routine verified/refuted notes.
+                pinned = self._conn.execute(
                     "SELECT id, ts, agent, kind, text, source FROM world_notes "
-                    "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+                    "WHERE text LIKE 'DISCOVERY(%' "
+                    "ORDER BY id DESC LIMIT ?", (min(4, limit),)).fetchall()
+                rows = list(pinned)
+                if pinned:
+                    placeholders = ",".join("?" * len(pinned))
+                    rows += self._conn.execute(
+                        "SELECT id, ts, agent, kind, text, source "
+                        "FROM world_notes WHERE id NOT IN ("
+                        + placeholders + ") ORDER BY id DESC LIMIT ?",
+                        (*[r[0] for r in pinned], limit - len(pinned)),
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        "SELECT id, ts, agent, kind, text, source "
+                        "FROM world_notes ORDER BY id DESC LIMIT ?",
+                        (limit,)).fetchall()
         return [{"id": r[0], "ts": r[1], "agent": r[2], "kind": r[3],
                  "text": r[4], "source": r[5]} for r in rows]
 

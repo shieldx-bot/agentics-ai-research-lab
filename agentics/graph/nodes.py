@@ -1177,6 +1177,45 @@ async def _harvest_insights(ctx: AgentContext, parent_id: int,
         return 0
 
 
+async def _branch_feedback(ctx: AgentContext, hyp_id: int, status: str) -> None:
+    """Bandit-lite discovery feedback: a BRANCH settle updates its discovery
+    root (nearest ancestor with discovery=1).
+
+    - supported -> discovery_reinforce: the branch CONFIRMED the finding
+      (novelty +5, capped) and `discovery_confirmed` is journaled — evidence
+      the lab is digging in the right place.
+    - refuted -> `branch_dead_end` journaled with the branch ANGLE: the
+      angle failed, which is itself information (the next ideation round
+      sees the dead end through the world model / rejected patterns).
+    The discovery root's own settle is judged by the ideator's novelty
+    grading instead (no self-reinforcement). Never raises."""
+    if status not in ("supported", "refuted"):
+        return
+    try:
+        root = await asyncio.to_thread(
+            ctx.memory.nearest_discovery_ancestor, hyp_id)
+        if root is None or int(root.get("id") or 0) == int(hyp_id):
+            return
+        if status == "supported":
+            nov = await asyncio.to_thread(
+                ctx.memory.discovery_reinforce, int(root["id"]))
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "discovery_confirmed",
+                {"branch_hyp": hyp_id, "discovery": int(root["id"]),
+                 "novelty": round(float(nov), 1),
+                 "why": "branch settled supported — finding reinforced"})
+        else:
+            row = await asyncio.to_thread(ctx.memory.get_hypothesis, hyp_id)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "branch_dead_end",
+                {"branch_hyp": hyp_id,
+                 "discovery": int(root["id"]),
+                 "angle": (row or {}).get("branch", ""),
+                 "why": "branch settled refuted — this attack angle failed"})
+    except Exception as exc:  # noqa: BLE001 — feedback must never break a settle
+        log.warning("[%s] branch feedback failed: %s", ctx.agent_id, exc)
+
+
 async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
     """Kosmos world model as TASK PROPOSER: topic saturated + registry
     empty -> the agent reads the world model and registers ONE gap-closing
@@ -1489,6 +1528,9 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         + (f" ({note[:120]})" if note else ""),
         source=f"h#{hyp_id}")
     if status in ("supported", "refuted"):
+        # bandit-lite feedback FIRST: a branch settle credits/debits its
+        # discovery root before the ideation round re-reads the registry.
+        await _branch_feedback(ctx, hyp_id, status)
         # Kosmos closed loop: the settled result proposes its follow-ups.
         measured_txt = (f"{criterion.metric}={measured.get(criterion.metric)}"
                         if measured else note[:200])
@@ -1797,6 +1839,7 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
     await asyncio.to_thread(ctx.workspace.sync_main)    # workspace must exist
     results: list[dict] = []
+    harvest_target: tuple | None = None   # (hyp_id, claim, status, measured_txt)
     for spec in specs:
         claim = str(spec.get("claim", "")).strip()[:300]
         criterion, malformed = None, ""
@@ -1911,6 +1954,29 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
         results.append({"claim": claim, "status": status, "note": note,
                         "hypothesis_id": hyp_id, "evidence_id": ev_id,
                         "replication": False})
+        # autoresearch ledger + discovery feedback + Kosmos harvest: the
+        # MAIN verify path used to settle claims silently — no ledger row,
+        # no novelty judgment, no branching. Every settle now feeds the
+        # loop the same way the deep-dive path does (one harvest per cycle:
+        # prefer the first supported settle, else the first refuted).
+        if status in ("supported", "refuted"):
+            measured = ev.meta.get("metrics", {})
+            await asyncio.to_thread(
+                ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
+                metric=criterion.metric,
+                measured=measured.get(criterion.metric), op=criterion.op,
+                target=criterion.target, verdict_note=note[:200],
+                protocol_path=path, source="verify", description=claim[:200])
+            await _branch_feedback(ctx, hyp_id, status)
+            measured_txt = (f"{criterion.metric}="
+                            f"{measured.get(criterion.metric)}"
+                            if measured else note[:200])
+            if harvest_target is None or (
+                    status == "supported"
+                    and harvest_target[2] != "supported"):
+                harvest_target = (hyp_id, claim, status, measured_txt)
+    if harvest_target is not None:
+        await _harvest_insights(ctx, *harvest_target)
     # P24: the independent-replication block rides along on this cycle too
     if repl:
         results = repl + results
