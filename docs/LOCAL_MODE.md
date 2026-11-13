@@ -394,3 +394,45 @@ LLM itself, with code owning only the safety rails.
 - Both paths are covered offline in `tests/test_plan_conditioned_prompts.py`
   (brief content, runaway caps, legacy-plan backward compat, body excerpt
   bound).
+
+## 9. Swarm evaluation — reading the lab AS a swarm (`agentics swarm-eval`)
+
+The lab grades ITSELF as a multi-agent system, offline and read-only, from
+its own traces (journal, tasks, MRs, P19 panels, LLM ledger):
+`python -m agentics.cli swarm-eval`. Five metric groups — coordination &
+task, convergence & dynamics, trajectory & handoff, resilience & scale
+(elasticity S across snapshots), governance & cost — are documented in
+`agentics/swarm_eval.py`. Each run persists a snapshot
+(`swarm_eval_snapshots`); S becomes computable once two snapshots exist at
+different swarm sizes.
+
+### Percent view (quick read)
+
+`python -m agentics.cli swarm-eval --percent` renders ONE unified table
+where every metric is normalised to a percentage:
+
+- a rate maps directly (0.62 -> 62%);
+- a count maps to its share of the natural total (e.g. reject reasons over
+  decided panels, replication verdicts over all replication tasks);
+- the elasticity S maps so 100% == linear scaling;
+- mean panel rounds map against the P19 cap (2 rounds);
+- a metric with no honest denominator keeps `—` — never faked.
+Cells are colour-coded green/yellow/red per metric's healthy direction.
+`--json --percent` embeds the same rows as `percent_rows` for scripting.
+
+### Operational findings from the first live evaluations (2026-11-13)
+
+- **Leaked Hyperbrowser sessions throttle the swarm.** A killed run leaves
+  its cloud session active until the idle timeout; the free plan allows one
+  concurrent session per token, so leftover sessions 429-block half the
+  swarm (LLM ok-rate fell to 27% until `scripts/hb_session_cleanup.py`
+  stopped 10 orphans; after the sweep a full run held **100% ok-rate over
+  24 calls**). Sweep before every evaluation run.
+- **The P7 coverage gate saturates ALL roles.** Once >= 3 findings cover
+  the topic, every agent's cycle short-circuits with "topic already
+  covered" — including coders/writers, so the MR -> panel -> merge pipeline
+  never engages and productive-cycle share collapses (~1-6%). The metrics
+  expose exactly this premature-convergence signature; a future fix may let
+  code/docs tasks bypass the research dedup gate.
+- Reset topic memory (`agentics reset-memory`) to give the swarm a fresh
+  trajectory before re-evaluating a run.
