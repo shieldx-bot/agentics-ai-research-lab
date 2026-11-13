@@ -18,6 +18,7 @@ from pathlib import Path
 
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, parse_json_block
+from agentics.config import DEFAULT_BACKLOG_WATERMARK
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS,
@@ -263,7 +264,21 @@ def node_start(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
 
 def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """Supervisor: sweep stale claims, keep the local backlog fed."""
+    """Supervisor: sweep stale claims, keep the local backlog fed.
+
+    Dispatch improvements over the old sweep-only scan (same mechanisms,
+    tuned — no new machinery):
+
+    - Watermark top-up: the backlog is refilled to ``backlog_watermark``
+      open tasks whenever it falls BELOW the watermark, not only when it is
+      completely empty — free coders/writers stop idling behind one task.
+    - Pipeline visibility: the summary carries task/MR/merge-queue depths so
+      the owner (and the dashboard) see congestion, not just a headcount.
+    - Signal/noise split: a routine scan is journalled (`scan_summary`) but
+      NOT broadcast into the message feed — supervisor chatter used to drown
+      the 15-row message window every agent's prompt reads; broadcasts now
+      happen only when something actually changed.
+    """
     state["action"] = "scan"
     freed = ctx.claims.sweep_stale()
     try:                       # P13 hygiene: dead agents must not hold files
@@ -300,14 +315,13 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     except Exception:  # noqa: BLE001 — retention must never break the scan
         pruned_ws = []
     tasks = ctx.memory.scan_open_tasks(limit=30)
-    if freed:
-        ctx.memory.post_message(
-            ctx.agent_id, "alert",
-            f"Freed {len(freed)} stale claim(s): {freed}"
-        )
+    # Watermark top-up: keep `backlog_watermark` unclaimed tasks available so
+    # every free coder/writer has something to claim this cycle (0 disables).
+    watermark = max(0, int(getattr(
+        ctx.settings, "backlog_watermark", DEFAULT_BACKLOG_WATERMARK) or 0))
     topped_up = 0
-    if not tasks and tasks_src is not None:
-        topped_up = tasks_src.supervisor_top_up()
+    if tasks_src is not None and len(tasks) < watermark:
+        topped_up = tasks_src.supervisor_top_up(min_open=watermark - len(tasks))
         tasks = ctx.memory.scan_open_tasks(limit=30)
     summary = (
         f"Backlog scan: {len(tasks)} open unclaimed task(s)."
@@ -317,12 +331,54 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
         + (f" P19 panel events: {len(swept_panels)}." if swept_panels else "")
     )
-    ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
+    # Pipeline depths: where the work actually sits. One glance answers "why
+    # is nobody merging?" (MRs stuck awaiting review, panels waiting for a
+    # vote or the author's defense, merge queue backed up).
+    try:
+        task_depths = ctx.memory.task_counts()
+        review_depths = ctx.memory.review_counts()
+        panel_depths = ctx.memory.panel_counts()
+        queue_depth = len(ctx.memory.mq_pending())
+        claims_in_flight = len(ctx.memory.active_claims())
+        pipeline = (
+            f" Pipeline: tasks " + fmt_depths(task_depths)
+            + f" | claims in flight: {claims_in_flight}"
+            + " | MRs " + fmt_depths(review_depths)
+            + " | live panels " + fmt_depths(panel_depths)
+            + f" | merge queue: {queue_depth}."
+        )
+        summary += pipeline
+    except Exception as exc:  # noqa: BLE001 — visibility must never break a scan
+        log.debug("pipeline depths unavailable: %s", exc)
     state["summary"] = summary
-    _maybe_open_evolution_task(ctx, state)
+    _maybe_open_evolution_task(ctx, state)   # may append to the summary
+    # Observability split (H2): the journal feed (dashboard / `agentics events`)
+    # always gets the scan; the shared MESSAGE feed only gets it when something
+    # material changed — routine scans must not crowd findings out of the
+    # recent-messages window that every agent's prompt reads. A P19 panel
+    # sweep IS material (an MR died / a task re-opened — agents must know).
+    material = bool(freed or stale_locks or repaired or topped_up
+                    or swept_panels
+                    or "Opened self-evolution task" in state["summary"])
+    try:
+        ctx.memory.journal(ctx.agent_id, "scan_summary", {
+            "open": len(tasks), "freed": freed, "locks": stale_locks,
+            "repaired": repaired, "topped_up": topped_up,
+            "panel_events": len(swept_panels),
+            "material": material, "summary": summary[:400],
+        })
+    except Exception as exc:  # noqa: BLE001 — observability, not control flow
+        log.debug("could not journal scan summary: %s", exc)
+    if material:
+        ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     _check_integrity(ctx)
     state["done"] = True
     return state
+
+
+def fmt_depths(counts: dict[str, int]) -> str:
+    """`open=2 claimed=1 merged=5` — sorted, zero statuses omitted."""
+    return " ".join(f"{k}={v}" for k, v in sorted(counts.items()) if v) or "none"
 
 
 def _check_integrity(ctx: AgentContext) -> None:
@@ -447,7 +503,11 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
     by_id = {i.number: i for i in infos}
     profile = build_profile(ctx.memory.agent_outcomes().get(ctx.agent_id, []))
-    for info, score in rank_issues(infos, profile)[:3]:      # lost race → next best
+    # Try EVERY ranked candidate, not a top-3 slice: with several agents
+    # racing for the same head of the queue, losing the top-3 used to mean a
+    # whole idle cycle even while lower-ranked tasks sat open. Each attempt
+    # is one cheap try_claim; the ranking (P-N profile) is unchanged.
+    for info, score in rank_issues(infos, profile):            # lost race → next best
         task = next(t for t in tasks if t["id"] == info.number)
         branch = branch_name(ctx.agent_id, task["id"], task["title"])
         if not ctx.claims.try_claim(task["id"], ctx.agent_id, branch):

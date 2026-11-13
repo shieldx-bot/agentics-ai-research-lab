@@ -18,7 +18,8 @@ What it shows, in order:
   4. the WRITER does the same for a docs task;
   5. the protection demo: an agent tries to edit agentics/stop.py and is
      stopped by guard layer 1 (write-time) before anything leaves the workspace;
-  6. the REVIEWER cross-reviews both MRs (P5);
+  6. the REVIEWERS cross-review both MRs as a P19 PANEL: two peers vote
+     accept each MR (quorum = panel size 2) -> unanimous approval;
   7. the INTEGRATOR drains the queue: tier-2 (full tests on main+MR), then a
      local merge into data/lab.git:main (P4);
   8. the journal timeline + live state that make the swarm observable.
@@ -212,6 +213,10 @@ async def main() -> None:
                            local, ownership)
     reviewer = build_context("a07", Role.REVIEWER, settings, mem,
                              supervisor.vector, local, ownership)
+    # P19: an MR is judged by a PANEL (default size 2), not one reviewer —
+    # a second peer completes each panel's quorum.
+    reviewer2 = build_context("a08", Role.REVIEWER, settings, mem,
+                              supervisor.vector, local, ownership)
     integrator = build_context("a09", Role.INTEGRATOR, settings, mem,
                                supervisor.vector, local, ownership)
 
@@ -257,10 +262,15 @@ async def main() -> None:
     await run_cycle(writer)
     show(mem, "after writer cycle")
 
-    # 6) reviewer cross-reviews both MRs ----------------------------------------
+    # 6) the P19 panel cross-reviews both MRs -----------------------------------
+    # round 1: a07 votes both MRs (1/2 each — waiting); round 2: a08 completes
+    # both panels (2/2 -> unanimous approval). One vote per reviewer per round.
     await run_cycle(reviewer)
     await run_cycle(reviewer)
-    show(mem, "after reviews (both MRs approved)")
+    show(mem, "after reviewer a07 (both panels at 1/2, waiting)")
+    await run_cycle(reviewer2)
+    await run_cycle(reviewer2)
+    show(mem, "after reviewer a08 (both MRs unanimously approved)")
 
     # 7) integrator drains the queue ----------------------------------------------
     await run_cycle(integrator)
@@ -278,7 +288,8 @@ async def main() -> None:
         capture_output=True, text=True).stdout.strip()
     print(f"\nmain history on the local bare repo:\n{log}")
 
-    for ctx in (supervisor, researcher, coder, writer, reviewer, integrator):
+    for ctx in (supervisor, researcher, coder, writer, reviewer, reviewer2,
+                integrator):
         ctx.meta["personal"].close()
     mem.close()
 

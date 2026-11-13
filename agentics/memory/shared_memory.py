@@ -1201,6 +1201,27 @@ class SharedMemory:
             ).fetchall()
         return {status: n for status, n in rows}
 
+    def review_counts(self) -> dict[str, int]:
+        """MR counts by status — the review pipeline depth (owner console and
+        the supervisor's dispatch summary both read it)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) FROM reviews GROUP BY status"
+            ).fetchall()
+        return {status: n for status, n in rows}
+
+    def panel_counts(self) -> dict[str, int]:
+        """LIVE P19 panels by state (voting/defense) — terminal panels
+        (approved/rejected) are already visible in the MR statuses. Tells the
+        supervisor summary WHERE a review is stuck: voting needs another
+        peer's vote, defense awaits the author's rebuttal."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT state, COUNT(*) FROM mr_panels "
+                "WHERE state IN ('voting','defense') GROUP BY state"
+            ).fetchall()
+        return {state: n for state, n in rows}
+
     # ------------------------------------------------------------ reviews (local MRs)
     def open_review(
         self, task_id: int | None, title: str, body: str, author: str,

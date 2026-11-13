@@ -39,7 +39,13 @@ def main() -> None:
     mem.update_hypothesis(sup, "supported", evidence_id=ev1, note="measured 0.9")
     mem.update_hypothesis(ref, "refuted", note="measured precision=0.4")
 
-    app = create_app(mem, type("S", (), {"research_topic": "NFV"})())
+    # The REAL Settings class — the dashboard state now carries the P18 LLM
+    # budget dial (llm_max_calls_per_hour) and the P20 audit counters, so a
+    # hand-rolled fake settings namespace 500s the endpoint and the smoke
+    # reads {"error": ...} instead of the state payload.
+    from agentics.config import Settings
+
+    app = create_app(mem, Settings(data_dir=root / "data", research_topic="NFV"))
     client = _client(app)
     state = client.get("/api/state").json()
     hyp = state["hypotheses"]

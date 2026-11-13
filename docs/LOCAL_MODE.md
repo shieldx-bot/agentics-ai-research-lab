@@ -243,6 +243,33 @@ of truth shared by the dashboard, `events`, `watch` and `explain`. A
 standalone smoke script: dropped — `tests/test_local_review_merge.py` already
 is a real-git E2E that doubles as the offline health check.
 
+**F. Supervisor dispatch — watermark top-up, not empty-only.** The old
+`supervisor_top_up()` fired only when the backlog was COMPLETELY empty and
+opened one task per supervisor cycle (~75 s), so with 2+ free coders the rest
+idled whole cycles ("lost race" / "resting"). The scan now tops the backlog up
+to `BACKLOG_WATERMARK` (default 2, 0 disables) unclaimed tasks in the same
+scan, using the same two sources (failure-trace investigation first, survey
+rotation second) and one shared dedup title set, so shortfall slots never
+re-derive the same task. Rotation angles now carry their natural existing
+category (`research`/`code`/`docs` via `ANGLE_CATEGORY`) so the P–N claim
+ranking can steer benchmark/harness tasks to coders and checklists to writers
+instead of everything being filed as `research`. The claim loop also walks
+the FULL ranked candidate list now (was a top-3 slice): losing the head of
+the queue in a race no longer costs a whole idle cycle while lower-ranked
+tasks sit open.
+
+**G. Scan signal/noise split.** The supervisor used to broadcast its backlog
+summary into the shared message feed every cycle; that feed is the 15-row
+window `_memory_context` injects into every agent's prompt, so scan chatter
+crowded out actual findings. A routine scan is now journalled as a structured
+`scan_summary` event (dashboard / `agentics events` still see it — H2 is not
+weakened) and only material changes (claims freed, locks repaired, tasks
+topped up, evolution task opened) reach the message feed. The summary also
+gained pipeline depths — task/claim/MR/live-panel/merge-queue counts via the
+new `SharedMemory.review_counts()` / `panel_counts()` — so the owner sees
+WHERE work is stuck (voting needs a peer's vote, defense awaits the author),
+not just how many tasks are open.
+
 ---
 
 ## 8. Adaptive planning & role prompts (LLM-authored, `agentics/planning.py`)

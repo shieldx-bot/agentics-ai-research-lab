@@ -260,14 +260,144 @@ def test_supervisor_tops_up_empty_backlog_from_local_source(mem):
 
     class _Settings:
         research_topic = "NFV"
+        backlog_watermark = 2
 
     ctx = _ctx(mem, role=Role.SUPERVISOR)
     ctx.local = SimpleNamespace(guard=ProtectedPathsGuard(),
                                 tasks=TaskSource(mem, _Settings()))
     ctx.claims = SimpleNamespace(sweep_stale=lambda: [])
     state = nodes.node_scan(ctx, {})
-    assert "Opened 1 new survey task(s)" in state["summary"]
-    assert mem.scan_open_tasks()      # the backlog is no longer empty
+    # watermark dispatch: an empty backlog is refilled to the watermark (2)
+    # in ONE scan, so two coders can claim in parallel instead of idling
+    assert "Opened 2 new survey task(s)" in state["summary"]
+    assert len(mem.scan_open_tasks()) == 2   # the backlog is no longer thin
+    # the material change reached the shared message feed
+    assert any("Backlog scan" in m["content"] for m in mem.recent_messages())
+
+
+def test_supervisor_scan_tops_up_only_the_shortfall(mem):
+    """A backlog at/above the watermark is left alone — no runaway task spam."""
+    from agentics.local_ops import TaskSource
+
+    class _Settings:
+        research_topic = "NFV"
+        backlog_watermark = 2
+
+    ctx = _ctx(mem, role=Role.SUPERVISOR)
+    ctx.local = SimpleNamespace(guard=ProtectedPathsGuard(),
+                                tasks=TaskSource(mem, _Settings()))
+    ctx.claims = SimpleNamespace(sweep_stale=lambda: [])
+    nodes.node_scan(ctx, {})                 # empty -> topped up to 2
+    before = [t["id"] for t in mem.scan_open_tasks()]
+    assert len(before) == 2
+    state = nodes.node_scan(ctx, {})         # at watermark -> untouched
+    assert "Opened" not in state["summary"]
+    assert [t["id"] for t in mem.scan_open_tasks()] == before
+
+
+def test_supervisor_routine_scan_does_not_broadcast(mem):
+    """Signal/noise split: a routine scan is journalled but does NOT post into
+    the shared message feed — supervisor chatter must not drown the 15-row
+    message window every agent's prompt reads."""
+    from agentics.local_ops import TaskSource
+
+    class _Settings:
+        research_topic = "NFV"
+        backlog_watermark = 2
+
+    ctx = _ctx(mem, role=Role.SUPERVISOR)
+    ctx.local = SimpleNamespace(guard=ProtectedPathsGuard(),
+                                tasks=TaskSource(mem, _Settings()))
+    ctx.claims = SimpleNamespace(sweep_stale=lambda: [])
+    mem.create_task("already open A")
+    mem.create_task("already open B")        # backlog already at the watermark
+    state = nodes.node_scan(ctx, {})
+    assert "Backlog scan: 2 open" in state["summary"]
+    events = [j["event"] for j in mem.recent_journal()]
+    assert "scan_summary" in events          # owner still sees it (journal)
+    broadcasted = [m for m in mem.recent_messages()
+                   if m["agent"] == ctx.agent_id and m["kind"] == "broadcast"
+                   and "Backlog scan" in m["content"]]
+    assert broadcasted == []                 # ...but nothing material changed
+
+
+def test_supervisor_scan_summary_carries_pipeline_depths(mem):
+    """The owner reads WHERE the work sits, not just how many tasks are open."""
+    from agentics.local_ops import TaskSource
+
+    class _Settings:
+        research_topic = "NFV"
+        backlog_watermark = 2
+
+    ctx = _ctx(mem, role=Role.SUPERVISOR)
+    ctx.local = SimpleNamespace(guard=ProtectedPathsGuard(),
+                                tasks=TaskSource(mem, _Settings()))
+    ctx.claims = SimpleNamespace(sweep_stale=lambda: [])
+    held = mem.create_task("held work")
+    mem.claim_issue(held, "a06", 3600, "agent/a06/x")   # lease without MR
+    mem.create_task("already open A")
+    mem.create_task("already open B")        # backlog >= watermark -> no top-up
+    reviewable = mem.create_task("reviewed work")
+    mem.open_review(reviewable, "MR", "b", author="a05",
+                    branch="agent/a05/x", files=[])
+    state = nodes.node_scan(ctx, {})
+    assert "claims in flight: 1" in state["summary"]
+    assert "MRs open=1" in state["summary"]
+    assert "merge queue: 0" in state["summary"]
+    assert "Opened" not in state["summary"]  # backlog was already fed
+    detail = next(j["detail"] for j in mem.recent_journal()
+                  if j["event"] == "scan_summary")
+    # a live claim is STEADY STATE, not a dispatch change — depths are still
+    # visible in the journal, but the message feed stays quiet
+    assert json.loads(detail)["material"] is False
+    broadcasted = [m for m in mem.recent_messages()
+                   if m["agent"] == ctx.agent_id and "Backlog scan" in m["content"]]
+    assert broadcasted == []
+
+
+def test_claim_tries_every_ranked_candidate_not_top3(mem):
+    """Losing the head of the queue must not cost a whole idle cycle: the
+    claim loop walks the FULL ranked list (watermark keeps 2+ tasks open, so
+    several agents race for the same head and the 4th-ranked task is real
+    work). The P-N ranking itself is untouched."""
+    for i in range(5):
+        mem.create_task(f"task {i}")             # equal scores -> oldest first
+    lost = iter([True, True, True])              # top-3 candidates taken in the race
+
+    class Racing:
+        def try_claim(self, task_id, agent, branch=""):
+            return not next(lost, False)         # fails 3x, then succeeds
+
+    ctx = _ctx(mem)
+    ctx.claims = Racing()
+    state = nodes.node_claim(ctx, {})
+    assert state["issue_number"] == 4            # the 4th-ranked task got claimed
+    assert "lost race" not in state.get("summary", "")
+
+
+def test_scan_summary_shows_live_panel_states(mem):
+    """Pipeline depths include LIVE P19 panels: voting (needs another peer's
+    vote) vs defense (awaits the author's rebuttal) — the owner sees WHERE a
+    review is stuck, terminal panels stay in the MR statuses."""
+    from agentics.local_ops import TaskSource
+
+    class _Settings:
+        research_topic = "NFV"
+        backlog_watermark = 2
+
+    ctx = _ctx(mem, role=Role.SUPERVISOR)
+    ctx.local = SimpleNamespace(guard=ProtectedPathsGuard(),
+                                tasks=TaskSource(mem, _Settings()))
+    ctx.claims = SimpleNamespace(sweep_stale=lambda: [])
+    mem.create_task("already open A")
+    mem.create_task("already open B")            # at watermark -> no top-up
+    t = mem.create_task("reviewed work")
+    mr = mem.open_review(t, "MR", "b", author="a05",
+                         branch="agent/a05/x", files=[])
+    mem.ensure_panel(mr)                         # live panel: voting, round 1
+    state = nodes.node_scan(ctx, {})
+    assert "live panels voting=1" in state["summary"]
+    assert "MRs open=1" in state["summary"]
 
 
 # ------------------------------------------------------------ implement (tier-1, guards)

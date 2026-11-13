@@ -69,6 +69,21 @@ VERIFICATION_ANGLE_BODY = (
     "is not the goal; settling claims by running code is."
 )
 
+# The task category each rotation angle feeds the claim-ranking profiles with
+# (research/code/docs already exist in the seed backlog and the tasks schema).
+# Labeling the angle correctly lets the Performance-Novelty routing steer
+# surveys to researchers, benchmarks/harnesses to coders and checklists to
+# writers instead of everything landing in one undifferentiated pile.
+ANGLE_CATEGORY: dict[str, str] = {
+    "State-of-the-art survey": "research",
+    "Benchmark design and metrics": "code",
+    "Empirical comparison of methods": "research",
+    "Failure-mode analysis": "research",
+    "Reproducibility checklist": "docs",
+    "Tooling and evaluation harness": "code",
+    "Empirical verification of stored findings": "research",
+}
+
 
 # ------------------------------------------------------------- P10 layer 4
 def origin_hook_script(
@@ -245,8 +260,12 @@ class TaskSource:
         for title, category, body in seeds:
             self.memory.create_task(title, body=body, category=category, agent="seed")
 
-    def supervisor_top_up(self) -> int:
-        """Supervisor: if nothing is claimable, grow the backlog by one task.
+    def supervisor_top_up(self, min_open: int = 1) -> int:
+        """Supervisor: grow the claimable backlog to at least ``min_open`` tasks.
+
+        Called by node_scan with ``watermark - open_count`` so a thin (not only
+        an EMPTY) backlog is refilled in the same scan — several coders can
+        then claim in parallel instead of idling behind a single task.
 
         Two self-generated sources, in priority order (reconciliation of the
         two parallel fixes on this branch):
@@ -260,17 +279,33 @@ class TaskSource:
              backlog sweeps every research angle instead of reopening
              "State-of-the-art survey" forever.
 
-        Returns the number of tasks created (0 or 1).
-        """
-        if self.memory.scan_open_tasks(limit=1):
-            return 0
-        if self._open_failure_investigation():
-            return 1
-        return self._open_next_survey_angle()
+        The dedup title set is built ONCE and threaded through every source
+        call, so the shortfall slots never re-derive the same task.
 
-    def _open_failure_investigation(self) -> int:
-        """Turn the newest un-investigated failed trace into a bugfix task."""
+        Returns the number of tasks created (0..shortfall).
+        """
+        if min_open <= 0:
+            return 0
+        shortfall = min_open - len(self.memory.scan_open_tasks(limit=min_open))
+        if shortfall <= 0:
+            return 0
         known = {t["title"] for t in self.memory.list_tasks(limit=500)}
+        created = 0
+        for _ in range(shortfall):
+            made = self._open_failure_investigation(known)
+            if not made:
+                made = self._open_next_survey_angle()
+            if not made:
+                break           # both sources deduped away — do not spin
+            created += made
+        return created
+
+    def _open_failure_investigation(self, known: set[str]) -> int:
+        """Turn the newest un-investigated failed trace into a bugfix task.
+
+        ``known`` is the shared dedup title set of the whole top-up pass; the
+        created title is added to it so the next shortfall slot skips it.
+        """
         for trace in self.memory.recent_traces(limit=5, failures_only=True):
             failure = " ".join(
                 str(trace.get("failure") or trace.get("attempted") or "").split()
@@ -298,6 +333,7 @@ class TaskSource:
                 agent="supervisor",
             )
             if task_id is not None:
+                known.add(title)
                 self.memory.journal("supervisor", "backlog_top_up",
                                     {"task": task_id, "source": "failure_trace",
                                      "trace": trace.get("id")})
@@ -320,7 +356,7 @@ class TaskSource:
             created = self.memory.create_task_if_absent(
                 f"{angle}: {topic}",
                 body=body,
-                category="research",
+                category=ANGLE_CATEGORY.get(angle, "research"),
                 agent="supervisor",
             )
             if created is not None:

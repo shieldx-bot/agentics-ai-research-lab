@@ -203,6 +203,61 @@ def test_task_source_supervisor_tops_up_when_dry(settings, mem):
     assert src.supervisor_top_up() == 0        # still open -> nothing new
 
 
+def test_supervisor_top_up_fills_the_watermark_in_one_pass(settings, mem):
+    """min_open=2 refills an empty backlog with TWO distinct tasks in a single
+    call — parallel coders claim without waiting for the next scan cycle."""
+    src = TaskSource(mem, settings)
+    created = src.supervisor_top_up(min_open=2)
+    assert created == 2
+    open_tasks = mem.scan_open_tasks()
+    assert len(open_tasks) == 2
+    assert len({t["title"] for t in open_tasks}) == 2   # two different angles
+
+
+def test_supervisor_top_up_creates_only_the_shortfall(settings, mem):
+    """1 open + min_open=2 -> exactly 1 new task (no runaway backlog spam)."""
+    src = TaskSource(mem, settings)
+    mem.create_task("already open A")
+    assert src.supervisor_top_up(min_open=2) == 1
+    assert len(mem.scan_open_tasks()) == 2
+    assert src.supervisor_top_up(min_open=2) == 0        # at watermark
+    assert src.supervisor_top_up(min_open=0) == 0        # disabled
+
+
+def test_supervisor_top_up_each_slot_is_a_distinct_failure_trace(settings, mem):
+    """Two un-investigated failures + min_open=2 -> two distinct bugfix tasks,
+    the shared dedup set prevents the same trace investigation twice."""
+    src = TaskSource(mem, settings)
+    mem.add_trace("a04", "coder", 1, "failed", category="code",
+                  failure="TypeError: boom one")
+    mem.add_trace("a05", "coder", 2, "failed", category="code",
+                  failure="KeyError: boom two")
+    assert src.supervisor_top_up(min_open=2) == 2
+    titles = {t["title"] for t in mem.scan_open_tasks()}
+    assert len(titles) == 2
+    assert all(t.startswith("Investigate failure") for t in titles)
+    assert all(t["category"] == "bugfix" for t in mem.scan_open_tasks())
+
+
+def test_survey_angles_carry_their_natural_category(settings, mem):
+    """Rotation tasks are labeled so P-N claim routing can steer them
+    (benchmarks/harnesses -> code, checklists -> docs, surveys -> research)."""
+    from agentics.local_ops import ANGLE_CATEGORY
+
+    src = TaskSource(mem, settings)
+    opened: dict[str, str] = {}
+    for _ in range(len(SURVEY_ANGLES)):
+        if not src.supervisor_top_up():
+            continue
+        newest = mem.list_tasks(limit=1)[0]
+        angle = newest["title"].rsplit(": ", 1)[0]
+        opened[angle] = newest["category"]
+        mem.set_task_status(newest["id"], "merged")       # dry the backlog
+    assert set(opened) == set(ANGLE_CATEGORY)
+    for angle, category in ANGLE_CATEGORY.items():
+        assert opened[angle] == category
+
+
 def test_supervisor_top_up_rotates_survey_angles(settings, mem):
     """Backlog dry again and again must walk every angle, not repeat angle 0."""
     src = TaskSource(mem, settings)

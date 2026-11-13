@@ -10,6 +10,12 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Supervisor dispatch: keep at least this many unclaimed tasks in the local
+# backlog so free coders/writers never idle behind an empty or thin queue.
+# 0 disables the top-up (scan-only supervisor). Used as the Settings default
+# AND as the fallback for stripped-down test settings namespaces.
+DEFAULT_BACKLOG_WATERMARK = 2
+
 
 _ENV_MTIME: float | None = None
 
@@ -106,6 +112,14 @@ class Settings:
     auto_merge: bool = field(default_factory=lambda: _env_bool("AUTO_MERGE", False))
     claim_ttl_minutes: int = field(
         default_factory=lambda: _env_int("CLAIM_TTL_MINUTES", 45)
+    )
+    # Supervisor backlog watermark: when a scan sees fewer unclaimed tasks
+    # than this, the supervisor tops the backlog up to the watermark using
+    # its existing sources (failure investigation, survey rotation). Replaces
+    # the old "only when COMPLETELY empty, one task per cycle" rule, which
+    # starved parallel coders. 0 disables.
+    backlog_watermark: int = field(
+        default_factory=lambda: _env_int("BACKLOG_WATERMARK", DEFAULT_BACKLOG_WATERMARK)
     )
     # LLM backend mode (see docs/LLM_PROVIDERS.md):
     # "perplexity" (default) = Perplexity-only: EVERY node uses the Perplexity
