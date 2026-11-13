@@ -247,6 +247,8 @@ class SharedMemory:
                 "ALTER TABLE evidence ADD COLUMN hypothesis_id INTEGER",
                 "ALTER TABLE evidence ADD COLUMN metrics TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE evidence ADD COLUMN runs TEXT NOT NULL DEFAULT '[]'",
+                # P16bis dedup: normalized claim identity for reuse across agents
+                "ALTER TABLE hypotheses ADD COLUMN claim_hash TEXT DEFAULT ''",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -435,16 +437,44 @@ class SharedMemory:
 
         `criterion` is the structured acceptance test {"metric", "op",
         "target"[, "tolerance"]} — the machine verdict compares the measured
-        number against it, so the goalposts cannot move after the run."""
+        number against it, so the goalposts cannot move after the run.
+        The claim's normalized hash is stored so the next agent meeting the
+        same claim can reuse the settled verdict instead of re-running (H3)."""
+        from agentics.verify.hypothesis import claim_hash as _chash
+
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
-                "criterion, protocol_path, status) VALUES (?,?,?,?,?,?,?,?)",
+                "criterion, protocol_path, status, claim_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, task_id, finding_id, claim[:500],
                  json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
-                 status),
+                 status, _chash(claim)),
             )
             return int(cur.lastrowid or 0)
+
+    def settled_hypothesis_for_claim(self, claim: str) -> dict | None:
+        """The swarm's SETTLED verdict for this claim, if anyone already ran it.
+
+        Matches by normalized claim hash (case/whitespace-insensitive), so a
+        reworded duplicate still resolves to the first verdict. Only
+        supported/refuted hypotheses count as settled — inconclusive ones
+        deserve a fresh run. None means: nobody settled it, go verify."""
+        from agentics.verify.hypothesis import claim_hash as _chash
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, claim, status, verdict_note, evidence_id, agent, "
+                "task_id, criterion FROM hypotheses "
+                "WHERE claim_hash=? AND status IN ('supported','refuted') "
+                "ORDER BY id DESC LIMIT 1",
+                (_chash(claim),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "claim": row[1], "status": row[2],
+                "verdict_note": row[3], "evidence_id": row[4], "agent": row[5],
+                "task_id": row[6], "criterion": json.loads(row[7] or "{}")}
 
     def update_hypothesis(
         self, hyp_id: int, status: str, evidence_id: int | None = None,

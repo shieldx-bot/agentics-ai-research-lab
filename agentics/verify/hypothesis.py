@@ -92,6 +92,17 @@ def slugify(text: str, fallback: str = "hypothesis") -> str:
     return slug or fallback
 
 
+def claim_hash(claim: str) -> str:
+    """Stable identity of a claim (case/whitespace-insensitive).
+
+    The dedup key that lets the swarm recognize an already-settled hypothesis
+    however it is reworded: a supported or refuted claim is NOT re-run by the
+    next agent that meets it — the first verdict IS the shared verdict (H3:
+    never burn cycles re-verifying settled work)."""
+    normalized = " ".join((claim or "").lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def stable_id(claim: str, seed: str = "") -> str:
     """Collision-free slug: readable prefix + short digest of the claim."""
     digest = hashlib.sha1(f"{claim}|{seed}".encode("utf-8")).hexdigest()[:8]
@@ -181,6 +192,7 @@ __all__ = [
     "HYPOTHESIS_PROMPT_CONTRACT",
     "Hypothesis",
     "PROTOCOL_CONTRACT",
+    "claim_hash",
     "hypothesis_from_json",
     "parse_hypothesis",
     "slugify",

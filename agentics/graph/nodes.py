@@ -471,6 +471,25 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             results.append({"claim": claim, "status": "inconclusive",
                             "note": malformed or "malformed hypothesis spec"})
             continue
+        # H3 dedup — the swarm never re-runs a SETTLED claim: whichever agent
+        # meets the same hypothesis later inherits the first verdict instead of
+        # burning two protocol runs on it (verified_knowledge keeps the claim
+        # reusable; this gate keeps the ledger free of duplicate evidence).
+        prior = await asyncio.to_thread(
+            ctx.memory.settled_hypothesis_for_claim, claim)
+        if prior is not None:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_reused",
+                {"claim": claim[:160], "settled_by": prior["id"],
+                 "status": prior["status"], "evidence": prior["evidence_id"],
+                 "why": "claim already settled — reused, not re-run"})
+            results.append({"claim": claim, "status": prior["status"],
+                            "note": (f"reused settled verdict of h#{prior['id']} "
+                                     f"(by {prior['agent']}): "
+                                     f"{prior['verdict_note'][:120]}"),
+                            "reused": True, "hypothesis_id": prior["id"],
+                            "evidence_id": prior["evidence_id"]})
+            continue
         hyp_id = await asyncio.to_thread(
             ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
             task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
@@ -866,6 +885,26 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             # be findable per task by the reviewer / dashboard / CLI)
             if hyp.task is None:
                 hyp.task = hyp_task
+            # H3 dedup: a claim the swarm already settled is inherited, not
+            # re-run. A supported claim must not cost two more protocol runs;
+            # a refuted claim must not sneak past the push gate by rerunning it.
+            prior = await asyncio.to_thread(
+                ctx.memory.settled_hypothesis_for_claim, hyp.claim)
+            if prior is not None:
+                ctx.memory.journal(ctx.agent_id, "hypothesis_reused", {
+                    "task": hyp_task, "claim": hyp.claim[:160],
+                    "settled_by": prior["id"], "status": prior["status"],
+                    "evidence": prior["evidence_id"],
+                })
+                if prior["status"] == "refuted":
+                    return await _yield(
+                        ctx, state,
+                        f"P16 hypothesis '{hyp.hypothesis_id}' is ALREADY REFUTED "
+                        f"by the swarm (h#{prior['id']}, evidence "
+                        f"#{prior['evidence_id']}) — do not re-assert a refuted "
+                        "claim; fix the code or re-plan",
+                    )
+                continue            # supported: reuse the verdict, proceed to push
             # pre-registration (broadcast) -> protocol run -> settlement with
             # evidence_id; supported claims become verified_knowledge, refuted
             # ones stop being repeated by the swarm.

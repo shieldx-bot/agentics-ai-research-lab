@@ -100,7 +100,27 @@ On the dashboard, the "Kiểm chứng thực nghiệm" card shows raw runs; the
 value and the settled status — pre-registration means the goalposts cannot
 move after seeing the numbers.
 
-## 7. Testing
+## 7. Claim dedup — settled claims are reused, never re-run (H3 enforced)
+
+Sharing verdicts is only half of H3; the other half is that the swarm never
+pays for the same experiment twice. Every hypothesis row stores a normalized
+`claim_hash` (case/whitespace-insensitive, `verify.hypothesis.claim_hash`).
+Both verify paths consult `SharedMemory.settled_hypothesis_for_claim()`
+BEFORE running anything:
+
+* **research path** (`node_verify`): a claim already settled (supported /
+  refuted) by any agent produces a `reused` result that references the
+  first verdict — no new hypothesis row, no protocol run, no duplicate
+  evidence row; the reuse is journalled (`hypothesis_reused`) for the owner.
+* **coder path** (`node_implement`): a plan that re-declares an already
+  supported claim proceeds to push at zero experimental cost; re-declaring
+  an already REFUTED claim yields the cycle exactly like a fresh refutation —
+  re-asserting a falsified claim cannot sneak past the gate by rerunning it.
+
+Only `supported`/`refuted` count as settled: `inconclusive` claims always
+deserve a fresh run. Pinned by `tests/test_hypothesis_dedup.py`.
+
+## 8. Testing
 
 `tests/test_verify_ops.py` (exit-code evidence), `tests/test_verify_metrics.py`
 (criterion adjudication + reproducibility), `tests/test_evidence_memory.py`
