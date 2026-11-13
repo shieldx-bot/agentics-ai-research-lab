@@ -690,6 +690,170 @@ async def ddg_web_search(query: str, max_results: int = 6, settings=None) -> lis
     return out
 
 
+# ---------------------------------------------------------------- verification toolkit
+# Anonymous GitHub search allows ~10 calls/min process-wide: pace it like arXiv.
+_gh_lock = asyncio.Lock()
+_gh_last: float = 0.0
+_GH_MIN_INTERVAL_S = 6.5
+
+
+async def _github_pace() -> None:
+    """Process-wide politeness: at most one GitHub search every ~6.5 s."""
+    global _gh_last
+    async with _gh_lock:
+        wait = _GH_MIN_INTERVAL_S - (time.monotonic() - _gh_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _gh_last = time.monotonic()
+
+
+async def github_repo_search(query: str, max_results: int = 5, settings=None) -> list[dict]:
+    """Search public GitHub repos — 'does this idea already have code?'
+
+    Directly serves hypothesis verification (H1/H2): a reference
+    implementation an agent can clone into the workspace sandbox is the
+    fastest path from idea to a runnable protocol. Keyless (10 req/min
+    anonymous budget), real stargazer/language/license metadata.
+    """
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("github", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    await _github_pace()
+    data = await _get_json(
+        "https://api.github.com/search/repositories",
+        params={"q": query, "per_page": max(1, min(int(max_results), 20))},
+        settings=settings,
+    )
+    out: list[dict] = []
+    for it in ((data or {}).get("items") or [])[: max(1, int(max_results))]:
+        full = (it.get("full_name") or "").strip()
+        if not full:
+            continue
+        out.append({
+            "repo": full,
+            "url": it.get("html_url") or f"https://github.com/{full}",
+            "description": " ".join((it.get("description") or "").split())[:300],
+            "stars": it.get("stargazers_count"),
+            "language": it.get("language") or "",
+            "license": ((it.get("license") or {}) or {}).get("spdx_id") or "",
+            "pushed_at": (it.get("pushed_at") or "")[:10],
+        })
+    _cache_put(key, out)
+    return out
+
+
+async def pypi_package_info(package: str, settings=None) -> dict | None:
+    """Real PyPI metadata for one package — exists? latest version? python?
+
+    Verification protocols must pin REAL dependency versions (P16
+    reproducibility): this checks a package actually exists before an
+    agent writes ``pip install ...`` into a ``verify_cmds`` protocol, and
+    returns the latest published version to pin. Unknown/typo names
+    return None — never an invented version.
+    """
+    name = urllib.parse.quote((package or "").strip().strip("/"))
+    if not _enabled(settings) or not name:
+        return None
+    key = ("pypi", name)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached or None
+    data = await _get_json(f"https://pypi.org/pypi/{name}/json", settings=settings)
+    out = None
+    if isinstance(data, dict) and (data.get("info") or {}).get("name"):
+        info = data["info"]
+        out = {
+            "name": info.get("name", ""),
+            "version": info.get("version", ""),
+            "summary": " ".join((info.get("summary") or "").split())[:300],
+            "requires_python": info.get("requires_python") or "",
+            "home_page": info.get("home_page")
+                         or ((info.get("project_urls") or {}).get("Homepage") or ""),
+            "license": (info.get("license") or "")[:120],
+        }
+    _cache_put(key, out or ())
+    return out
+
+
+async def hf_models_search(query: str, max_results: int = 5, settings=None) -> list[dict]:
+    """Find public models on Hugging Face — real pretrained weights for a
+    verification protocol (complements ``hf_datasets_search``)."""
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("hf-models", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    data = await _get_json(
+        "https://huggingface.co/api/models",
+        params={"search": query, "limit": max(1, min(int(max_results), 20)),
+                "sort": "downloads", "direction": -1},
+        settings=settings,
+    )
+    out = []
+    for d in (data or [])[:max_results] if isinstance(data, list) else []:
+        out.append({
+            "id": d.get("id", ""),
+            "downloads": d.get("downloads"),
+            "likes": d.get("likes"),
+            "pipeline_tag": d.get("pipeline_tag") or "",
+            "last_modified": d.get("lastModified", ""),
+            "url": f"https://huggingface.co/{d.get('id', '')}",
+        })
+    _cache_put(key, out)
+    return out
+
+
+async def verification_toolkit(query: str, settings=None) -> dict | None:
+    """Repos + datasets + models that make a hypothesis checkable NOW.
+
+    Bundles the three tool-discovery sources into one cached call so a
+    finding ships with runnable code paths and real data instead of only
+    a literature list. Every element degrades independently; the whole
+    bundle returns None when nothing is found.
+    """
+    if not _enabled(settings) or not query.strip():
+        return None
+    key = ("toolkit", query)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached or None
+    repos, datasets, models = await asyncio.gather(
+        github_repo_search(query, 3, settings=settings),
+        hf_datasets_search(query, 3, settings=settings),
+        hf_models_search(query, 3, settings=settings),
+    )
+    out = None
+    if repos or datasets or models:
+        out = {"repos": repos, "datasets": datasets, "models": models}
+    _cache_put(key, out or ())
+    return out
+
+
+def _toolkit_text(toolkit: dict) -> str:
+    lines = ["Reference implementations & data (real metadata — clone/download "
+             "only after checking the license and availability):"]
+    for r in toolkit.get("repos") or []:
+        stars = f", stars {r['stars']}" if r.get("stars") is not None else ""
+        lang = r.get("language") or "unknown lang"
+        lic = f", {r['license']}" if r.get("license") else ""
+        line = f"- [repo] {r['repo']} ({lang}{stars}{lic}) — {r['url']}"
+        if r.get("description"):
+            line += f": {r['description']}"
+        lines.append(line)
+    for d in toolkit.get("datasets") or []:
+        downloads = d.get("downloads") if d.get("downloads") is not None else 0
+        lines.append(f"- [dataset] {d['id']} ({downloads} downloads) — {d['url']}")
+    for m in toolkit.get("models") or []:
+        downloads = m.get("downloads") if m.get("downloads") is not None else 0
+        tag = f", {m['pipeline_tag']}" if m.get("pipeline_tag") else ""
+        lines.append(f"- [model] {m['id']} ({downloads} downloads{tag}) — {m['url']}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- composition
 def _dedup(hits: list[PaperHit]) -> list[PaperHit]:
     seen: set[str] = set()
@@ -751,10 +915,20 @@ async def fallback_research(query: str, settings=None, max_results: int = 8) -> 
     Shape-compatible with ``LLMResponse`` (``.answer``/``.citations``/``.ok``)
     so ``node_research`` can consume it unchanged. Returns ``ok=False`` when
     every source came up empty — callers keep their existing error handling.
+    The literature list is enriched with the verification toolkit (repos,
+    datasets, models): the finding tells downstream plan/verify nodes what
+    code and data actually exist, so a hypothesis can go straight to a
+    runnable protocol.
     """
-    hits = await search_all(query, max_results=max_results, settings=settings)
+    hits, toolkit = await asyncio.gather(
+        search_all(query, max_results=max_results, settings=settings),
+        verification_toolkit(query, settings=settings),
+    )
     if not hits:
         return FreeResearch(answer="", citations=[])
     citations = [h.url for h in hits if h.url]
     bibtex = await enriched_bibtex(citations, settings=settings)
-    return FreeResearch(answer=_answer_text(query, hits), citations=citations, bibtex=bibtex)
+    answer = _answer_text(query, hits)
+    if toolkit:
+        answer += "\n\n" + _toolkit_text(toolkit)
+    return FreeResearch(answer=answer, citations=citations, bibtex=bibtex)
