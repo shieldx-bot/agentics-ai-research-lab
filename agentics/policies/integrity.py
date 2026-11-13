@@ -122,13 +122,60 @@ class IntegrityWatcher:
             for path in paths:                 # per path: a mixed batch would
                 for args in (["checkout", "--", path],   # fail all-or-nothing
                              ["clean", "-f", "--", path]):
-                    try:
-                        subprocess.run(
-                            ["git", "-C", str(root), *args],
-                            check=False, capture_output=True, text=True, timeout=60,
-                        )
-                    except (OSError, subprocess.TimeoutExpired) as exc:
-                        log.warning("integrity restore failed for %s: %s", path, exc)
+                    proc = subprocess.run(
+                        ["git", "-C", str(root), *args],
+                        check=False, capture_output=True, text=True, timeout=60,
+                    )
+                    # A silent no-op restoration hid a baseline-vs-HEAD
+                    # restore war for a whole live run (2026-11-13): make
+                    # git's verdict visible instead of swallowing stderr.
+                    if proc.returncode != 0 and proc.stderr.strip():
+                        log.info("integrity restore %s %s: %s",
+                                 args[0], path, proc.stderr.strip()[:200])
+                self._resnapshot_after_restore(root, path)
+
+    def _resnapshot_after_restore(self, root: Path, rel: str) -> None:
+        """Adopt the post-restore truth into the baseline.
+
+        The baseline is a disk snapshot first taken when a workspace is seen
+        — often MID-CLONE, so it can disagree with git HEAD forever, and the
+        same keys then re-drifted (and were "restored") on every sweep for
+        the whole run (live 2026-11-13: one workspace churned every 21s for
+        half an hour). After restoring, the snapshot learns the restored
+        content when git confirms the working tree matches HEAD: a file the
+        restore actually fixed stops drifting, while a file that keeps
+        drifting (a real rogue) keeps alerting. A protected path that is
+        gone AND untracked cannot be restored by git at all (checkout only
+        resurrects tracked paths, clean only deletes) — drop it from the
+        watch set and journal once instead of looping forever."""
+        key = f"{root.name}:{rel}"
+        target = root / rel
+        if target.is_file():
+            same = subprocess.run(
+                ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", rel],
+                check=False, capture_output=True, text=True, timeout=60,
+            )
+            if same.returncode == 0:           # working tree == HEAD: adopt
+                try:
+                    self._snapshot[key] = self._hash(target)
+                except OSError:
+                    pass
+            return
+        if key not in self._snapshot:
+            return                             # new rogue already removed: nothing to adopt
+        tracked = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", rel],
+            check=False, capture_output=True, text=True, timeout=60,
+        )
+        if tracked.returncode != 0:
+            self._snapshot.pop(key, None)
+            try:
+                self.memory.journal("guard", "integrity_watch_dropped", {
+                    "workspace": root.name, "path": rel,
+                    "reason": "untracked and deleted; nothing to restore",
+                })
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
 
     def sweep_and_journal(self) -> list[str]:
         """Sweep, and when drift is found: journal + broadcast the alert."""

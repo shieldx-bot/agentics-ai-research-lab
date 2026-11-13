@@ -225,7 +225,7 @@ async def _llm_ask(
         if budget is not None:
             budget.record(ctx.agent_id, purpose, True, time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
-        from agentics.llm.errors import is_llm_refusal
+        from agentics.llm.errors import is_infra_failure, is_llm_refusal
 
         if is_llm_refusal(exc):
             # A refusal never touched the provider (empty pool, backend
@@ -238,6 +238,25 @@ async def _llm_ask(
                 state["error"] = f"llm refused: {exc}"
             try:
                 ctx.memory.journal(ctx.agent_id, "llm_refused",
+                                   {"purpose": purpose, "why": str(exc)[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return "", []
+        if is_infra_failure(exc):
+            # Session/transport-level (cloud session died mid-ask, the
+            # per-token cap rejected a rebuild, the CDP link dropped): the
+            # cookie and the model are fine and the client already rebuilt
+            # once. The P20 fail-streak must stay truthful — the free plan's
+            # ~10-minute session cap once read as five consecutive "model
+            # failures" per agent and froze the WHOLE swarm for the 900s
+            # cooldown (live 2026-11-13 14:47-15:10). Loudly logged and
+            # journalled, but not counted.
+            log.warning("[%s] %s llm infra failure: %s",
+                        ctx.agent_id, purpose, str(exc)[:200])
+            if state is not None and not state.get("error"):
+                state["error"] = f"llm {purpose} infra failure: {exc}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "llm_infra_failure",
                                    {"purpose": purpose, "why": str(exc)[:200]})
             except Exception:  # noqa: BLE001 — telemetry must never gate harder
                 pass

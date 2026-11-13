@@ -6,6 +6,7 @@ All tests are offline — no session is created (sessions only spawn inside
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -476,3 +477,73 @@ def test_sweep_tolerates_a_failing_stop(tmp_path, monkeypatch):
     client = _client_with(tmp_path, fake, monkeypatch)
     assert asyncio_run(client._stop_leaked_sessions()) is None  # never raises
     assert fake.stopped == []
+
+
+# ------------------------------------------------- proactive session recycle
+def test_ensure_session_recycles_an_aged_session(tmp_path, monkeypatch):
+    """Free-plan sessions die at a hard ~10-min duration cap — mid-ask, all
+    at once (live 2026-11-13: six sessions aged 9m37s-10m06s died inside one
+    30s window, wrecking every in-flight call). An aged session must be
+    recycled BETWEEN asks, while healthy, instead of waiting for the cap."""
+    _stop_at_playwright(monkeypatch)
+    fake = _FakeSessions()
+    client = _client_with(tmp_path, fake, monkeypatch)
+    client._recycle_s = 100.0
+    client._page = object()                            # looks healthy...
+    client._session_id = "s-old"
+    client._session_started = time.monotonic() - 101   # ...but is past the guard
+    torn = []
+
+    async def fake_teardown():
+        torn.append(1)
+
+    monkeypatch.setattr(client, "_teardown", fake_teardown)
+    with pytest.raises(RuntimeError, match="stop at playwright"):
+        asyncio_run(client._ensure_session())          # fell through to create
+    assert torn == [1, 1]                         # recycle teardown + playwright-fail teardown
+    assert fake.created == 1
+    assert client._session_id == "s1"                  # a FRESH session id
+
+
+def test_ensure_session_keeps_a_young_session(tmp_path, monkeypatch):
+    fake = _FakeSessions()
+    client = _client_with(tmp_path, fake, monkeypatch)
+    client._recycle_s = 100.0
+    client._page = object()
+    client._session_id = "s-young"
+    client._session_started = time.monotonic() - 10
+    asyncio_run(client._ensure_session())
+    assert fake.created == 0 and client._session_id == "s-young"
+
+
+def test_recycle_disabled_keeps_any_session(tmp_path, monkeypatch):
+    """HB_SESSION_RECYCLE_S=0 must restore the legacy never-recycle behavior."""
+    fake = _FakeSessions()
+    client = _client_with(tmp_path, fake, monkeypatch)
+    client._recycle_s = 0.0
+    client._page = object()
+    client._session_id = "s-old"
+    client._session_started = time.monotonic() - 10_000
+    asyncio_run(client._ensure_session())
+    assert fake.created == 0 and client._session_id == "s-old"
+
+
+def test_recycle_threshold_is_jittered_per_client(tmp_path):
+    """A swarm recycling in sync would 429-storm the rebuild path (the very
+    burst under test) — the per-client threshold must spread around the
+    configured base."""
+    s = _settings(tmp_path, hb_session_recycle_s=480)
+    seen = {
+        HyperbrowserClient(
+            CookieAccount(name="account-01", cookies=[]), s)._recycle_s
+        for _ in range(20)
+    }
+    assert all(432.0 <= v <= 552.0 for v in seen)
+    assert len(seen) > 1                          # actually jittered
+
+
+def test_recycle_guard_disabled_via_settings(tmp_path):
+    s = _settings(tmp_path, hb_session_recycle_s=0)
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]), s)
+    assert client._recycle_s == 0.0
