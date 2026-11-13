@@ -201,6 +201,10 @@ CREATE TABLE IF NOT EXISTS hypotheses (
     attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
+CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+CREATE INDEX IF NOT EXISTS idx_findings_issue ON findings(issue);
+CREATE INDEX IF NOT EXISTS idx_journal_agent ON journal(agent);
+CREATE INDEX IF NOT EXISTS idx_evidence_agent ON evidence(agent);
 """
 
 
@@ -212,6 +216,15 @@ _JOURNAL_KEEP_ROWS = 5000
 # Evidence rows (P16 records wired in for hypothesis 3) self-trim the same way.
 _EVIDENCE_TRIM_EVERY = 500
 _EVIDENCE_KEEP_ROWS = 2000
+
+# v2: the bus/knowledge tables get the SAME bounded-size treatment — the lab
+# runs forever, so messages/findings/decisions must not grow without limit.
+_MESSAGES_TRIM_EVERY = 500
+_MESSAGES_KEEP_ROWS = 10_000
+_FINDINGS_TRIM_EVERY = 200
+_FINDINGS_KEEP_ROWS = 2_000
+_DECISIONS_TRIM_EVERY = 200
+_DECISIONS_KEEP_ROWS = 2_000
 
 
 @dataclass
@@ -235,6 +248,9 @@ class SharedMemory:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._journal_inserts = 0      # drives the periodic journal trim
         self._evidence_inserts = 0     # drives the periodic evidence trim
+        self._message_inserts = 0      # v2: bus/knowledge trims follow the
+        self._finding_inserts = 0      # same every-N-inserts policy as the
+        self._decision_inserts = 0     # journal/evidence feeds above
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
             for column in (
@@ -262,6 +278,13 @@ class SharedMemory:
                 "INSERT INTO messages (ts, agent, kind, issue, content) VALUES (?,?,?,?,?)",
                 (time.time(), agent, kind, issue, content),
             )
+            self._message_inserts += 1
+            if self._message_inserts % _MESSAGES_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM messages WHERE id NOT IN "
+                    "(SELECT id FROM messages ORDER BY id DESC LIMIT ?)",
+                    (_MESSAGES_KEEP_ROWS,),
+                )
 
     def recent_messages(self, limit: int = 50, since_ts: float = 0.0) -> list[dict]:
         with self._lock:
@@ -286,7 +309,28 @@ class SharedMemory:
                 "VALUES (?,?,?,?,?,?)",
                 (time.time(), agent, issue, title, content, json.dumps(citations or [])),
             )
+            self._finding_inserts += 1
+            if self._finding_inserts % _FINDINGS_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM findings WHERE id NOT IN "
+                    "(SELECT id FROM findings ORDER BY id DESC LIMIT ?)",
+                    (_FINDINGS_KEEP_ROWS,),
+                )
             return int(cur.lastrowid or 0)
+
+    def get_finding(self, finding_id: int) -> dict | None:
+        """One finding by id. The recall path (vector hits carry ``finding_id``
+        metadata) checks the row still exists before citing it, so a trimmed
+        finding never leaks back into a prompt as a ghost row."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, agent, issue, title, content, citations "
+                "FROM findings WHERE id=?", (finding_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "ts": row[1], "agent": row[2], "issue": row[3],
+                "title": row[4], "content": row[5], "citations": json.loads(row[6])}
 
     def list_findings(self, limit: int = 100) -> list[dict]:
         with self._lock:
@@ -582,6 +626,13 @@ class SharedMemory:
                 "INSERT INTO decisions (ts, agent, decision, reason) VALUES (?,?,?,?)",
                 (time.time(), agent, decision, reason),
             )
+            self._decision_inserts += 1
+            if self._decision_inserts % _DECISIONS_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM decisions WHERE id NOT IN "
+                    "(SELECT id FROM decisions ORDER BY id DESC LIMIT ?)",
+                    (_DECISIONS_KEEP_ROWS,),
+                )
 
     # ------------------------------------------------------------ claims
     def claim_issue(self, issue: int, agent: str, ttl_s: float, branch: str = "") -> bool:
@@ -1250,7 +1301,10 @@ class SharedMemory:
             self._conn.execute("UPDATE skills SET uses=uses+1 WHERE skill_id=?", (skill_id,))
 
     def memory_stats(self) -> dict:
-        """Counts for `agentics memory-stats` — how big/structured memory is."""
+        """Counts for `agentics memory-stats` — how big/structured memory is.
+
+        All queries run under the lock (the pre-v2 helper escaped it for the
+        count() calls, a latent cross-thread hazard on the shared conn)."""
         with self._lock:
             def count(sql: str) -> int:
                 return int(self._conn.execute(sql).fetchone()[0])
@@ -1259,14 +1313,22 @@ class SharedMemory:
                 "JOIN trace_clusters c ON s.cluster_id=c.cluster_id "
                 "WHERE s.status='active' ORDER BY s.uses DESC, s.skill_id DESC LIMIT 5"
             ).fetchall()
-        return {
-            "traces": count("SELECT COUNT(*) FROM traces"),
-            "clustered": count("SELECT COUNT(*) FROM traces WHERE cluster_id IS NOT NULL"),
-            "clusters": count("SELECT COUNT(*) FROM trace_clusters"),
-            "active_skills": count("SELECT COUNT(*) FROM skills WHERE status='active'"),
-            "superseded_skills": count("SELECT COUNT(*) FROM skills WHERE status='superseded'"),
-            "top_skills": [{"category": r[2], "uses": r[1], "text": r[0][:120]} for r in top],
-        }
+            stats = {
+                "traces": count("SELECT COUNT(*) FROM traces"),
+                "clustered": count("SELECT COUNT(*) FROM traces WHERE cluster_id IS NOT NULL"),
+                "clusters": count("SELECT COUNT(*) FROM trace_clusters"),
+                "active_skills": count("SELECT COUNT(*) FROM skills WHERE status='active'"),
+                "superseded_skills": count("SELECT COUNT(*) FROM skills WHERE status='superseded'"),
+                "top_skills": [{"category": r[2], "uses": r[1], "text": r[0][:120]}
+                               for r in top],
+                # v2: the shared-brain tables the trim policy now bounds
+                "messages": count("SELECT COUNT(*) FROM messages"),
+                "findings": count("SELECT COUNT(*) FROM findings"),
+                "decisions": count("SELECT COUNT(*) FROM decisions"),
+                "evidence": count("SELECT COUNT(*) FROM evidence"),
+                "hypotheses": count("SELECT COUNT(*) FROM hypotheses"),
+            }
+        return stats
 
     # ------------------------------------------------------------ merge queue (P4)
     def mq_enqueue(self, pr_number: int, author: str) -> bool:

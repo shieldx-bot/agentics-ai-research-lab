@@ -44,6 +44,60 @@ STOP_YIELD = "yield"
 
 
 # ---------------------------------------------------------------- helpers
+def _lessons_text(ctx: AgentContext, query: str = "", limit: int = 5) -> str:
+    """The agent's OWN lessons from past cycles — the personal memory was
+    write-only until now; this closes the loop so an agent stops repeating
+    its own failures. With a ``query`` the lessons are ranked by relevance
+    to the current task; without one, by recency. Defensive: contexts (or
+    test doubles) without the recall methods degrade to "" — never a crash."""
+    personal = (getattr(ctx, "meta", None) or {}).get("personal")
+    if personal is None:
+        return ""
+    try:
+        if query and hasattr(personal, "relevant_lessons"):
+            lessons = personal.relevant_lessons(query, limit)
+        elif hasattr(personal, "recent_lessons"):
+            lessons = personal.recent_lessons(limit)
+        else:
+            return ""
+    except Exception:  # noqa: BLE001 — memory must never break a cycle
+        return ""
+    return "\n".join(f"- {str(l)[:220]}" for l in lessons if l)
+
+
+def finding_recall_text(ctx: AgentContext, query: str, limit: int = 3) -> str:
+    """Relevance recall of stored findings — the shared semantic memory.
+
+    The vector store already holds every finding the researcher ever wrote
+    (``node_research`` adds it); until now that index was only queried for
+    DEDUP. This makes the same index answer "what do we already know about
+    this?" at plan time. Vector hits whose SQLite row was trimmed out are
+    skipped, so recall never cites a ghost finding. Returns "" when chromadb
+    is absent or nothing matches — the plan prompt is unchanged at cold start.
+    """
+    vector = getattr(ctx, "vector", None)
+    if not (query or "").strip() or vector is None or not getattr(vector, "available", False):
+        return ""
+    try:
+        hits = vector.search(query, n=max(limit * 2, limit))
+        lines: list[str] = []
+        for h in hits:
+            meta = h.get("meta") or {}
+            fid = str(meta.get("finding_id", ""))
+            if not fid.isdigit():
+                continue
+            f = ctx.memory.get_finding(int(fid))
+            if f is None:
+                continue          # vector entry outlived its trimmed SQLite row
+            digest = " ".join((f["content"] or "").split())[:220]
+            lines.append(f"- #{f['id']} {f['title']} (by {f['agent']}): {digest}")
+            if len(lines) >= limit:
+                break
+    except Exception:  # noqa: BLE001 — recall must never break planning
+        return ""
+    return "\n".join(lines)
+
+
 def _memory_context(ctx: AgentContext) -> dict:
     msgs = ctx.memory.recent_messages(limit=15)
     findings = ctx.memory.list_findings(limit=10)
@@ -55,6 +109,10 @@ def _memory_context(ctx: AgentContext) -> dict:
         "findings": "\n".join(
             f"- #{f['id']} {f['title']} (by {f['agent']})" for f in findings
         ) or "(empty)",
+        # v2: the agent's own deduped lessons — reflect writes them, this
+        # snapshot (and node_plan) read them back. Recurring failures show
+        # as (xN) patterns instead of N identical rows.
+        "lessons": _lessons_text(ctx) or "(none yet)",
         # H3: every agent's snapshot carries the swarm's settled knowledge —
         # supported claims are reusable common ground, refuted ones are dead
         # ends (rendered by verified_knowledge_text, below).
@@ -554,6 +612,22 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         category=category)
     tools_txt = tool_context(
         ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}")
+    # v2 memory loops: the planner sees its OWN relevant lessons (personal
+    # memory) and the swarm's RELATED stored findings (vector recall) — both
+    # bounded, both defensive, both empty at cold start.
+    _query = f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}"
+    lessons_txt = _lessons_text(ctx, _query)
+    recall_txt = finding_recall_text(ctx, _query)
+    personal_rule = (
+        f"\nYour own lessons from past cycles (personal memory — never repeat "
+        f"these failures; (xN) marks how often each recurred):\n{lessons_txt}\n"
+        if lessons_txt else ""
+    )
+    recall_rule = (
+        f"\nFindings this lab already stored about similar topics (relevance "
+        f"recall — reuse this knowledge, cite finding ids):\n{recall_txt}\n"
+        if recall_txt else ""
+    )
     # H3: plans must stand on what the lab has PROVEN, not on fresh guesses —
     # and the declared verify_cmds should re-check exactly the new claims.
     knowledge_txt = verified_knowledge_text(ctx)
@@ -581,7 +655,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{evolution_rule}{rework_rule}{knowledge_rule}\n"
+        f"{tools_txt}\n{personal_rule}{recall_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
         "Propose a concrete implementation plan for this repo. Reply ONLY with "
         'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
         '"steps": ["..."], "commit_message": "...", '

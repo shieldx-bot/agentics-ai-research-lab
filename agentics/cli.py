@@ -362,9 +362,10 @@ def metrics(
 
 @app.command("memory-stats")
 def memory_stats() -> None:
-    """LifeMem memory health: traces, workflow clusters, distilled skills."""
+    """Memory health: LifeMem traces/clusters/skills + bounded tables + personal lessons."""
     settings = _settings()
     setup_logging("ERROR")
+    from agentics.memory.personal_memory import PersonalMemory
     from agentics.memory.shared_memory import SharedMemory
 
     settings.ensure_dirs()
@@ -376,6 +377,11 @@ def memory_stats() -> None:
         f"[bold]Skills:[/] {st['active_skills']} active / "
         f"{st['superseded_skills']} superseded"
     )
+    console.print(
+        f"[bold]Findings:[/] {st['findings']}   [bold]Messages:[/] {st['messages']}   "
+        f"[bold]Decisions:[/] {st['decisions']}   [bold]Evidence:[/] {st['evidence']}   "
+        f"[bold]Hypotheses:[/] {st['hypotheses']}"
+    )
     if st["top_skills"]:
         table = Table(title="Most-reused skills")
         for col in ("uses", "category", "skill"):
@@ -384,6 +390,28 @@ def memory_stats() -> None:
             table.add_row(str(s["uses"]), s["category"], s["text"])
         console.print(table)
     memory.close()
+
+    # v2: personal memory health — deduped lessons per agent (the same DB
+    # the graph opens at data/personal/<agent>.db, read-only here)
+    personal_dir = settings.data_dir / "personal"
+    rows = []
+    if personal_dir.is_dir():
+        for db in sorted(personal_dir.glob("*.db")):
+            try:
+                pm = PersonalMemory(db.stem, personal_dir)
+                stats = pm.lesson_stats()
+                pm.close()
+            except Exception:  # noqa: BLE001, S112 — corrupt notebook skipped, keep reporting
+                continue
+            rows.append((db.stem, stats))
+    if rows:
+        table = Table(title="Personal memory (deduped lessons)")
+        for col in ("agent", "lessons", "recurrences", "recurring"):
+            table.add_column(col)
+        for agent, s in rows:
+            table.add_row(agent, str(s["lessons"]), str(s["recurrences"]),
+                          str(s["recurring"]))
+        console.print(table)
 
 
 @app.command()

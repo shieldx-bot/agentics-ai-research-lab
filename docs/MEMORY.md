@@ -5,6 +5,10 @@ generation); the third is the **LifeMem upgrade** (Qiu et al.,
 [arXiv:2609.12655](https://arxiv.org/abs/2609.12655)) that stops the shared
 memory from degrading into an unorganized pile as the lab runs for weeks.
 
+A later hardening pass (v2) closed the loops that were half-built — dedup,
+recall, bounded growth — without introducing any new subsystem; every
+change upgrades a mechanism that already existed. See "v2 hardening" below.
+
 ## Layer 1 — Shared memory (`agentics/memory/shared_memory.py`)
 
 SQLite WAL, one file (`data/memory.db`), safe for concurrent agent threads.
@@ -21,11 +25,27 @@ SQLite WAL, one file (`data/memory.db`), safe for concurrent agent threads.
 | `merge_queue` | persistent serial merge queue (P4) |
 | `trace_clusters` | **LifeMem**: workflow clusters grouping similar traces |
 | `skills` | **LifeMem**: skills distilled from merged traces per cluster |
+| `messages` / `findings` / `decisions` | v2: bounded by the same trim policy the journal/evidence feeds already had |
 
 ## Layer 2 — Personal memory (`agentics/memory/personal_memory.py`)
 
 Per-agent SQLite (`data/personal/<agent>.db`): lessons this agent drew from its
 own cycles. Cheap, private, always local to the agent's context.
+
+v2 closed the write-only gap (lessons used to be written at reflect time and
+never read back) and hardened the notebook:
+
+- **Dedup** — a lesson is identified by its normalized hash (the same
+  normalization `claim_hash` applies to hypotheses); a recurrence bumps
+  `hits` / `last_seen` instead of inserting a duplicate row. Recurring
+  failures render as `(xN)` patterns in prompts.
+- **Recall** — `recent_lessons` (recency) and `relevant_lessons(query)`
+  (keyword overlap + hits, the ranking the tool/skill lookups already use)
+  feed `_memory_context["lessons"]` and the `node_plan` prompt.
+- **Bounded** — the lessons table self-trims like the journal (every 50 new
+  lessons, keep the 500 most recently seen).
+- **Migration** — v1 databases upgrade in place on first open (new columns,
+  hash backfill, duplicate consolidation); re-opening is idempotent.
 
 ## Layer 3 — LifeMem structuring (`agentics/memory/lifemem.py`)
 
@@ -74,7 +94,9 @@ exactly the "unorganized memory" failure mode LifeMem documents for agents.
 ### Operating it
 
 ```bash
-python -m agentics.cli memory-stats   # traces, clusters, active/superseded skills
+python -m agentics.cli memory-stats   # traces, clusters, skills,
+                                     # findings/messages/decisions/evidence/hypotheses,
+                                     # per-agent personal lessons (deduped)
 ```
 
 `Top skills` shows the most-activated distilled skills — if a skill's `uses`
@@ -88,6 +110,25 @@ count grows while the merge rate stays flat, the skill tier is doing its job.
 - The offline hashed BoW implementation remains a baseline, not a semantic
   embedding claim. Evaluate any future embedding replacement against retrieval
   benchmarks before changing the default.
+
+## v2 hardening — closing the half-built loops
+
+Everything below upgrades an existing mechanism; nothing new was invented.
+
+| Loop that was half-built | What the upgrade does |
+| --- | --- |
+| Personal memory was write-only | `_memory_context["lessons"]` + `node_plan` inject the agent's own deduped lessons (recency snapshot; relevance-ranked at plan time) |
+| Findings vector index was dedup-only | `finding_recall_text` queries the SAME ChromaDB index at plan time ("what do we already know?"); hits pointing at trimmed SQLite rows are skipped via `get_finding` — recall never cites a ghost |
+| Identical lessons re-inserted every cycle | hash dedup + `hits`/`last_seen` (the `claim_hash` idea, applied to lessons) |
+| messages/findings/decisions grew forever | the journal/evidence trim pattern extended to them (10k messages / 2k findings / 2k decisions kept) |
+| hot queries had no indexes | `idx_messages_ts`, `idx_findings_issue`, `idx_journal_agent`, `idx_evidence_agent` |
+| `memory_stats()` escaped the lock for its count queries | all stats now run under the connection lock (latent cross-thread hazard on the shared conn) |
+
+All recall/injection paths are defensive: a context or double without the
+new surface (old fixtures, test fakes, a partially started swarm) degrades to
+an empty string — memory can never break a cycle. At cold start every new
+prompt block is empty, so prompts are unchanged until memory actually has
+something to say.
 
 ### Limits
 
