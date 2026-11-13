@@ -441,6 +441,17 @@ Engine cơ khí (không LLM): `agentics/peer_review.py` — node graph:
 `node_review` (vote), `node_defend` (bảo vệ, router ưu tiên cao nhất cho
 mọi role), sweep trong `node_scan`.
 
+**Đường dây trực tiếp của owner trên terminal** — `agentics panel`:
+bảng mọi panel (state, vòng, đồng hồ bảo vệ còn lại, dòng kết luận);
+`agentics panel --mr N` xem đầy đủ phiếu/objection/bản bảo vệ của một MR
+(kể cả panel đã đóng); `agentics panel --stats` trả lời câu hỏi gốc của
+cơ chế — nó có đang cải thiện kết quả chung không: tỉ lệ duyệt, vòng bảo
+vệ cứu được bao nhiêu %, lý do reject phân loại theo reason prefix cố
+định của engine (incomplete/unmoved/conceded/deadline), người phản đối
+nhiều nhất. Hai query chỉ đọc: `SharedMemory.panels_overview()` và
+`SharedMemory.panel_stats()` — engine và luật bỏ phiếu không đổi.
+
 Test: `tests/test_peer_review.py` (18 kịch bản luật), 
-`tests/test_peer_review_memory.py`, `tests/test_nodes_integration.py`
+`tests/test_peer_review_memory.py`, `tests/test_cli_panel.py` (lệnh owner),
+`tests/test_nodes_integration.py`
 (vote mở defense), `tests/test_dashboard_api.py` (owner nhìn thấy panel).
