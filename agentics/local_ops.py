@@ -41,7 +41,8 @@ def branch_name(agent_id: str, task_id: int, title: str) -> str:
 
 
 # Angles the Supervisor rotates through when the backlog runs dry, so the
-# infinite research loop always has somewhere to go.
+# infinite research loop always has somewhere to go. Appended angles keep the
+# existing rotation indices stable (total % len picks from the head first).
 SURVEY_ANGLES: tuple[str, ...] = (
     "State-of-the-art survey",
     "Benchmark design and metrics",
@@ -49,6 +50,20 @@ SURVEY_ANGLES: tuple[str, ...] = (
     "Failure-mode analysis",
     "Reproducibility checklist",
     "Tooling and evaluation harness",
+    # P16bis: turn the swarm's own stored findings into settled knowledge —
+    # a dedicated verification angle so claims in shared memory eventually
+    # meet run_protocol instead of being re-surveyed forever.
+    "Empirical verification of stored findings",
+)
+
+# Body for the verification angle task: it points the Researcher at the
+# swarm's own unverified findings (the P16bis loop's fuel).
+VERIFICATION_ANGLE_BODY = (
+    "Backlog ran dry. Pick findings already stored in shared memory that have "
+    "no settled hypothesis yet, extract their QUANTITATIVE claims and verify "
+    "them by running protocols (P16bis: claim -> pre-registered criterion -> "
+    "AGENTICS_RESULT protocol -> evidence -> verified_knowledge). Re-surveying "
+    "is not the goal; settling claims by running code is."
 )
 
 
@@ -228,10 +243,15 @@ class TaskSource:
         total = sum(self.memory.task_counts().values())
         for offset in range(len(SURVEY_ANGLES)):
             angle = SURVEY_ANGLES[(total + offset) % len(SURVEY_ANGLES)]
+            body = (
+                VERIFICATION_ANGLE_BODY
+                if angle.startswith("Empirical verification")
+                else "Backlog ran dry. Produce the next research increment with "
+                     "citations and store findings in shared memory."
+            )
             created = self.memory.create_task_if_absent(
                 f"{angle}: {topic}",
-                body=("Backlog ran dry. Produce the next research increment with "
-                      "citations and store findings in shared memory."),
+                body=body,
                 category="research",
                 agent="supervisor",
             )

@@ -159,6 +159,25 @@ def test_supervisor_top_up_rotates_survey_angles(settings, mem):
     assert len(angles_logged) == len(titles)
 
 
+def test_verification_angle_task_points_at_stored_findings(settings, mem):
+    """P16bis: the appended 'Empirical verification' angle produces a task
+    whose body steers the Researcher at the swarm's OWN unverified findings
+    (settling claims by running code), not at another re-survey."""
+    src = TaskSource(mem, settings)
+    created = None
+    for _ in range(len(SURVEY_ANGLES)):        # rotation reaches it eventually
+        if not src.supervisor_top_up():        # returns a COUNT, not an id
+            continue
+        task = mem.list_tasks(limit=1)[0]      # newest = the one just opened
+        if task["title"].startswith("Empirical verification"):
+            created = task
+            break
+        mem.set_task_status(task["id"], "merged")          # dry the backlog again
+    assert created is not None
+    assert "stored in shared memory" in created["body"]
+    assert "verified_knowledge" in created["body"]
+
+
 def test_repair_orphan_tasks_reopens_claimed_without_lease(settings, mem):
     src = TaskSource(mem, settings)
     tid = mem.create_task("crashed claim")
