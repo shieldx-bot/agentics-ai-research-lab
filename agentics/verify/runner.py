@@ -1,4 +1,9 @@
-"""P16 ExperimentRunner — executes a pre-registered hypothesis protocol.
+"""P16 ExperimentRunner — standalone executor for a pre-registered hypothesis.
+
+NOTE (superseded in the live cycle): node_implement now composes the
+register → run → settle API (agentics/verify/experiment.py). This module
+remains the reference executor with the RESULT-FILE fallback convention
+and is exercised by tests/test_experiment_runner.py.
 
 Composes the predecessor's stack (no second safety surface, no second
 adjudicator):
