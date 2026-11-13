@@ -108,24 +108,6 @@ CREATE TABLE IF NOT EXISTS reviews (
     verdict_comment TEXT DEFAULT '',
     approved_by TEXT DEFAULT ''
 );
-CREATE TABLE IF NOT EXISTS evidence (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts REAL NOT NULL,
-    agent TEXT NOT NULL,
-    role TEXT DEFAULT '',                  -- author | reviewer
-    task_id INTEGER,
-    mr_id INTEGER,
-    hypothesis TEXT DEFAULT '',            -- the falsifiable claim being tested
-    method TEXT DEFAULT '',                -- run_command | reviewer_rerun | ...
-    cmd TEXT DEFAULT '',
-    exit_code INTEGER,
-    verdict TEXT NOT NULL,                 -- confirmed | refuted | inconclusive
-    output TEXT DEFAULT '',                -- bounded output tail
-    duration_s REAL,
-    metric REAL,
-    threshold REAL,
-    comparator TEXT DEFAULT 'ge'           -- ge | le | gt | lt | eq (enrichment)
-);
 CREATE TABLE IF NOT EXISTS traces (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -339,6 +321,13 @@ class SharedMemory:
                  float(duration_s), artifact[:300]),
             )
             ev_id = int(cur.lastrowid or 0)
+            self._evidence_inserts += 1
+            if self._evidence_inserts % _EVIDENCE_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM evidence WHERE id NOT IN "
+                    "(SELECT id FROM evidence ORDER BY id DESC LIMIT ?)",
+                    (_EVIDENCE_KEEP_ROWS,),
+                )
         if broadcast:
             self.post_message(
                 agent, "evidence",
@@ -387,15 +376,33 @@ class SharedMemory:
             ).fetchall()
         return [self._evidence_row(r) for r in rows]
 
-    def latest_evidence(self, limit: int = 30) -> list[dict]:
+    def latest_evidence(self, limit: int = 30, agent: str | None = None) -> list[dict]:
         """Newest evidence across every agent — the shared verdict feed
-        (newest first: the dashboard and agents care about the latest)."""
+        (newest first: the dashboard and agents care about the latest).
+        ``agent`` narrows the feed to one agent's recorded runs."""
+        sql = f"SELECT {self._EVIDENCE_COLS} FROM evidence"
+        args: list = []
+        if agent:
+            sql += " WHERE agent=?"
+            args.append(agent)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
-                "ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            rows = self._conn.execute(sql, args).fetchall()
         return [self._evidence_row(r) for r in rows]
+
+    def evidence_stats(self) -> dict:
+        """Confirmed/refuted/inconclusive counts — how sound is the lab's
+        evidence base? Dashboard health metric, cheap enough for every poll."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(verdict='confirmed'),0), "
+                "COALESCE(SUM(verdict='refuted'),0), "
+                "COALESCE(SUM(verdict='inconclusive'),0) FROM evidence"
+            ).fetchone()
+        return {"total": row[0], "confirmed": row[1],
+                "refuted": row[2], "inconclusive": row[3]}
 
     def evidence_search(self, term: str, limit: int = 30) -> list[dict]:
         """Cross-agent lookup: prior verdicts mentioning a term (hypothesis,
@@ -946,89 +953,6 @@ class SharedMemory:
             self.set_task_status(task_id, "in_review")
         self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
         return True
-
-    # ------------------------------------------------------------ evidence (P16 + H3)
-    def record_evidence(
-        self, agent: str, role: str, task_id: int | None, mr_id: int | None,
-        hypothesis: str, row: dict,
-    ) -> int:
-        """Wire one P16 Evidence record into shared knowledge (hypothesis 3).
-
-        ``row`` is the dict produced by ``verify_ops.Evidence.as_row()``:
-        {method, cmd, exit_code, verdict, output, duration_s} — optionally
-        enriched with {metric, threshold, comparator} parsed from the output.
-        The verdict comes from the REAL exit code, never from a model. Every
-        record is journalled and broadcast so every agent sees every verdict.
-        """
-        verdict = row.get("verdict", "inconclusive")
-        if verdict not in ("confirmed", "refuted", "inconclusive"):
-            verdict = "inconclusive"
-        comparator = row.get("comparator") or "ge"
-        if comparator not in ("ge", "le", "gt", "lt", "eq"):
-            comparator = "ge"
-        with self._lock, self._conn:
-            cur = self._conn.execute(
-                "INSERT INTO evidence (ts, agent, role, task_id, mr_id, hypothesis, "
-                "method, cmd, exit_code, verdict, output, duration_s, metric, "
-                "threshold, comparator) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (time.time(), agent, role[:20], task_id, mr_id,
-                 (hypothesis or "")[:400], (row.get("method") or "")[:30],
-                 (row.get("cmd") or "")[:300],
-                 None if row.get("exit_code") is None else int(row["exit_code"]),
-                 verdict, str(row.get("output") or "")[-1500:],
-                 row.get("duration_s"),
-                 None if row.get("metric") is None else float(row["metric"]),
-                 None if row.get("threshold") is None else float(row["threshold"]),
-                 comparator),
-            )
-            eid = int(cur.lastrowid or 0)
-            self._evidence_inserts += 1
-            if self._evidence_inserts % _EVIDENCE_TRIM_EVERY == 0:
-                self._conn.execute(
-                    "DELETE FROM evidence WHERE id NOT IN "
-                    "(SELECT id FROM evidence ORDER BY id DESC LIMIT ?)",
-                    (_EVIDENCE_KEEP_ROWS,),
-                )
-        metric_txt = "" if row.get("metric") is None else (
-            f" metric={row['metric']} vs {comparator} {row.get('threshold')}")
-        self.journal(agent, "evidence_recorded", {
-            "id": eid, "task": task_id, "mr": mr_id,
-            "method": row.get("method"), "verdict": verdict,
-            "cmd": (row.get("cmd") or "")[:120],
-        })
-        self.post_message(
-            agent, "broadcast",
-            f"Evidence [{verdict}]{metric_txt}: "
-            f"{(hypothesis or row.get('cmd') or '')[:140]}",
-            task_id,
-        )
-        return eid
-
-    def recent_evidence(self, limit: int = 12, agent: str | None = None) -> list[dict]:
-        """Newest-first evidence rows, optionally filtered by recording agent."""
-        sql = "SELECT * FROM evidence"
-        args: list = []
-        if agent:
-            sql += " WHERE agent=?"
-            args.append(agent)
-        sql += " ORDER BY id DESC LIMIT ?"
-        args.append(limit)
-        with self._lock:
-            cols = [c[0] for c in self._conn.execute(sql, args).description]
-            rows = self._conn.execute(sql, args).fetchall()
-        return [dict(zip(cols, r)) for r in rows]
-
-    def evidence_stats(self) -> dict:
-        """Confirmed/refuted/inconclusive counts — the lab's evidence base."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*), "
-                "COALESCE(SUM(verdict='confirmed'),0), "
-                "COALESCE(SUM(verdict='refuted'),0), "
-                "COALESCE(SUM(verdict='inconclusive'),0) FROM evidence"
-            ).fetchone()
-        return {"total": row[0], "confirmed": row[1],
-                "refuted": row[2], "inconclusive": row[3]}
 
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(
