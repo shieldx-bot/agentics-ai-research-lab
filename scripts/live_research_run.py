@@ -83,13 +83,13 @@ async def main() -> None:
     state = nodes.node_start(ctx, state)
     print(f"[{time.monotonic() - t0:6.1f}s] node_research (topic: {settings.research_topic[:70]}…)")
     state = await nodes.node_research(ctx, state)
+    answer = state.get("papers", [{}])[0].get("answer", "")
     report["research"] = {
         "done": state.get("done"), "error": state.get("error", ""),
         "citations": state.get("citations", []),
-        "answer": answer,
+        "answer_chars": len(answer),
         "bibtex": state.get("bibtex", ""),
     }
-    answer = state.get("papers", [{}])[0].get("answer", "")
     print(f"[{time.monotonic() - t0:6.1f}s] research done: "
           f"{report['research']['answer_chars']} chars, "
           f"{len(report['research']['citations'])} citations")

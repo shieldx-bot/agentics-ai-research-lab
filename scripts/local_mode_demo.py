@@ -163,12 +163,17 @@ def show(mem: SharedMemory, title: str) -> None:
 
 
 async def main() -> None:
+    global TOPIC
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="keep the demo data dir")
+    ap.add_argument("--topic", default=TOPIC,
+                    help="research topic for the demo (default: the built-in NFV one)")
     args = ap.parse_args()
+    TOPIC = args.topic
 
     root = Path(tempfile.mkdtemp(prefix="agentics-demo-"))
     print(f"demo sandbox: {root}")
+    print(f"demo topic: {TOPIC}")
     settings = Settings(data_dir=root / "data", research_topic=TOPIC,
                         evolution_every_n_cycles=0)
     settings.ensure_dirs()
