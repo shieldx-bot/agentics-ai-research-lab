@@ -55,6 +55,18 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _hb_api_keys() -> list[str]:
+    """Hyperbrowser token pool: HB_API_KEYS (comma-separated) wins, then the
+    single HB_API_KEY. Empty list = no tokens (session creation will fail
+    with the SDK's own clear error, same as before)."""
+    raw = _env("HB_API_KEYS", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        single = _env("HB_API_KEY", "")
+        keys = [single] if single else []
+    return keys
+
+
 def _env_int(key: str, default: int) -> int:
     _load_dotenv()
     try:
@@ -171,6 +183,12 @@ class Settings:
     #   residential proxy) via Playwright CDP; works from any VPS.
     browser_backend: str = field(default_factory=lambda: _env("BROWSER_BACKEND", "local"))
     hyperbrowser_api_key: str = field(default_factory=lambda: _env("HB_API_KEY"))
+    # HB_API_KEYS: comma-separated Hyperbrowser tokens. Each token owns ONE
+    # cloud session, so K tokens scale the swarm to K truly parallel agents
+    # (per-token session locks replace the old global single-session lock).
+    # Falls back to [hyperbrowser_api_key]; secrets.yaml may override with a
+    # YAML list.
+    hyperbrowser_api_keys: list[str] = field(default_factory=lambda: _hb_api_keys())
     hyperbrowser_proxy_country: str = field(
         default_factory=lambda: _env("HB_PROXY_COUNTRY", "US"))
     hyperbrowser_timeout: int = field(
