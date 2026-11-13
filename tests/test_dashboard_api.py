@@ -148,3 +148,18 @@ def test_evidence_card_present_in_dashboard_html(mem, settings):
     html = TestClient(create_app(mem, settings)).get("/").text
     assert "Kiểm chứng thực nghiệm" in html
     assert 'id="evidence"' in html and 'id="evcounts"' in html
+
+
+def test_alerts_card_covers_repairs_and_p16_suspicions(mem, settings):
+    """The alerts card previously only showed guard events — a Supervisor
+    task_repair, a failed merge or a suspicious P16 hypothesis were invisible
+    to the owner. All system alerts must surface in one place."""
+    for event in ("task_repair", "merge_failed", "p16_inconclusive",
+                  "p16_hypothesis_invalid", "integrity_drift"):
+        mem.journal("sys", event, {"note": f"{event} happened"})
+    s = _state(mem, settings)
+    events = [a["event"] for a in s["alerts"]]
+    for event in ("task_repair", "merge_failed", "p16_inconclusive",
+                  "p16_hypothesis_invalid", "integrity_drift"):
+        assert event in events
+    assert "lock_conflict" not in events            # none recorded here

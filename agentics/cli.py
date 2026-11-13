@@ -103,6 +103,40 @@ def status() -> None:
     memory.close()
 
 
+@app.command("repair")
+def repair() -> None:
+    """Owner: run the maintenance pass NOW instead of waiting for a scan cycle.
+
+    Calls the two existing local-mode services (no new machinery): the
+    TaskSource's orphan repair (tasks stuck in claimed/in_review with no
+    lease/MR go back to the open pool) and the ClaimPolicy's stale-lease
+    sweep (leases of dead/expired agents are released)."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.local_ops import LocalClaimPolicy, TaskSource
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        swept = LocalClaimPolicy(memory, ttl_minutes=30).sweep_stale()
+        repaired = TaskSource(memory, settings).repair_orphan_tasks()
+        if swept:
+            console.print(f"[bold]Swept stale leases[/] -> tasks re-opened: "
+                          + ", ".join(f"#{t}" for t in swept))
+        else:
+            console.print("[bold]Swept stale leases:[/] none")
+        if repaired:
+            console.print(f"[bold]Repaired orphan tasks[/] -> re-opened: "
+                          + ", ".join(f"#{t}" for t in repaired))
+        else:
+            console.print("[bold]Repaired orphan tasks:[/] none")
+        memory.journal("owner", "manual_maintenance", {
+            "swept": swept, "repaired": repaired})
+    finally:
+        memory.close()
+
+
 @app.command("dashboard")
 def dashboard(
     port: int = typer.Option(None, "--port", help="HTTP port (default DASHBOARD_PORT or 8080)"),
