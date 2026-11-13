@@ -523,7 +523,18 @@ class SharedMemory:
                 "UPDATE evidence SET verdict=?, note=?, verdict_by=? WHERE id=?",
                 (verdict, note[:600], by[:64], ev_id),
             )
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+        if changed:
+            # P19 — immutable audit: overwriting a verdict is exactly the kind
+            # of action a production audit trail exists for (who re-judged
+            # what, when, and on what grounds).
+            try:
+                self.audit(by or "system", "evidence_reverdict", {
+                    "evidence_id": ev_id, "verdict": verdict,
+                    "note": note[:300]})
+            except Exception:  # noqa: BLE001 — audit must never gate the update
+                pass
+        return changed
 
     def _evidence_row(self, r) -> dict:
         return {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
@@ -1124,6 +1135,13 @@ class SharedMemory:
         if changed:
             self.journal(agent, "task_exempt_set" if exempt else "task_exempt_cleared",
                          {"task": task_id})
+            # P19 — immutable audit: lifting a protected-path exemption is a
+            # security decision; it must be traceable after the journal trims.
+            try:
+                self.audit(agent, "task_exempt_set" if exempt else "task_exempt_cleared",
+                           {"task": task_id})
+            except Exception:  # noqa: BLE001
+                pass
 
     def task_counts(self) -> dict[str, int]:
         with self._lock:
