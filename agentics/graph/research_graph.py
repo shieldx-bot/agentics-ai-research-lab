@@ -31,6 +31,7 @@ from agentics.graph.nodes import (
     node_review,
     node_scan,
     node_start,
+    node_tournament,
     node_verify,
     pending_defense,
     pending_replication,
@@ -70,9 +71,13 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     async def replicate_node(state: ResearchState) -> ResearchState:
         return await node_replicate(ctx, state)
 
+    async def tournament_node(state: ResearchState) -> ResearchState:
+        return await node_tournament(ctx, state)
+
     g.add_node("research", research_node)
     g.add_node("verify", verify_node)
     g.add_node("replicate", replicate_node)
+    g.add_node("tournament", tournament_node)
     g.add_node("plan", plan_node)
     g.add_node("implement", implement_node)
     g.add_node("open_pr", lambda s: node_open_pr(ctx, s))
@@ -140,7 +145,8 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     g.add_conditional_edges("research", route_after_research,
                             {"verify": "verify", "plan": "plan",
                              "reflect": "reflect"})
-    g.add_edge("verify", "reflect")
+    g.add_edge("verify", "tournament")
+    g.add_edge("tournament", "reflect")
     g.add_edge("replicate", "reflect")
     g.add_edge("open_pr", "reflect")
     g.add_edge("review", "reflect")
@@ -172,6 +178,8 @@ def _node_digest(node: str, out: dict) -> str:
         return f"reviewed !{out.get('pr_number', '')}: {out.get('review_verdict', '')}"[:200]
     if node == "replicate":
         return f"replicated claim(s): {out.get('replication_verdict', '')}"[:200]
+    if node == "tournament":
+        return f"tournament: {out.get('tournament_summary', 'idle')}"[:200]
     if node == "defend":
         return f"defended !{out.get('pr_number', '')}: {out.get('defense_outcome', '')}"[:200]
     if node == "integrate":

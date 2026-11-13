@@ -598,6 +598,10 @@ _FANOUT_ANGLES = (
     ("limitations & open problems",
      "Focus on failure modes, limitations, negative results and open research "
      "problems reported for the topic. Cite the papers that report them."),
+    ("production experience",
+     "Focus on practitioner engineering experience: production deployments, "
+     "postmortems, case studies and field reports for the topic. Cite the "
+     "engineering blogs, conference talks or repository issues that report them."),
 )
 
 
@@ -1203,6 +1207,24 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             results.append({"claim": claim, "status": "inconclusive",
                             "note": f"runner error: {exc}"[:200]})
             continue
+
+        # P16-R — bounded self-repair (see node_implement): the author sees
+        # the machine failure note and fixes its own protocol once; the
+        # re-adjudication is the same run_protocol, same frozen criterion.
+        def _rerun_verify(fixed_code: str):
+            try:
+                ctx.workspace.write_file(path, fixed_code)
+            except ValueError as exc:
+                return Evidence(
+                    cmd=path, exit_code=126, verdict="inconclusive",
+                    method="protocol", output=f"repair write refused: {exc}",
+                    meta={"note": f"repair write refused: {exc}",
+                          "metrics": {}, "runs": []})
+            return run_protocol(ctx.workspace, path, criterion)
+
+        ev, _fixed = await _repair_protocol_rounds(
+            ctx, state, claim=claim, criterion=criterion, code=protocol_code,
+            ev=ev, rerun=_rerun_verify, what=f"verify:h{hyp_id}", hyp_id=hyp_id)
         ev_id = await asyncio.to_thread(
             ctx.memory.record_evidence, ctx.agent_id, state.get("issue_number"),
             ev.cmd, ev.exit_code, ev.verdict,
@@ -1255,6 +1277,135 @@ def pending_replication(ctx: AgentContext, limit: int = 1) -> list[dict]:
                                                          limit=limit)
     except Exception:  # noqa: BLE001 — routing must never crash on a read
         return []
+
+
+# ---------------------------------------------------------------- tournament
+async def node_tournament(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """Co-Scientist tournament node (ported from Gottweis et al. 2026).
+
+    Runs AFTER the researcher's verify node: the cycle just produced or
+    re-adjudicated hypotheses, so this is the moment to (a) debate a
+    bounded batch of pairs through the Elo tournament, (b) breed the next
+    generation from the top ratings, and (c) every N debates distil the
+    win/loss patterns into a meta-review steering note.
+
+    A QUALITY loop on top of the TRUTH loop: Elo never settles a claim —
+    only P16 exit-code verification does. Every ask passes the P20 budget
+    gate; the whole node is failure-isolated (a tournament outage logs a
+    journal event and the cycle ends normally)."""
+    state["done"] = True
+    settings = getattr(ctx, "settings", None)
+    if settings is None:
+        return state
+    if not bool(getattr(settings, "tournament_enabled", True)):
+        return state
+    if ctx.llm is None:
+        return state
+    n_matches = int(getattr(settings, "tournament_matches_per_cycle", 0) or 0)
+    n_evolve = int(getattr(settings, "evolution_per_cycle", 0) or 0)
+    if n_matches < 1 and n_evolve < 1:
+        return state
+    goal = str(getattr(settings, "research_topic", "") or "")
+    try:
+        from agentics.coscientist import evolution as evo_mod
+        from agentics.coscientist import metareview as meta_mod
+        from agentics.coscientist import tournament as tour_mod
+
+        results: list[dict] = []
+        if n_matches > 0:
+            results = await tour_mod.run_batch(ctx, n_matches, goal)
+        evolved = None
+        if n_evolve > 0:
+            evolved = await evo_mod.evolve_top(
+                ctx, goal,
+                top_k=int(getattr(settings, "evolution_top_k", 3) or 3))
+        if meta_mod.should_synthesize(
+                ctx.memory,
+                int(getattr(settings, "meta_review_window", 4) or 4)):
+            await meta_mod.synthesize_feedback(
+                ctx, goal,
+                int(getattr(settings, "meta_review_window", 4) or 4))
+        parts = []
+        if results:
+            decided = [r for r in results if r.get("winner")]
+            invalid = [r for r in results if r.get("mode") == "invalid"]
+            parts.append(f"{len(decided)} debate(s)"
+                         + (f", {len(invalid)} unparseable" if invalid else ""))
+        if evolved:
+            parts.append(f"evolved h#{evolved['hypothesis_id']} "
+                         f"({evolved['strategy']})")
+        state["tournament_summary"] = "; ".join(parts)
+        if parts:
+            state["summary"] = f"tournament: {'; '.join(parts)}"
+    except Exception as exc:  # noqa: BLE001 — the tournament must never kill a cycle
+        try:
+            ctx.memory.journal(ctx.agent_id, "tournament_error",
+                               {"error": str(exc)[:300]})
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("[%s] tournament node degraded: %s", ctx.agent_id, exc)
+    return state
+
+
+async def _repair_protocol_rounds(ctx: AgentContext, state: ResearchState, *,
+                                  claim: str, criterion, code: str, ev,
+                                  rerun, what: str, hyp_id: int | None = None):
+    """P16-R — bounded Reflexion-style self-repair for inconclusive protocols.
+
+    The machine verdict (exit codes, metric parsing, reproducibility gate)
+    was always correct; the lab's weak spot was that a self-written protocol
+    breaking the AGENTICS_RESULT contract settled as `inconclusive` and the
+    failure output was discarded. Here the author reads its own failure note
+    and rewrites the protocol (criterion stays FROZEN — no goalpost move),
+    then the SAME machine adjudication re-runs. Bounded by
+    VERIFY_PROTOCOL_REPAIR_ROUNDS (default 1, 0=off); every round is
+    journalled with the before/after verdicts. Returns (final_evidence,
+    final_code); when the stored hypothesis id is known, the stored protocol
+    source is refreshed so P23/P24 replay the SETTLED file, not the draft.
+
+    `rerun(fixed_code) -> Evidence` is the call-site's own runner (the
+    hypothesis-contract path re-writes hyp.code; the verify path re-writes
+    the protocol file) — one adjudication core, two persistence shapes."""
+    from agentics.verify.repair import build_repair_prompt, extract_fixed_code
+
+    rounds = int(getattr(getattr(ctx, "settings", None),
+                         "verify_protocol_repair_rounds", 1) or 0)
+    if rounds < 1 or ev.verdict != "inconclusive" or \
+            getattr(ctx, "llm", None) is None:
+        return ev, code
+    for rnd in range(1, rounds + 1):
+        prompt = build_repair_prompt(claim, criterion, code, ev)
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise",
+                                   purpose="repair", state=state)
+        fixed = extract_fixed_code(answer, code)
+        if fixed is None:
+            try:
+                ctx.memory.journal(ctx.agent_id, "p16_protocol_repair", {
+                    "what": what, "round": rnd, "outcome": "no_usable_fix",
+                    "verdict": ev.verdict})
+            except Exception:  # noqa: BLE001
+                pass
+            break
+        ev2 = await asyncio.to_thread(rerun, fixed)
+        note = ""
+        if isinstance(getattr(ev2, "meta", None), dict):
+            note = str(ev2.meta.get("note") or "")
+        try:
+            ctx.memory.journal(ctx.agent_id, "p16_protocol_repair", {
+                "what": what, "round": rnd,
+                "verdict_before": ev.verdict, "verdict_after": ev2.verdict,
+                "note": note[:200]})
+        except Exception:  # noqa: BLE001
+            pass
+        ev, code = ev2, fixed
+        if ev.verdict != "inconclusive":
+            break
+    if hyp_id is not None and code != "":
+        try:
+            ctx.memory.update_hypothesis_protocol_code(hyp_id, code)
+        except Exception:  # noqa: BLE001 — replay bookkeeping must never gate
+            pass
+    return ev, code
 
 
 async def node_replicate(ctx: AgentContext, state: ResearchState) -> ResearchState:
@@ -1770,6 +1921,20 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             hyp_id = await asyncio.to_thread(
                 register_hypothesis, ctx.memory, ctx.agent_id, hyp)
             ev = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
+
+            # P16-R — bounded self-repair: an inconclusive protocol feeds its
+            # OWN failure note back to the author, which rewrites the script
+            # once (criterion frozen), and the SAME machine adjudication
+            # re-runs. The settled verdict still comes from exit codes and
+            # measured metrics — repair fixes the script, never the verdict.
+            def _rerun_contract(fixed_code: str):
+                hyp.code = fixed_code            # run_hypothesis re-writes it
+                return run_hypothesis(ctx.workspace, hyp)
+
+            ev, _final_code = await _repair_protocol_rounds(
+                ctx, state, claim=hyp.claim, criterion=hyp.criterion,
+                code=hyp.code, ev=ev, rerun=_rerun_contract,
+                what=f"implement:{hyp.hypothesis_id}", hyp_id=hyp_id)
             await asyncio.to_thread(
                 settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
                 method="hypothesis_contract")

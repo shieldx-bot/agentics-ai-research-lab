@@ -10,10 +10,13 @@ evolution_every_n_cycles: 10   # 0 = never open self-evolution issues
 # --- Research ------------------------------------------------------------
 research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core automation"
 # P18b research fan-out (agentics/graph/nodes.py): > 1 asks complementary
-# angles (benchmarks / open problems) IN PARALLEL on other Hyperbrowser
-# tokens of the pool — 2 = survey + 1 angle, 3 = all three. Every angle
-# passes the P20 budget gate; 1 disables the fan-out entirely.
-research_fanout: 2
+# angles (benchmarks / open problems / production experience) IN PARALLEL on
+# other Hyperbrowser tokens of the pool — 2 = survey + 1 angle, 3 = all
+# three. Every angle passes the P20 budget gate; 1 disables the fan-out.
+# Live 2026-11-13: the pool grew to 7 tokens, so all three angles now run
+# as genuinely parallel cloud sessions (they used to fall back to the
+# sequential same-view path on the one-token lab).
+research_fanout: 3
 # Solo-lab unblock: when the pool has fewer identities than angles (e.g. ONE
 # Hyperbrowser token), the extra angle still runs — sequentially on the
 # agent's own pinned view, never parallel on one session. false restores the
@@ -126,3 +129,25 @@ adaptive_prompts: true
 role_prompt_ttl_hours: 24      # re-synthesize a mission after this many hours
 role_prompt_max_chars: 1600    # hard cap for a synthesized mission
 role_prompt_rework_failures: 2 # consecutive failed cycles trigger a rework
+
+# --- Co-Scientist tournament (agentics/coscientist) -------------------------
+# Ported from the Apache-2.0 re-implementation of Gottweis et al. 2026
+# ("Accelerating scientific discovery with Co-Scientist", Nature 655):
+# an Elo tournament ranks hypotheses by simulated scientific debate, an
+# evolution operator breeds the next generation from the top ratings, and
+# a meta-review distils win/loss patterns into steering feedback.
+# A QUALITY loop on top of the P16 TRUTH loop — Elo never settles a claim,
+# only code run does. Every ask passes the P20 budget gate; the node is
+# failure-isolated from the research cycle.
+tournament_enabled: true
+tournament_matches_per_cycle: 2   # debates per researcher cycle (budget-bounded)
+evolution_per_cycle: 1            # breeding asks per cycle (0 = off)
+evolution_top_k: 3                # Elo-top pool the evolution draws from
+meta_review_window: 4             # decisive debates before a feedback synthesis
+
+# --- P16-R protocol self-repair (Reflection on failed experiments) ----------
+# When a hypothesis protocol is inconclusive, the author gets N bounded
+# repair rounds: the machine failure note is fed back, the script is
+# rewritten ONCE, and the SAME frozen-criterion adjudication re-runs.
+# 0 = off. The verdict stays 100% machine — repair fixes the script.
+verify_protocol_repair_rounds: 1

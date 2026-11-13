@@ -278,6 +278,29 @@ class Settings:
     # Off restores the strict single-ask behaviour for 1-identity pools.
     research_same_view_angle: bool = field(
         default_factory=lambda: _env_bool("RESEARCH_SAME_VIEW_ANGLE", True))
+    # --- Co-Scientist tournament (agentics/coscientist, ported from the
+    # Apache-2.0 Kaimen-Inc re-implementation of Gottweis et al. 2026) ---
+    # The Elo tournament over hypotheses: a QUALITY dimension on top of the
+    # P16 truth dimension. Every match and evolution ask passes the P20
+    # budget gate; 0 matches/cycle or enabled=False disables the loop.
+    tournament_enabled: bool = field(
+        default_factory=lambda: _env_bool("TOURNAMENT_ENABLED", True))
+    tournament_matches_per_cycle: int = field(
+        default_factory=lambda: _env_int("TOURNAMENT_MATCHES_PER_CYCLE", 2))
+    evolution_per_cycle: int = field(
+        default_factory=lambda: _env_int("EVOLUTION_PER_CYCLE", 1))
+    evolution_top_k: int = field(
+        default_factory=lambda: _env_int("EVOLUTION_TOP_K", 3))
+    # Meta-review feedback synthesis: every N decisive debates the newest
+    # win/loss patterns are distilled into a steering note (one more ask).
+    meta_review_window: int = field(
+        default_factory=lambda: _env_int("META_REVIEW_WINDOW", 4))
+    # P16-R (Reflection on failed protocols): when a hypothesis protocol is
+    # inconclusive, the author gets N bounded self-repair rounds — the
+    # machine failure note is fed back and the protocol is rewritten ONCE,
+    # then re-adjudicated by the same frozen criterion. 0 = off.
+    verify_protocol_repair_rounds: int = field(
+        default_factory=lambda: _env_int("VERIFY_PROTOCOL_REPAIR_ROUNDS", 1))
 
     @property
     def owner(self) -> str:

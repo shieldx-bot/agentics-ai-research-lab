@@ -310,6 +310,36 @@ CREATE TABLE IF NOT EXISTS task_awards (
     score REAL NOT NULL,                    -- the Performance-Novelty score it won with
     ts REAL NOT NULL
 );
+-- Co-Scientist tournament (agentics/coscientist): every simulated scientific
+-- debate between two hypotheses, with the exact Elo state transition. The
+-- match_id is DETERMINISTIC (hash of the pre-match rating state), so a
+-- crash-then-retry inserts-or-ignores the same row instead of double-applying
+-- the delta — the same idempotency contract the reference system gives itself.
+CREATE TABLE IF NOT EXISTS tournament_matches (
+    match_id TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,                    -- the jury (which agent ran the ask)
+    hyp_a INTEGER NOT NULL,
+    hyp_b INTEGER NOT NULL,
+    mode TEXT NOT NULL,                     -- debate | pairwise | invalid
+    winner TEXT NOT NULL DEFAULT '',        -- a | b | '' (unparseable verdict)
+    elo_a_before REAL NOT NULL,
+    elo_b_before REAL NOT NULL,
+    elo_a_after REAL,
+    elo_b_after REAL,
+    rationale TEXT NOT NULL DEFAULT ''      -- the jury's reasoning (trimmed)
+);
+CREATE INDEX IF NOT EXISTS idx_tournament_ts ON tournament_matches(ts);
+-- Meta-review feedback: the distilled win/loss pattern that future
+-- generation / debate / evolution prompts are conditioned on (the
+-- self-improvement loop's steering channel).
+CREATE TABLE IF NOT EXISTS tournament_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    window_matches INTEGER NOT NULL,        -- how many debates it synthesised
+    text TEXT NOT NULL
+);
 """
 
 
@@ -389,6 +419,12 @@ class SharedMemory:
                 # replication is recorded here (refuted closes the ledger).
                 "ALTER TABLE hypotheses ADD COLUMN replication TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE hypotheses ADD COLUMN replication_attempts INTEGER NOT NULL DEFAULT 0",
+                # Co-Scientist tournament: a QUALITY dimension (Elo + match
+                # count) on top of the TRUTH dimension (status/evidence).
+                # parents keeps the evolution lineage (JSON list of hyp ids).
+                "ALTER TABLE hypotheses ADD COLUMN elo REAL NOT NULL DEFAULT 1200",
+                "ALTER TABLE hypotheses ADD COLUMN matches_played INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN parents TEXT NOT NULL DEFAULT '[]'",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -914,7 +950,7 @@ class SharedMemory:
         self, agent: str, claim: str, criterion: dict,
         task_id: int | None = None, finding_id: int | None = None,
         protocol_path: str = "", status: str = "proposed",
-        protocol_code: str = "",
+        protocol_code: str = "", parents: list[int] | None = None,
     ) -> int:
         """Register a hypothesis BEFORE the protocol runs (pre-registration).
 
@@ -924,17 +960,20 @@ class SharedMemory:
         The claim's normalized hash is stored so the next agent meeting the
         same claim can reuse the settled verdict instead of re-running (H3).
         `protocol_code` keeps the protocol source INSIDE memory, so a settled
-        claim stays replayable even after P21 prunes the workspace."""
+        claim stays replayable even after P21 prunes the workspace.
+        `parents` records the Co-Scientist evolution lineage (ids of the
+        hypotheses this one was bred from) — provenance, not verdict."""
         from agentics.verify.hypothesis import claim_hash as _chash
 
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
-                "criterion, protocol_path, status, claim_hash, protocol_code) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "criterion, protocol_path, status, claim_hash, protocol_code, "
+                "parents) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, task_id, finding_id, claim[:500],
                  json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
-                 status, _chash(claim), protocol_code[:20_000]),
+                 status, _chash(claim), protocol_code[:20_000],
+                 json.dumps([int(p) for p in (parents or [])])),
             )
             return int(cur.lastrowid or 0)
 
@@ -1023,6 +1062,36 @@ class SharedMemory:
             )
             return changed
 
+    def hypothesis_by_claim(self, claim: str) -> dict | None:
+        """The swarm's existing row for this claim, ANY status (H3 helper).
+
+        Matches by normalized claim hash — a reworded duplicate still
+        resolves. The tournament-evolution loop uses this to avoid re-breeding
+        an idea the lab already holds, settled or not."""
+        from agentics.verify.hypothesis import claim_hash as _chash
+
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                "WHERE claim_hash=? ORDER BY id DESC LIMIT 1",
+                (_chash(claim),),
+            ).fetchone()
+        return self._hypothesis_row(row) if row is not None else None
+
+    def update_hypothesis_protocol_code(self, hyp_id: int, code: str) -> bool:
+        """P16-R: keep a repaired claim REPLAYABLE (P23/P24 contract).
+
+        After a self-repair round the SETTLED verdict belongs to the FIXED
+        protocol, so the stored source must be the final file — replaying
+        the originally registered draft would re-produce the failure the
+        repair already fixed and corrupt the replication ledger."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET protocol_code=? WHERE id=?",
+                ((code or "")[:20_000], int(hyp_id)),
+            )
+            return cur.rowcount > 0
+
     def get_hypothesis(self, hyp_id: int) -> dict | None:
         with self._lock:
             row = self._conn.execute(
@@ -1052,19 +1121,29 @@ class SharedMemory:
 
     @staticmethod
     def _hypothesis_row(r) -> dict:
-        return {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
-                "finding_id": r[4], "claim": r[5],
-                "criterion": json.loads(r[6] or "{}"),
-                "protocol_path": r[7], "status": r[8], "verdict_note": r[9],
-                "evidence_id": r[10], "attempts": r[11],
-                "protocol_code": r[12] if len(r) > 12 else "",
-                "replication": r[13] if len(r) > 13 else "",
-                "replication_attempts": r[14] if len(r) > 14 else 0}
+        row = {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
+               "finding_id": r[4], "claim": r[5],
+               "criterion": json.loads(r[6] or "{}"),
+               "protocol_path": r[7], "status": r[8], "verdict_note": r[9],
+               "evidence_id": r[10], "attempts": r[11],
+               "protocol_code": r[12] if len(r) > 12 else "",
+               "replication": r[13] if len(r) > 13 else "",
+               "replication_attempts": r[14] if len(r) > 14 else 0}
+        # Co-Scientist tournament columns (quality dimension on top of truth)
+        if len(r) > 17:
+            row["elo"] = r[15]
+            row["matches_played"] = r[16]
+            try:
+                row["parents"] = json.loads(r[17] or "[]")
+            except json.JSONDecodeError:
+                row["parents"] = []
+        return row
 
     # canonical column list for get/list — _hypothesis_row reads positionally
     HYP_COLS = ("id, ts, agent, task_id, finding_id, claim, criterion, "
                 "protocol_path, status, verdict_note, evidence_id, attempts, "
-                "protocol_code, replication, replication_attempts")
+                "protocol_code, replication, replication_attempts, "
+                "elo, matches_played, parents")
 
     def hypotheses_needing_replication(self, agent: str, limit: int = 2) -> list[dict]:
         """P24 — settled claims whose stored protocol an INDEPENDENT agent
@@ -1124,6 +1203,119 @@ class SharedMemory:
                 "SELECT status, COUNT(*) FROM hypotheses GROUP BY status"
             ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------ Co-Scientist tournament
+    # The tournament is a QUALITY dimension over the same hypotheses the P16
+    # machinery settles for TRUTH. Refuted hypotheses are dead ideas and never
+    # re-enter the pool; everything else (proposed/testing/inconclusive/
+    # supported) is rankable — an inconclusive protocol says nothing about the
+    # IDEA's worth, which is exactly what Elo measures.
+    _TOURNAMENT_ELIGIBLE = "status != 'refuted'"
+
+    def tournament_pool(self, limit: int = 60) -> list[dict]:
+        """Rankable hypotheses (not refuted), newest first, with Elo state."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                f"WHERE {self._TOURNAMENT_ELIGIBLE} "
+                "ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
+
+    def top_by_elo(self, limit: int = 3) -> list[dict]:
+        """Highest-Elo rankable hypotheses — the evolution pool.
+
+        Ranked by Elo, then by matches actually played (a defended rating
+        beats an idle one), then by recency so a fresh tournament still has
+        material before any debate has run."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                f"WHERE {self._TOURNAMENT_ELIGIBLE} "
+                "ORDER BY elo DESC, matches_played DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
+
+    def record_tournament_match(
+        self, match_id: str, agent: str, hyp_a: int, hyp_b: int, mode: str,
+        winner: str, elo_a_before: float, elo_b_before: float,
+        elo_a_after: float | None, elo_b_after: float | None,
+        rationale: str = "",
+    ) -> bool:
+        """Claim the match slot by INSERT OR IGNORE on the deterministic id.
+
+        True -> this caller owns the Elo apply. False -> a retry of the same
+        pre-match state already recorded it; the delta must NOT be applied
+        again (the reference system's crash-idempotency contract)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO tournament_matches "
+                "(match_id, ts, agent, hyp_a, hyp_b, mode, winner, "
+                " elo_a_before, elo_b_before, elo_a_after, elo_b_after, "
+                " rationale) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (match_id, time.time(), agent, int(hyp_a), int(hyp_b), mode,
+                 winner, float(elo_a_before), float(elo_b_before),
+                 elo_a_after, elo_b_after, (rationale or "")[:1500]),
+            )
+            return cur.rowcount > 0
+
+    def apply_elo_update(self, hyp_a: int, hyp_b: int, elo_a_after: float,
+                         elo_b_after: float) -> bool:
+        """Persist a zero-sum Elo transition on both sides (match counted).
+
+        Only ever called by the owner of a freshly inserted match row — the
+        idempotency lives in record_tournament_match, not here."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET elo=?, matches_played=matches_played+1 "
+                "WHERE id=?", (float(elo_a_after), int(hyp_a)),
+            )
+            cur2 = self._conn.execute(
+                "UPDATE hypotheses SET elo=?, matches_played=matches_played+1 "
+                "WHERE id=?", (float(elo_b_after), int(hyp_b)),
+            )
+            return cur.rowcount > 0 and cur2.rowcount > 0
+
+    def recent_tournament_matches(self, limit: int = 10) -> list[dict]:
+        """The latest debates (newest first) — meta-review and standings read
+        these; they are the win/loss evidence the feedback loop learns from."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT match_id, ts, agent, hyp_a, hyp_b, mode, winner, "
+                "elo_a_before, elo_b_before, elo_a_after, elo_b_after, "
+                "rationale FROM tournament_matches "
+                "ORDER BY ts DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(zip(
+            ("match_id", "ts", "agent", "hyp_a", "hyp_b", "mode", "winner",
+             "elo_a_before", "elo_b_before", "elo_a_after", "elo_b_after",
+             "rationale"), r)) for r in rows]
+
+    def save_tournament_feedback(self, text: str, agent: str,
+                                 window_matches: int) -> int:
+        """Store the meta-review's distilled pattern (the steering channel).
+
+        Old rows are kept: the feedback history is the tournament's own
+        longitudinal record, and it is small (one row per synthesis)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO tournament_feedback (ts, agent, window_matches, "
+                "text) VALUES (?,?,?,?)",
+                (time.time(), agent, int(window_matches), (text or "")[:2000]),
+            )
+            return int(cur.lastrowid or 0)
+
+    def latest_tournament_feedback(self) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, agent, window_matches, text "
+                "FROM tournament_feedback ORDER BY id DESC LIMIT 1",
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "ts": row[1], "agent": row[2],
+                "window_matches": row[3], "text": row[4]}
 
     def attach_protocol_outcome(
         self, ev_id: int, metrics: dict, runs: list,

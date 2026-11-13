@@ -494,3 +494,88 @@ _inconclusive/_blocked`.
 Test: `tests/test_replication_memory.py`, `tests/test_replication_engine.py`,
 `tests/test_node_replicate.py`, `tests/test_replication_surfaces.py`
 (sổ cái chính tắc của P24: `tests/test_replication_ledger.py` — không đổi).
+
+## P25 — Giải đấu Co-Scientist: Elo là chiều CHẤT LƯỢNG, P16 vẫn là chiều CHÂN LÝ
+
+Port hành vi từ kiến trúc Co-Scientist (Gottweis et al., Nature 655, 2026 —
+"Accelerating scientific discovery with Co-Scientist"), mô hình hoá theo bản
+re-implementation Apache-2.0 tại `github.com/Kaimen-Inc/Co-Scientist`
+(2026-11-13). Những gì port, và những gì CỐ ĐỊNH không port:
+
+**Port** — vòng tự cải thiện mà ablation của paper ghi điểm cao nhất:
+
+1. **Tournament** (`agentics/coscientist/tournament.py`, `elo.py`,
+   `pairing.py`): các giả thuyết chưa bị bác bỏ tranh tài bằng debate mô
+   phỏng; mỗi trận = MỘT ask Perplexity qua gate P20, verdict là dòng
+   `better idea: 1|2` (parser dung sai như bản gốc); Elo zero-sum, K theo
+   kinh nghiệm (32 trận đầu / 16 sau, mốc 3 — bản gốc dùng 5, lab giải nhỏ
+   nên sớm một trận, có chú thích); chọn cặp 3 bucket như bản gốc (mới vào
+   × gần-Elo / gần-Elo × khác-ý-tưởng / top-heavy random).
+   **Idempotency crash-safe**: `match_id` = hash của TRẠNG THÁI ĐIỂM TRƯỚC
+   trận → retry sau crash INSERT OR IGNORE cùng hàng, delta không bao giờ
+   cộng hai lần (cùng hợp đồng với `round_id` của bản gốc).
+2. **Evolution** (`evolution.py`): top-Elo → `combine` (cặp khác ý tưởng
+   nhất trong top-k) / `out_of_box` (huyền cảm thay vì ghép) → hypothesis
+   MỚI status `proposed` với lineage `parents`; dedup theo claim-hash trên
+   MỌI status — ý tưởng đàn đã có không sinh lại. Con lai đi cùng vòng đời
+   P16 bình thường, không có kênh xác nhận riêng.
+3. **Meta-review** (`metareview.py`): mỗi `META_REVIEW_WINDOW` trận quyết
+   liệt, mẫu thắng/thua được chưng cất thành ghi chú điều hướng, bơm vào
+   prompt của mọi trận và phép tiến hóa sau đó — vòng phản hồi khép kín.
+
+**Không port** — và vì sao (trung thực về kiến trúc):
+
+- Supervisor + hàng đợi task của bản gốc: lab ĐÃ có claim/lease + LangGraph
+  cycle + memory WAL; port thêm chỉ là trùng lặp cơ chế.
+- FAISS + embedder ngoài: lab có ChromaDB; đến khi cặp đấu cần độ tương
+  đồng ý tưởng, callback similarity là điểm cắm, vắng thì suy giảm về
+  chọn đồng nhất (y hệt hành vi "no embedder" của bản gốc).
+- **LLM-review làm chân lý**: lab MẠNH HƠN bản gốc ở điểm này — P16 chấm
+  bằng exit-code + metric đo được + gate tái lập P24, không phải opinon LLM.
+  Elo XẾP HẠNG ý tưởng; chỉ code chạy mới ĐỊNH GIÁ claim. Refuted by code
+  ⇒ chết trong pool tournament bất kể điểm Elo cao thế nào.
+
+Knobs: `TOURNAMENT_ENABLED`, `TOURNAMENT_MATCHES_PER_CYCLE` (2),
+`EVOLUTION_PER_CYCLE` (1), `EVOLUTION_TOP_K` (3), `META_REVIEW_WINDOW` (4).
+Bề mặt owner: `python -m agentics.cli standings` (chỉ đọc) và
+`python -m agentics.cli tournament --matches N [--evolve M]` (gom trận ngoài
+chu kỳ). Node `tournament` nằm trên đường researcher sau `verify`, cô lập
+lỗi hoàn toàn — giải đấu chết không được phép giết chu kỳ research.
+
+Live 2026-11-13 (demo 8 phút, 2 chu kỳ): 2 trận debate parse sạch
+(invalid: 0), h#4 sinh ra bằng `out_of_box` từ h#1, standings hiển thị
+hai chiều tách bạch (h#4 Elo 1217 `proposed` dẫn đầu, h#5 Elo 1199 nhưng
+`supported` bởi đo đạc). Chỉ số P24 decided của cửa sổ: 3/6 (50%) so với
+0/4 (0%) của baseline demo trước.
+
+## P16-R — Tự sửa protocol: phản hồi thất bại quay về tác giả, đúng một vòng
+
+Điểm yếu thật trước P16-R: verdict máy luôn đúng (exit-code, parse metric,
+gate tái lập) nhưng protocol TỰ VIẾT của agent hay vỡ hợp đồng
+`AGENTICS_RESULT:` → claim ngồi mãi ở `inconclusive`, và OUTPUT THẤT BẠI
+bị vứt đi thay vì đọc lại vào hệ thống (demo 2026-11-13: 0/4 decided).
+
+Cơ chế (`agentics/verify/repair.py` + `_repair_protocol_rounds` ở graph):
+protocol inconclusive ⇒ tác giả nhận lại CHÍNH protocol của mình + tiêu chí
+ĐÓNG BĂNG + ghi chú thất bại của máy, viết lại file MỘT vòng có bận
+(`VERIFY_PROTOCOL_REPAIR_ROUNDS`, mặc định 1, 0 = tắt), rồi CÙNG bộ chấm
+chạy lại. Bất biến:
+
+- Tiêu chí đã đăng ký không bao giờ hiện ra như thứ có thể sửa — cột mốc
+  không di chuyển sau khi chạy.
+- Reply không đổi / rỗng ⇒ không đốt lần chạy lại (journal
+  `no_usable_fix`).
+- Mọi vòng đều ghi journal `p16_protocol_repair` với verdict trước/sau.
+- Sau khi sửa thành công, `protocol_code` lưu trong memory được CẬP NHẬT
+  theo bản cuối — P23/P24 replay bản ĐÃ CHẤM, không replay bản nháp lỗi.
+- Verdict vẫn 100% máy: sửa Script, không sửa bộ chấm. Đó là ranh giới
+  trung thực giữa "tự cải thiện" và "lách metric".
+
+Cả hai đường protocol đều dùng chung helper: hợp đồng hypothesis của
+node_implement và đường P16bis của node_verify.
+
+Live 2026-11-13: vòng sửa đầu tiên bắn trên h#6 (`verify:h6`, round 1,
+inconclusive → vẫn inconclusive — protocol khó, nhưng vết sửa nằm trong
+sổ cái để chu kỳ sau đọc tiếp).
+
+Test: `tests/test_coscientist.py`, `tests/test_protocol_repair.py`.

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import typer
 from rich.console import Console
@@ -502,6 +504,120 @@ def swarm_eval(
             _print_percent_rows(percent_rows(report))
             return
         _print_swarm_eval(report, memory)
+    finally:
+        memory.close()
+
+
+@app.command("standings")
+def standings(
+    limit: int = typer.Option(15, "--limit", help="số hypothesis hiển thị"),
+) -> None:
+    """Bảng xếp hạng Elo của giải đấu giả thuyết (Co-Scientist tournament).
+
+    Chỉ đọc — không tốn LLM. Elo là chiều CHẤT LƯỢNG ý tưởng (do các trận
+    debate simulated cộng dồn); status là chiều CHÂN LÝ (do P16 chạy code
+    quyết định). Hai chiều này tách bạch có chủ đích."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        pool = memory.tournament_pool()
+        matches = memory.recent_tournament_matches(limit=10)
+        if not pool:
+            console.print("[yellow]Chưa có hypothesis nào trong pool — "
+                          "để lab chạy vài chu kỳ research/verify đã.[/]")
+            return
+        table = Table(title=f"Tournament standings — {len(pool)} hypothesis "
+                            f"(đang xếp hạng, bỏ giả thuyết đã bị bác bỏ)")
+        for col in ("#", "Elo", "trận", "status", "claim", "nguồn"):
+            table.add_column(col)
+        ranked = sorted(pool, key=lambda h: -(h.get("elo") or 1200))[:limit]
+        for i, h in enumerate(ranked, 1):
+            when = datetime.fromtimestamp(h["ts"], tz=timezone.utc).strftime(
+                "%m-%d %H:%M")
+            table.add_row(
+                f"h#{h['id']}", f"{h.get('elo') or 1200:.0f}",
+                str(h.get("matches_played") or 0), h["status"],
+                (h["claim"] or "")[:60], f"{h['agent']}@{when}")
+        console.print(table)
+        decided = [m for m in matches if m.get("winner")]
+        console.print(f"[dim]{len(matches)} trận gần nhất "
+                      f"({len(decided)} có kết quả) — chi tiết: "
+                      "journal event 'tournament_match'.[/]")
+    finally:
+        memory.close()
+
+
+@app.command("tournament")
+def tournament(
+    matches: int = typer.Option(2, "--matches", help="số trận debate chạy"),
+    evolve: int = typer.Option(0, "--evolve", help="số phép tiến hóa chạy"),
+    no_meta: bool = typer.Option(False, "--no-meta", help="không tổng hợp feedback"),
+) -> None:
+    """Chạy trực tiếp một batch giải đấu (Co-Scientist) qua LLM thật.
+
+    Dùng để gom trận debate ngoài chu kỳ lab (owner chạy tay): chọn cặp,
+    tranh luận qua Perplexity, cập nhật Elo zero-sum, có thể tiến hóa top
+    hypotheses thành thế hệ mới. Mọi ask qua P20 budget gate."""
+    import asyncio
+
+    settings = _settings()
+    setup_logging("INFO")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+
+    async def _run() -> None:
+        from agentics.llm.session_host import BrowserSessionHost
+
+        host = BrowserSessionHost.from_settings(settings)
+        ctx = SimpleNamespace(
+            agent_id="owner-cli", memory=memory, llm=host, settings=settings,
+            budget=None, meta={})
+        try:
+            from agentics.coscientist import evolution as evo_mod
+            from agentics.coscientist import metareview as meta_mod
+            from agentics.coscientist import tournament as tour_mod
+
+            goal = settings.research_topic
+            results = await tour_mod.run_batch(ctx, matches, goal) if matches else []
+            for r in results:
+                if r.get("mode") == "blocked":
+                    console.print("  [yellow]batch dừng: ask bị chặn/lỗi "
+                                  "(budget hoặc session)[/]")
+                elif r.get("mode") == "invalid":
+                    console.print(f"  [yellow]h#{r['a']} vs h#{r['b']}: "
+                                  "không parse được kết luận[/]")
+                else:
+                    e = r.get("elo_after") or [None, None]
+                    console.print(
+                        f"  h#{r['a']} vs h#{r['b']} [{r['mode']}] → "
+                        f"h#{r['a'] if r['winner'] == 'a' else r['b']} thắng "
+                        f"(Elo → {e[0]} / {e[1]})")
+            if evolve:
+                out = await evo_mod.evolve_top(ctx, goal)
+                if out:
+                    console.print(f"  tiến hóa: h#{out['hypothesis_id']} "
+                                  f"({out['strategy']}) từ {out['parent_ids']}")
+            if not no_meta and meta_mod.should_synthesize(
+                    memory, settings.meta_review_window):
+                note = await meta_mod.synthesize_feedback(
+                    ctx, goal, settings.meta_review_window)
+                if note:
+                    console.print(f"  meta-review: {note[:200]}")
+        finally:
+            for client in list(getattr(host, "_clients", {}).values()):
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    try:
+        asyncio.run(_run())
     finally:
         memory.close()
 
