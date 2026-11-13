@@ -76,13 +76,48 @@ def test_run_experiments_never_raises(tmp_path):
     results = run_experiments(ws, [
         [PY, "exp.py"],                                  # confirmed
         [PY, "-m", "pytest", "--cookie=junk"],           # blocked
-        "not-a-list-command",                            # string -> sh -c (blocked)
+        "not-a-list-command",                            # non-python head (no shell)
     ])
     assert [e.verdict for e in results] == \
         ["confirmed", "inconclusive", "inconclusive"]
-    # string commands reach the runner as a shell invocation; the workspace
-    # allowlist (only the active python) rejects it — no crash, just evidence
+    # a non-python command is rejected BEFORE any shell exists — no crash,
+    # just honest evidence about the sandbox contract
     assert results[2].exit_code == 126
+    assert "rejected" in results[2].output
+
+
+# ------------------------------------------------------------ string cmds (plan JSON)
+# Regression: plans are LLM JSON, so verify_cmds arrive as STRINGS. The old
+# runner wrapped them in /bin/sh -c, which the workspace allowlist (active
+# python only) always rejected — every declared check silently became
+# `inconclusive` in production. P16 was a no-op on real workspaces.
+def test_string_verify_cmd_from_a_plan_actually_runs(tmp_path):
+    ws = _workspace(tmp_path)
+    _script(ws, "import sys\nsys.exit(0)\n")
+    ev = run_experiment(ws, "python exp.py")
+    assert ev.verdict == "confirmed" and ev.exit_code == 0
+    assert ev.cmd.startswith(PY) and "exp.py" in ev.cmd
+
+
+def test_string_pytest_cmd_is_coerced_to_the_module_form(tmp_path):
+    from agentics.verify_ops import coerce_cmd
+    argv, reason = coerce_cmd("python -m pytest tests/test_x.py -q")
+    assert argv is not None and argv[:3] == [PY, "-m", "pytest"]
+    argv, _ = coerce_cmd("pytest tests/test_x.py")
+    assert argv[:3] == [PY, "-m", "pytest"]
+
+
+def test_string_command_never_uses_a_shell(tmp_path):
+    ws = _workspace(tmp_path)
+    ev = run_experiment(ws, "rm -rf /")            # catastrophic under sh -c
+    assert ev.verdict == "inconclusive" and ev.exit_code == 126
+    assert "rejected" in ev.output and "python" in ev.output
+
+
+def test_non_string_non_list_command_is_rejected(tmp_path):
+    ws = _workspace(tmp_path)
+    ev = run_experiment(ws, 42)
+    assert ev.verdict == "inconclusive" and ev.exit_code == 126
 
 
 def test_summarize_digest(tmp_path):
