@@ -163,15 +163,22 @@ prediction of NFV network functions"):
 | `node_research` | ~67 s | 6.9k-char academic survey, 7 verifiable citations (IMC'18, IEEE NetSoft'20, CNSM, ITU Journal…), concrete metrics (RF 93% precision / 99% AUC, XGBoost, SVR…) |
 | `node_plan` | ~48 s | valid JSON plan: 14 files + 7 concrete steps grounded in the surveyed papers |
 
-Constraints of cloud-browser mode (free plan):
+Scaling in cloud-browser mode (P18 token pool):
 
-* exactly ONE active session — asks are globally serialized and a switching
-  account evicts the previous holder's session. The orchestrator now caps
-  Hyperbrowser mode at one agent per process (even if `MAX_AGENTS` is higher),
-  preventing agent threads from evicting one another's browser sessions.
-* each `ask()` navigates a fresh Perplexity thread (~60–140 s round trip)
+* every Hyperbrowser token owns ONE cloud session; asks on the same token
+  are serialized (free-plan semantics), asks on DIFFERENT tokens run fully
+  parallel.
+* `HB_API_KEYS=tk1,tk2,tk3` (or a `hyperbrowser_api_keys` list in
+  `configs/secrets.yaml`) gives the swarm 3 concurrent sessions — the
+  orchestrator sizes the process to 3 parallel agents automatically
+  (still capped by `MAX_AGENTS` and the cookie-account pool). Agent *i* is
+  pinned to token *i* (round-robin if agents > tokens).
+* a single `HB_API_KEY` keeps the old free-plan behavior: one session, one
+  agent per process.
+* each `ask()` navigates a fresh Perplexity thread (~60–140 s round trip);
+  with K tokens the lab sustains K concurrent asks.
 * offline unit tests never create sessions; live check:
-  `HB_API_KEY=... python scripts/live_research_run.py`
+  `HB_API_KEYS=tk1,tk2,tk3 python scripts/live_research_run.py`
 
 ### Failure handling
 
