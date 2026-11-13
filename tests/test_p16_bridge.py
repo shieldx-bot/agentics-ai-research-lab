@@ -190,3 +190,15 @@ def test_verify_cmds_and_hypotheses_coexist(tmp_path):
     methods = {r["method"] for r in mem.evidence_for_task(1)}
     assert methods == {"run_command", "protocol"}
     assert "P16" in state["verification"]
+
+
+def test_protocol_file_joins_the_mr_record(tmp_path):
+    """The pushed branch carries the protocol file (git add -A); the MR record
+    must list it too, or the reviewer sees a file in the diff that the record
+    does not explain — the protocol IS the evidence's source code."""
+    mem = SharedMemory(tmp_path / "m.db")
+    ws = BridgeWorkspace(tmp_path)
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws), _impl_state(hypotheses=[_VALID_RAW])))
+    assert ws.pushed
+    assert "research_notes/experiments/cache-hit-rate-h1.py" in state["changed_files"]

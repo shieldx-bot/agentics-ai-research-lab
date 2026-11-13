@@ -863,6 +863,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             ev = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
             ev_id = await asyncio.to_thread(
                 settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev)
+            # the protocol file was written into the workspace and rides the
+            # pushed branch (git add -A) — the MR record must list it too, or
+            # the reviewer sees a file in the diff the record does not explain
+            if getattr(ctx.workspace, "path", None) and \
+                    (ctx.workspace.path / hyp.script_path).exists():
+                state["changed_files"] = sorted(
+                    set(state.get("changed_files") or []) | {hyp.script_path})
             if ev.verdict == "refuted":
                 return await _yield(
                     ctx, state,

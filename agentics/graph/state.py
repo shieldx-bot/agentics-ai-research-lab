@@ -48,9 +48,9 @@ class ResearchState(TypedDict, total=False):
     commit_message: str
     category: str                  # issue category (research/code/docs/...)
     verification: str              # tier-1 result, shown in the PR body
-    verify_cmds: list[str]         # P16: hypothesis checks the plan declares
-    reuses: list[str]              # registry tools the plan says it reuses
     verify_cmds: list[str]         # P16: commands the plan declares as checks
+    hypotheses: list[dict]         # P16: measurable claims (criterion + protocol code)
+    reuses: list[str]              # registry tools the plan says it reuses
     # P16bis — empirical claim verification (researcher path)
     finding_id: int                # finding the claims come from
     finding_text: str              # bounded finding content for the verify prompt
