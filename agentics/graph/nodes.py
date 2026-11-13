@@ -799,6 +799,92 @@ VERIFY_STATUS = {
 }
 
 
+# P24 replication bookkeeping journal name per outcome — the drift detail
+# itself is journaled by the P23 replay engine (claim_reconfirmed /
+# claim_falsified / claim_overturned / claim_unstable). The engine reports
+# HYPOTHESIS statuses; evidence rows speak confirmed/refuted/inconclusive.
+_REPL_OUTCOME = {
+    "supported": "confirmed", "refuted": "refuted",
+    "inconclusive": "inconclusive",
+}
+_REPL_EVENT = {
+    "confirmed": "hypothesis_replicated",
+    "refuted": "hypothesis_replication_refuted",
+    "inconclusive": "hypothesis_replication_inconclusive",
+}
+
+
+async def _replicate_settled(ctx: AgentContext, limit: int = 2) -> list[dict]:
+    """P24 — independent replication of the swarm's settled claims (zero LLM).
+
+    One agent's verdict is not knowledge; an INDEPENDENT re-run by another
+    agent is. Picks the oldest settled 'supported' claims this agent did NOT
+    author (mem.hypotheses_needing_replication — author exclusion, once-per-
+    swarm bookkeeping, 2-attempt retry budget for flaky runs) and re-runs
+    their stored protocol through the P23 replay engine (`replay_hypothesis`)
+    in THIS agent's own workspace. A confirmed replay journals
+    hypothesis_replicated on top of the engine's claim_reconfirmed; a refuted
+    one self-corrects verified_knowledge via the engine's claim_falsified
+    handling. Never raises — a broken replication is an inconclusive event,
+    exactly like the engine's own contract."""
+    targets = await asyncio.to_thread(
+        ctx.memory.hypotheses_needing_replication, ctx.agent_id, limit)
+    if not targets:
+        return []
+    await asyncio.to_thread(ctx.workspace.sync_main)
+    from agentics.verify.replay import replay_hypothesis
+
+    results: list[dict] = []
+    for hyp in targets:
+        try:
+            report = await asyncio.to_thread(
+                replay_hypothesis, ctx.memory, ctx.workspace, hyp["id"],
+                agent=ctx.agent_id)
+        except Exception as exc:  # noqa: BLE001 — replication never breaks verify
+            report = {"replayed": False, "note": f"replay error: {exc}"[:200]}
+        if report.get("replayed"):
+            status = report["status"]          # supported | refuted | inconclusive
+            outcome = _REPL_OUTCOME[status]    # confirmed | refuted | inconclusive
+            await asyncio.to_thread(
+                ctx.memory.record_replication, hyp["id"], outcome)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, _REPL_EVENT[outcome],
+                {"hyp": hyp["id"], "claim": hyp["claim"][:160],
+                 "author": hyp["agent"], "drift": report.get("event", ""),
+                 "evidence": report.get("evidence_id")})
+            results.append({
+                "claim": hyp["claim"], "status": outcome,
+                "note": (f"independent replication by {ctx.agent_id} "
+                         f"({report.get('event', '')})")[:200],
+                "replication": True, "hypothesis_id": hyp["id"],
+                "evidence_id": report.get("evidence_id"),
+            })
+        else:
+            # engine declined (write refused / crash / not settled anymore) —
+            # inconclusive bookkeeping; the retry budget lives in the ledger
+            await asyncio.to_thread(
+                ctx.memory.record_replication, hyp["id"], "inconclusive")
+            why = (report.get("note") or "replay declined")[:200]
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id,
+                _REPL_EVENT["inconclusive"],
+                {"hyp": hyp["id"], "claim": hyp["claim"][:160],
+                 "author": hyp["agent"], "why": why})
+            results.append({"claim": hyp["claim"], "status": "inconclusive",
+                            "note": why, "replication": True,
+                            "hypothesis_id": hyp["id"]})
+    return results
+
+
+def _replication_summary(rep: list[dict]) -> str:
+    """One digest line for the P24 replication block of a verify cycle."""
+    counts: dict[str, int] = {}
+    for r in rep:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+    return f"P24 replicated {len(rep)} claim(s) [{breakdown}]"
+
+
 async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher (P16bis, H2): verify the finding's claims by RUNNING code.
 
@@ -806,10 +892,22 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
     (metric/op/target); one self-contained protocol per claim is written into
     experiments/ and executed twice through the guarded workspace runner;
     the verdict is a machine comparison (measured vs criterion) — never an
-    LLM's opinion — and lands in shared evidence + verified knowledge (H3)."""
+    LLM's opinion — and lands in shared evidence + verified knowledge (H3).
+
+    P24: BEFORE any of that, this agent may serve as an independent replica —
+    re-running someone else's settled claim from its stored protocol (zero
+    LLM, needs no fresh finding). A researcher cycle with nothing new to
+    verify still advances the swarm's trust in what it already knows."""
     finding_text = state.get("finding_text") or ""
+    # P24 independent replication first — needs neither finding nor LLM.
+    try:
+        repl = await _replicate_settled(ctx)
+    except Exception:  # noqa: BLE001 — replication must never break verification
+        repl = []
     if not finding_text or ctx.llm is None:
-        state["summary"] = "verification skipped (no finding or no LLM)"
+        state["verifications"] = repl
+        state["summary"] = (_replication_summary(repl) if repl else
+                            "verification skipped (no finding or no LLM)")
         state["done"] = True
         return state
     ctx.report(
@@ -915,13 +1013,21 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
              "criterion": criterion.as_dict()},
         )
         results.append({"claim": claim, "status": status, "note": note,
-                        "hypothesis_id": hyp_id, "evidence_id": ev_id})
+                        "hypothesis_id": hyp_id, "evidence_id": ev_id,
+                        "replication": False})
+    # P24: the independent-replication block rides along on this cycle too
+    if repl:
+        results = repl + results
+        state["summary"] = (
+            f"P16bis verified {len(results) - len(repl)} claim(s); "
+            + _replication_summary(repl))
+    else:
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+        state["summary"] = f"P16bis verified {len(results)} claim(s) [{breakdown}]"
     state["verifications"] = results
-    counts: dict[str, int] = {}
-    for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
-    state["summary"] = f"P16bis verified {len(results)} claim(s) [{breakdown}]"
     state["done"] = True
     return state
 
