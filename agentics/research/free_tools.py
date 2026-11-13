@@ -103,18 +103,43 @@ _arxiv_last: float = 0.0
 async def _request(url: str, *, params: dict | None = None, headers: dict | None = None,
                    method: str = "GET", data: dict | None = None,
                    settings=None) -> str | None:
-    """One polite HTTP call; returns body text or None on any failure."""
+    """One polite HTTP call; returns body text or None on any failure.
+
+    A 429/503 (shared-IP budget exhaustion — common for OpenAlex on
+    datacenter hosts) is retried ONCE after the server's Retry-After delay
+    (bounded to 10 s); everything else fails fast to the graceful path."""
     timeout = aiohttp.ClientTimeout(total=_timeout(settings))
     hdrs = {"User-Agent": _USER_AGENT, **(headers or {})}
+    for attempt in (0, 1):
+        retry_delay: float | None = None
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=hdrs) as sess:
+                async with sess.request(method, url, params=params, data=data) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    if resp.status in (429, 503) and attempt == 0:
+                        retry_delay = min(_retry_after(resp) or 2.0, 10.0)
+                    else:
+                        log.warning("free_tools %s %s -> HTTP %s",
+                                    method, url.split("?")[0], resp.status)
+                        return None
+        except Exception as exc:  # noqa: BLE001 — a source outage must never break a cycle
+            log.warning("free_tools %s failed: %s", url.split("?")[0], exc)
+            return None
+        if retry_delay is not None:      # sleep OUTSIDE the session context
+            log.warning("free_tools %s -> HTTP 429/503, retrying in %.0fs",
+                        url.split("?")[0], retry_delay)
+            await asyncio.sleep(retry_delay)
+    return None
+
+
+def _retry_after(resp: "aiohttp.ClientResponse") -> float | None:
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=hdrs) as sess:
-            async with sess.request(method, url, params=params, data=data) as resp:
-                if resp.status != 200:
-                    log.warning("free_tools %s %s -> HTTP %s", method, url.split("?")[0], resp.status)
-                    return None
-                return await resp.text()
-    except Exception as exc:  # noqa: BLE001 — a source outage must never break a cycle
-        log.warning("free_tools %s failed: %s", url.split("?")[0], exc)
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
         return None
 
 
@@ -381,60 +406,95 @@ def _bibtex_entry(key: str, hit: PaperHit, eprint: str = "") -> str:
 async def enriched_bibtex(urls: list[str], settings=None, max_lookups: int = _MAX_LOOKUPS) -> str:
     """BibTeX from REAL publisher metadata for arXiv/DOI citation URLs.
 
-    arXiv URL -> arXiv API (authors/title/year/eprint);
-    DOI URL   -> Crossref (authors/year/journal/DOI);
-    anything else -> the legacy behaviour (deterministic key + <title> scrape)
-    executed in a thread so the event loop never blocks. Unknown metadata is
-    omitted, never invented — the same rule the original citations module set.
+    arXiv URL -> arXiv API (authors/title/year/eprint) — all ids batched
+    into ONE ``id_list`` call (the polite way: 1 request, not N×3 s);
+    DOI URL   -> Crossref (authors/year/journal/DOI), fetched in parallel;
+    anything else -> the legacy behaviour (deterministic key + <title>
+    scrape) executed in a thread so the event loop never blocks. Entries
+    keep the citation order. Unknown metadata is omitted, never invented —
+    the same rule the original citations module set.
     """
     cites = cite_fmt.parse_citations(list(urls))
     if not cites:
         return ""
-    entries: list[str] = []
-    legacy: list[cite_fmt.Citation] = []
-    for c in cites[:max(0, int(max_lookups))]:
-        hit: PaperHit | None = None
-        eprint = ""
-        arxiv_id = arxiv_id_from_url(c.url)
-        doi = doi_from_url(c.url)
-        if arxiv_id:
-            await _arxiv_pace()
-            body = await _request(
-                "https://export.arxiv.org/api/query",
-                params={"id_list": arxiv_id, "max_results": 1},
-                settings=settings,
-            )
-            parsed = _parse_arxiv_feed(body) if body else []
-            if parsed:
-                hit = parsed[0]
-                eprint = arxiv_id
+    selected = cites[: max(0, int(max_lookups))]
+    arxiv_ids: dict[str, str] = {}      # arXiv id -> citation key
+    dois: dict[str, str] = {}           # doi -> citation key
+    legacy_keys: list[str] = []
+    for c in selected:
+        aid, doi = arxiv_id_from_url(c.url), doi_from_url(c.url)
+        if aid and not doi:
+            arxiv_ids.setdefault(aid, c.key)
         elif doi:
-            data = await _get_json(f"https://api.crossref.org/works/{doi}", settings=settings)
-            msg = (data or {}).get("message") or {}
-            if msg.get("title"):
-                year = None
-                issued = (msg.get("issued") or {}).get("date-parts") or [[None]]
-                if issued and issued[0] and issued[0][0]:
-                    year = issued[0][0]
-                hit = PaperHit(
-                    source="crossref",
-                    title=" ".join(msg["title"][0].split()),
-                    url=c.url,
-                    year=year,
-                    authors=[f"{a.get('family', '')}, {a.get('given', '')}".strip(", ")
-                             for a in (msg.get("author") or [])],
-                    venue=" ".join((msg.get("container-title") or [""])[0].split()) or "DOI",
-                    doi=doi,
-                )
-        if hit:
-            entries.append(_bibtex_entry(c.key, hit, eprint=eprint))
+            dois.setdefault(doi, c.key)
         else:
-            legacy.append(c)
-    if legacy:
-        rest = await asyncio.to_thread(cite_fmt.to_bibtex, legacy, True)
+            legacy_keys.append(c.key)
+
+    results: dict[str, str] = {}
+    _legacy_urls: dict[str, str] = {}
+
+    def _to_legacy(key: str, url: str) -> None:
+        legacy_keys.append(key)  # keep deterministic order; resolved at the end
+        if url:                   # remember the original URL shape for the key
+            _legacy_urls[key] = url
+
+    if arxiv_ids:
+        await _arxiv_pace()
+        body = await _request(
+            "https://export.arxiv.org/api/query",
+            params={"id_list": ",".join(arxiv_ids), "max_results": len(arxiv_ids)},
+            settings=settings,
+        )
+        parsed = _parse_arxiv_feed(body) if body else []
+        by_id = {h.url.rsplit("/abs/", 1)[-1]: h for h in parsed}
+        for aid, key in arxiv_ids.items():
+            hit = by_id.get(aid) or by_id.get(aid.split("v")[0])
+            if hit is None:  # id_list echoes versions; match base id too
+                hit = next((h for k, h in by_id.items() if k.split("v")[0] == aid.split("v")[0]), None)
+            if hit:
+                results[key] = _bibtex_entry(key, hit, eprint=aid)
+            else:
+                _to_legacy(key, f"https://arxiv.org/abs/{aid}")
+    if dois:
+        fetches = await asyncio.gather(
+            *[_get_json(f"https://api.crossref.org/works/{doi}", settings=settings)
+              for doi in dois]
+        )
+        for doi, data in zip(dois, fetches):
+            msg = ((data or {}).get("message") or {}) if isinstance(data, dict) else {}
+            if not msg.get("title"):
+                _to_legacy(dois[doi], f"https://doi.org/{doi}")
+                continue
+            year = None
+            issued = (msg.get("issued") or {}).get("date-parts") or [[None]]
+            if issued and issued[0] and issued[0][0]:
+                year = issued[0][0]
+            hit = PaperHit(
+                source="crossref",
+                title=" ".join(msg["title"][0].split()),
+                url=f"https://doi.org/{doi}",
+                year=year,
+                authors=[f"{a.get('family', '')}, {a.get('given', '')}".strip(", ")
+                         for a in (msg.get("author") or [])],
+                venue=" ".join((msg.get("container-title") or [""])[0].split()) or "DOI",
+                doi=doi,
+            )
+            results[dois[doi]] = _bibtex_entry(dois[doi], hit)
+    if legacy_keys:
+        # preserve the original URL per key (parse_citations re-derives keys)
+        legacy_cites = []
+        for key in legacy_keys:
+            url = _legacy_urls.get(key)
+            if url:
+                legacy_cites.append(cite_fmt.Citation(url=url, key=key))
+            else:  # plain URL passed in without arXiv/DOI — fall back to input
+                legacy_cites.append(next(c for c in selected if c.key == key))
+        rest = await asyncio.to_thread(cite_fmt.to_bibtex, legacy_cites, True)
         if rest:
-            entries.append(rest)
-    return "\n\n".join(entries)
+            chunks = rest.split("\n\n")
+            for c, chunk in zip(legacy_cites, chunks):
+                results[c.key] = chunk
+    return "\n\n".join(results[c.key] for c in selected if c.key in results)
 
 
 # ---------------------------------------------------------------- general tools

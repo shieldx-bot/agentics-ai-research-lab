@@ -835,5 +835,90 @@ def mr_merge(
         memory.close()
 
 
+@app.command("papers")
+def papers(
+    query: str = typer.Argument(None, help="Search phrase (scholarly / datasets / web)"),
+    source: str = typer.Option("all", "--source", "-s",
+                               help="Scholarly source: all | arxiv | openalex | crossref"),
+    max_results: int = typer.Option(8, "--max", help="Rows per source"),
+    datasets: bool = typer.Option(False, "--datasets", help="Search Hugging Face datasets instead"),
+    web: bool = typer.Option(False, "--web", help="DuckDuckGo web search instead"),
+    define: bool = typer.Option(False, "--define", help="Wikipedia summary of the term instead"),
+    doi: str = typer.Option("", "--doi", help="Resolve one DOI to real-metadata BibTeX"),
+) -> None:
+    """Search the FREE keyless research tools directly (no LLM cookies).
+
+    Same sources the agents fall back to when the LLM pools are dead —
+    arXiv / OpenAlex / Crossref return real publisher metadata (authors,
+    year, abstract, citation counts), never LLM-generated text. Quick way
+    to sanity-check the evidence path before starting a run.
+    """
+    setup_logging("ERROR")
+    settings = _settings()
+    if not getattr(settings, "free_tools_enabled", True):
+        console.print("[red]Free tools are disabled[/] — set FREE_TOOLS_ENABLED=1")
+        raise typer.Exit(1)
+    if not any((query, datasets, web, define, doi)):
+        console.print("Nothing to search — give QUERY or one of --datasets/--web/--define/--doi")
+        raise typer.Exit(1)
+    import asyncio as _aio
+    from agentics.research import free_tools as ft
+
+    async def _run() -> None:
+        if doi:
+            bib = await ft.crossref_bibtex(doi, settings=settings)
+            console.print(bib or f"[yellow]no BibTeX found for DOI {doi}[/]")
+            return
+        if define:
+            info = await ft.wikipedia_summary(query or "", settings=settings)
+            if not info:
+                console.print("[yellow]no Wikipedia summary found[/]")
+                return
+            console.print(f"[bold]{info['term']}[/] — {info['extract']}")
+            console.print(f"[dim]{info['url']}[/]")
+            return
+        if datasets:
+            rows = await ft.hf_datasets_search(query or "", max_results, settings=settings)
+            table = Table(title=f"Hugging Face datasets: {query}")
+            for col in ("dataset", "downloads", "likes", "url"):
+                table.add_column(col, overflow="fold")
+            for r in rows:
+                table.add_row(r["id"], str(r["downloads"] or 0), str(r["likes"] or 0), r["url"])
+            console.print(table if rows else "[yellow]no datasets found[/]")
+            return
+        if web:
+            rows = await ft.ddg_web_search(query or "", max_results, settings=settings)
+            for i, r in enumerate(rows, 1):
+                console.print(f"[bold]{i}. {r['title']}[/]\n  {r['url']}\n  "
+                              f"[dim]{r.get('snippet', '')[:200]}[/]")
+            if not rows:
+                console.print("[yellow]no web results (DuckDuckGo is best-effort)[/]")
+            return
+        if source == "arxiv":
+            hits = await ft.arxiv_search(query or "", max_results, settings=settings)
+        elif source == "openalex":
+            hits = await ft.openalex_search(query or "", max_results, settings=settings)
+        elif source == "crossref":
+            hits = await ft.crossref_works(query or "", max_results, settings=settings)
+        else:
+            hits = await ft.search_all(query or "", max_results, settings=settings)
+        if not hits:
+            console.print("[yellow]no papers found[/]")
+            return
+        table = Table(title=f"Papers: {query} (source: {source}, keyless)")
+        for col in ("title", "authors", "year", "venue", "cited", "url"):
+            table.add_column(col, overflow="fold")
+        for h in hits:
+            table.add_row(h.title[:70], h.authors_short()[:28], str(h.year or "-"),
+                          h.venue[:28], str(h.cited_by if h.cited_by is not None else "-"),
+                          h.url)
+        console.print(table)
+        bibtex = await ft.enriched_bibtex([h.url for h in hits], settings=settings)
+        if bibtex:
+            console.print(f"\n[bold]BibTeX (real metadata):[/]\n{bibtex}")
+
+    _aio.run(_run())
+
+
 if __name__ == "__main__":
     app()
