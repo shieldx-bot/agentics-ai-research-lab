@@ -29,6 +29,9 @@ from agentics.evolution.traces import (
 )
 from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
+from agentics.peer_review import (
+    DEFENSE, OUT_APPROVED, OUT_DEFENSE, OUT_REJECTED, PeerPanel,
+)
 from agentics.planning import (
     PLAN_INSTRUCTION,
     bump_prompt_feedback,
@@ -43,12 +46,27 @@ from agentics.research import free_tools
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
 from agentics.verify_ops import (
-    cmds_from_evidence, run_experiments, summarize, verdict_for,
+    Evidence, cmds_from_evidence, run_experiment, run_experiments, summarize,
+    verdict_for,
 )
 
 log = logging.getLogger("graph.nodes")
 
 STOP_YIELD = "yield"
+
+
+def _panel_engine(ctx: AgentContext) -> PeerPanel:
+    """P18 engine wired from the ctx. The orchestrator injects ctx.panel;
+    tests and older callers get one built on the fly (same rulebook)."""
+    injected = getattr(ctx, "panel", None)
+    if injected is not None:
+        return injected
+    s = getattr(ctx, "settings", None)
+    return PeerPanel(
+        ctx.memory,
+        panel_size=int(getattr(s, "peer_panel_size", 2) or 2),
+        defense_ttl_minutes=int(getattr(s, "peer_defense_ttl_minutes", 30) or 30),
+    )
 
 
 # ---------------------------------------------------------------- helpers
@@ -172,6 +190,13 @@ def node_start(ctx: AgentContext, state: ResearchState) -> ResearchState:
         Role.REVIEWER: "review",
         Role.INTEGRATOR: "integrate",
     }.get(ctx.role, "idle")
+    # P18: defending my challenged MR outranks the default action — one
+    # unanswered objection rejects the MR for good, so the author goes first.
+    try:
+        if pending_defense(ctx) is not None:
+            out["action"] = "defend"
+    except Exception:  # noqa: BLE001 — display only, routing decides separately
+        pass
     ctx.report(
         node="start", status="working",
         intent={"goal": f"{out['action']} cycle as {ctx.role.value}", "steps": []},
@@ -191,6 +216,16 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # so expired leases released above count as repaired orphans)
     tasks_src = getattr(getattr(ctx, "local", None), "tasks", None)
     repaired = tasks_src.repair_orphan_tasks() if tasks_src is not None else []
+    # P18 hygiene: defense deadlines and vanished-MR panels are swept the way
+    # stale leases are — an undefended MR dies here, the task returns to the
+    # open pool, and every agent sees why.
+    try:
+        swept_panels = _panel_engine(ctx).sweep()
+    except Exception:  # noqa: BLE001 — panel sweep must never break the scan
+        swept_panels = []
+    if swept_panels:
+        ctx.memory.journal(ctx.agent_id, "panel_sweep",
+                           {"events": [list(e) for e in swept_panels[:10]]})
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
@@ -207,6 +242,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + (f" Stale file locks freed: {stale_locks}." if stale_locks else "")
         + (f" Repaired stalled task(s): {repaired}." if repaired else "")
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
+        + (f" P18 panel events: {len(swept_panels)}." if swept_panels else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     state["summary"] = summary
@@ -1159,12 +1195,25 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     branch that was ACTUALLY pushed (in its own workspace) and hard-rejects
     any MR whose real diff touches protected paths — no matter what the file
     list recorded by the author's workspace claims."""
+    # P18 — panel review: an MR is judged by a PANEL of peers, not one
+    # reviewer. This agent votes only when it is an eligible, not-yet-voted
+    # member of the current round (round 2 belongs to the original objectors).
+    engine = _panel_engine(ctx)
     candidate = None
     for mr in ctx.memory.open_reviews():
         if mr["author"] == ctx.agent_id:
-            continue  # never review own MR
+            continue  # never review own MR (P5 — the engine refuses it too)
         if mr["status"] != "open":
             continue  # changes_requested awaits author rework, not re-review
+        prow = ctx.memory.get_panel(mr["id"]) or ctx.memory.ensure_panel(mr["id"])
+        if prow["state"] != "voting":
+            continue  # defense awaits the AUTHOR (node_defend); closed panels stay closed
+        if any(v["voter"] == ctx.agent_id
+               for v in ctx.memory.panel_votes(mr["id"], round=prow["round"])):
+            continue  # one vote per reviewer per round
+        if prow["round"] >= 2 and ctx.agent_id not in {
+                o["voter"] for o in ctx.memory.panel_objections(mr["id"], round=1)}:
+            continue  # after a defense only the original objectors hold a veto
         candidate = mr
         break
     if candidate is None:
@@ -1391,34 +1440,139 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         # visibility: a green MR now says WHICH checks were reproduced)
         comment = f"{comment} {rerun_note}"
 
-    if verdict == "approve":
-        await asyncio.to_thread(
-            ctx.memory.set_review_verdict, mr_id, "approved", ctx.agent_id, comment
-        )
+    # P18 — the panel: this reviewer's verdict becomes ONE VOTE. One reject
+    # opens the defense round immediately; approval needs the panel's
+    # unanimous accepts; after a defense, one objector still rejecting is
+    # final (the engine handles every consequence).
+    vote = "accept" if verdict == "approve" else "reject"
+    decision = await asyncio.to_thread(
+        engine.cast_vote, mr_id, ctx.agent_id, vote, comment)
+    state["panel_decision"] = decision.outcome
+    state["panel_digest"] = engine.panel_digest(mr_id)
+    if decision.outcome == OUT_APPROVED:
         await asyncio.to_thread(ctx.merge_queue.enqueue, mr_id,
                                 author=candidate["author"])
-        await asyncio.to_thread(ctx.memory.set_trace_outcome, mr_id, "approved")
         state["review_verdict"] = "approve"
-    else:
-        await asyncio.to_thread(
-            ctx.memory.set_review_verdict, mr_id, "changes_requested",
-            ctx.agent_id, comment,
-        )
-        # the reviewer's reason becomes a failure trace every agent can learn from
-        await asyncio.to_thread(ctx.memory.set_trace_outcome, mr_id, "rejected", comment)
-        await asyncio.to_thread(ctx.memory.drop_tools, mr_id)
+    elif decision.outcome in (OUT_DEFENSE, OUT_REJECTED):
         state["review_verdict"] = "request_changes"
+    else:                              # waiting / ignored — panel still deciding
+        state["review_verdict"] = "vote_cast"
+    if decision.outcome == OUT_DEFENSE:
+        due_s = int(max(0, (decision.panel.get("due_ts") or 0) - time.time()))
+        ctx.memory.post_message(
+            ctx.agent_id, "alert",
+            f"P18: MR #{mr_id} enters DEFENSE — author {candidate['author']} must "
+            f"answer EVERY objection within {due_s // 60}m or the MR is rejected "
+            f"for good. Objections: {decision.reason[:300]}",
+            candidate.get("task_id"),
+        )
     ctx.memory.post_message(
         ctx.agent_id, "broadcast",
-        f"Review of MR #{mr_id}: {verdict} — {comment[:200]}",
+        f"Review of MR #{mr_id}: {verdict} ({decision.outcome}) — {comment[:200]}",
         candidate.get("task_id"),
     )
     ctx.memory.journal(ctx.agent_id, "review", {
-        "mr": mr_id, "verdict": verdict, "comment": comment[:300],
+        "mr": mr_id, "verdict": state["review_verdict"], "vote": vote,
+        "panel": decision.outcome, "comment": comment[:300],
         "task": candidate.get("task_id"),
     })
     state["review_comment"] = comment
-    state["summary"] = f"reviewed MR #{mr_id}: {verdict}"
+    state["summary"] = f"reviewed MR #{mr_id}: {state['review_verdict']}"
+    state["done"] = True
+    return state
+
+
+def pending_defense(ctx: AgentContext) -> tuple[dict, dict] | None:
+    """My MR whose panel is in the defense round (P18 — I must defend it)."""
+    try:
+        for mr in ctx.memory.reviews_by_author(ctx.agent_id):
+            panel = ctx.memory.get_panel(mr["id"])
+            if panel and panel["state"] == DEFENSE:
+                return mr, panel
+    except Exception:  # noqa: BLE001 — routing must never crash on a read
+        return None
+    return None
+
+
+async def node_defend(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """P18 — defend my MR: the panel raised objections, I answer EVERY one.
+
+    One shot per MR: the defense must cover each objection (keyed by the
+    objector's id) and may attach fresh evidence from REAL runs; anything
+    less — or silence past the deadline — ends the MR as rejected (final),
+    and the task returns to the open pool for a fresh attempt.
+    """
+    picked = pending_defense(ctx)
+    if picked is None:
+        state["summary"] = "no defense pending"
+        state["done"] = True
+        return state
+    mr, panel = picked
+    mr_id = mr["id"]
+    objections = ctx.memory.panel_objections(mr_id, round=1)
+    obj_desc = "\n".join(
+        f"- [{o['voter']}] {o['objection']}" for o in objections) or "- (none recorded)"
+    ev_rows = ctx.memory.evidence_for_task(mr.get("task_id"))
+    ev_desc = "\n".join(
+        f"- [{e['verdict']}] `{e['cmd'][:90]}` (exit {e['exit_code']}, by {e['agent']})"
+        for e in ev_rows[-6:])
+    ctx.report(
+        node="defend",
+        intent={"goal": f"Defend MR #{mr_id} against {len(objections)} objection(s)",
+                "why": "P18: one unanswered objection rejects the MR for good",
+                "steps": []},
+    )
+    prompt = (
+        f"Your MR #{mr_id} ({mr['title']}) was challenged by the peer panel.\n\n"
+        f"Objections you must answer:\n{obj_desc}\n\n"
+        f"MR body:\n{(mr.get('body') or '')[:2000]}\n\n"
+        f"Recorded evidence:\n{ev_desc or '(none)'}\n\n"
+        'Reply ONLY JSON: {"concede": false, "rebuttals": '
+        '{"<objector-id>": "your factual answer, with numbers where possible"}, '
+        '"extra_checks": ["python -m pytest tests/x.py"], '
+        '"note": "one-line summary"}\n'
+        "Rules: answer EVERY objection by its objector id (an unanswered one "
+        "rejects the MR immediately); extra_checks may only invoke python or "
+        "pytest (the workspace runs no shells); if an objection is right, set "
+        "concede=true — the MR is rejected and the task reopens for a fresh, "
+        "better attempt."
+    )
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="defend", state=state)
+    if state.get("error"):             # LLM hiccup — retry next cycle (deadline looms)
+        state["done"] = True
+        return state
+    parsed = parse_json_block(answer) or {}
+    engine = _panel_engine(ctx)
+    if parsed.get("concede"):
+        decision = await asyncio.to_thread(
+            engine.concede, mr_id, ctx.agent_id, str(parsed.get("note", "")))
+        state["defense_outcome"] = decision.outcome
+        state["summary"] = f"conceded MR #{mr_id}: {decision.outcome}"
+        state["done"] = True
+        return state
+    rebuttals = {str(k): str(v)[:2000]
+                 for k, v in (parsed.get("rebuttals") or {}).items() if str(v).strip()}
+    # the defense is backed by RUNS, not prose: every declared extra check is
+    # executed in the author's own workspace and lands in the shared feed
+    evidence_ids: list[int] = []
+    for cmd in list(parsed.get("extra_checks") or [])[:3]:
+        try:
+            ev = await asyncio.to_thread(run_experiment, ctx.workspace, cmd, 300)
+        except Exception as exc:  # noqa: BLE001 — a failed check is evidence too
+            ev = Evidence(cmd=str(cmd)[:400], exit_code=-1, verdict="inconclusive",
+                          output=f"defense check error: {exc}")
+        row_id = await asyncio.to_thread(
+            ctx.memory.record_evidence, ctx.agent_id, mr.get("task_id"),
+            ev.cmd, ev.exit_code, ev.verdict,
+            hypothesis=f"defense of MR #{mr_id}", method="defense_check",
+            output=ev.output, duration_s=ev.duration_s)
+        evidence_ids.append(row_id)
+    decision = await asyncio.to_thread(
+        engine.submit_defense, mr_id, ctx.agent_id, rebuttals,
+        note=str(parsed.get("note", ""))[:2000], evidence_ids=evidence_ids)
+    state["defense_outcome"] = decision.outcome
+    state["summary"] = (
+        f"defended MR #{mr_id}: {decision.outcome} {decision.reason[:120]}".strip())
     state["done"] = True
     return state
 

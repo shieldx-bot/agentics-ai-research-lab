@@ -1223,12 +1223,21 @@ class SharedMemory:
         Only a changes_requested MR authored by ``agent`` is reopened; reviewer
         fields are cleared so the (possibly different) reviewer starts fresh.
         The task goes back to in_review if it was parked elsewhere.
+
+        P18: an MR whose panel is in the defense round can NOT be reopened —
+        the author must submit the defense (submit_defense); silently flipping
+        the MR back to 'open' would bypass the panel's veto.
         """
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT author, status, task_id FROM reviews WHERE id=?", (mr_id,)
             ).fetchone()
             if row is None or row[1] != "changes_requested":
+                return False
+            panel = self._conn.execute(
+                "SELECT state FROM mr_panels WHERE mr_id=?", (mr_id,)
+            ).fetchone()
+            if panel is not None and panel[0] == "defense":
                 return False
             author, _, task_id = row
             self._conn.execute(

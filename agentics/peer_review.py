@@ -148,11 +148,15 @@ class PeerPanel:
         if vote == "reject":
             self.memory.record_panel_objection(
                 mr_id, panel["round"], voter, reason or "no reason given")
-        return self.tally(mr_id)
+        return self.tally(mr_id, note=reason if vote == "accept" else "")
 
     # ------------------------------------------------------------ tally
-    def tally(self, mr_id: int) -> PanelDecision:
-        """Apply the panel rules to the CURRENT round's votes."""
+    def tally(self, mr_id: int, note: str = "") -> PanelDecision:
+        """Apply the panel rules to the CURRENT round's votes.
+
+        ``note`` is the deciding voter's comment — it rides the MR record so
+        the owner sees WHY the panel said yes (e.g. the mechanical tier-2
+        prefix and the P16 evidence digest)."""
         mr = self._mr(mr_id)
         panel = self.memory.get_panel(mr_id)
         if mr is None or panel is None:
@@ -179,7 +183,7 @@ class PeerPanel:
             eligible = self.eligible_voters(mr["author"])
             quorum = min(self.panel_size, len(eligible))
             if accepts and len(accepts) >= quorum:
-                return self._approve(mr_id, [v["voter"] for v in accepts])
+                return self._approve(mr_id, [v["voter"] for v in accepts], note=note)
             return PanelDecision(OUT_WAITING, mr_id,
                                  reason=f"{len(accepts)}/{quorum} accept votes",
                                  panel=panel, votes=votes)
@@ -202,12 +206,15 @@ class PeerPanel:
                                  reason=f"awaiting re-vote from {unswung}",
                                  panel=panel, votes=votes)
         return self._approve(mr_id, list(dict.fromkeys(
-            [v["voter"] for v in self.memory.panel_votes(mr_id) if v["vote"] == "accept"])))
+            [v["voter"] for v in self.memory.panel_votes(mr_id) if v["vote"] == "accept"])),
+            note=note)
 
-    def _approve(self, mr_id: int, voters: list[str]) -> PanelDecision:
+    def _approve(self, mr_id: int, voters: list[str], note: str = "") -> PanelDecision:
         by = f"panel[{','.join(voters)[:200]}]"
-        self.memory.set_review_verdict(mr_id, "approved", by,
-                                       f"P18 unanimous panel: {voters}")
+        comment = f"P18 unanimous panel: {voters}"
+        if note.strip():
+            comment = f"{comment} — {note[:400]}"
+        self.memory.set_review_verdict(mr_id, "approved", by, comment)
         self.memory.set_panel(mr_id, state=APPROVED, clear_due=True)
         self.memory.set_trace_outcome(mr_id, "approved")
         panel = self.memory.get_panel(mr_id)
