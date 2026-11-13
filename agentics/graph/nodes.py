@@ -19,17 +19,21 @@ from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, build_system_prompt, parse_json_block
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
-    EVOLUTION_ALLOWED_PATHS, build_evolution_issue, tool_context, trace_context,
-    evolution_path_allowed, valid_tool_name,
+    EVOLUTION_ALLOWED_PATHS,
+    build_evolution_issue,
+    evolution_path_allowed,
+    tool_context,
+    trace_context,
+    valid_tool_name,
 )
+from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
-from agentics.policies.intent import scope_violations
-from agentics.verify_ops import run_experiments, summarize
 from agentics.memory import lifemem
-from agentics.memory.vector_store import VectorStore
+from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
 from agentics.research import papers as papers_mod
-from agentics.graph.state import ResearchState
+from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
+from agentics.verify_ops import run_experiments, summarize
 
 log = logging.getLogger("graph.nodes")
 
@@ -47,6 +51,10 @@ def _memory_context(ctx: AgentContext) -> dict:
         "findings": "\n".join(
             f"- #{f['id']} {f['title']} (by {f['agent']})" for f in findings
         ) or "(empty)",
+        # H3: every agent's snapshot carries the swarm's settled knowledge —
+        # supported claims are reusable common ground, refuted ones are dead
+        # ends (rendered by verified_knowledge_text, below).
+        "verified": verified_knowledge_text(ctx) or "(nothing verified yet)",
     }
 
 
@@ -385,10 +393,130 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         state.get("issue_number"),
     )
     if ctx.role == Role.RESEARCHER:
-        state["done"] = True
-        state["summary"] = f"stored finding #{fid}"
+        # P16bis (H2): the finding's claims must be VERIFIED by running code,
+        # not trusted because an LLM wrote them — the cycle continues into
+        # node_verify, which pre-registers hypotheses and adjudicates.
+        state["finding_id"] = fid
+        state["finding_text"] = content[:4000]
+        state["action"] = "verify"
     else:
         state["action"] = "plan"
+    return state
+
+
+# ---------------------------------------------------------------- verify (P16bis)
+VERIFY_STATUS = {
+    "confirmed": "supported",
+    "refuted": "refuted",
+    "inconclusive": "inconclusive",
+}
+
+
+async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """Researcher (P16bis, H2): verify the finding's claims by RUNNING code.
+
+    Claims are pre-registered as hypotheses with a quantitative criterion
+    (metric/op/target); one self-contained protocol per claim is written into
+    experiments/ and executed twice through the guarded workspace runner;
+    the verdict is a machine comparison (measured vs criterion) — never an
+    LLM's opinion — and lands in shared evidence + verified knowledge (H3)."""
+    finding_text = state.get("finding_text") or ""
+    if not finding_text or ctx.llm is None:
+        state["summary"] = "verification skipped (no finding or no LLM)"
+        state["done"] = True
+        return state
+    ctx.report(
+        node="verify", task_id=state.get("issue_number"),
+        intent={
+            "goal": (f"Verify the claims of finding #{state.get('finding_id')} "
+                     "by running protocols"),
+            "why": "P16bis: verdicts from measurements, not model opinion",
+            "steps": ["extract claims", "register criteria", "run protocols",
+                      "record evidence"],
+            "expected_files": [],
+        },
+    )
+    prompt = (
+        f"Research finding to verify:\n{finding_text[:3000]}\n\n"
+        "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
+        "self-contained python simulation can check (simulate the method on "
+        "synthetic data, measure the metric). For each claim write its "
+        "protocol.\n\n"
+        f"{PROTOCOL_CONTRACT}\n"
+        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]}'
+    )
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    parsed = parse_json_block(answer)
+    specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:3]
+    if not specs:
+        state["summary"] = "no verifiable claim extracted; nothing verified this cycle"
+        state["done"] = True
+        return state
+
+    await asyncio.to_thread(ctx.workspace.sync_main)    # workspace must exist
+    results: list[dict] = []
+    for spec in specs:
+        claim = str(spec.get("claim", "")).strip()[:300]
+        criterion, malformed = None, ""
+        try:
+            criterion = Criterion.from_dict(spec)
+        except ValueError as exc:
+            malformed = str(exc)
+        protocol_code = str(spec.get("protocol", ""))
+        if not claim or criterion is None or not protocol_code.strip():
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": malformed or "malformed hypothesis spec"})
+            continue
+        hyp_id = await asyncio.to_thread(
+            ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
+            task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
+            status="testing")
+        path = f"experiments/verify_h{hyp_id}.py"
+        try:
+            await asyncio.to_thread(ctx.workspace.write_file, path, protocol_code)
+        except ValueError as exc:            # P10 layer 1: protected / traversal
+            await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                    "inconclusive", note=str(exc)[:300])
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": str(exc)[:200]})
+            continue
+        try:
+            ev = await asyncio.to_thread(run_protocol, ctx.workspace, path, criterion)
+        except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the cycle
+            await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                    "inconclusive", note=f"runner error: {exc}"[:300])
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": f"runner error: {exc}"[:200]})
+            continue
+        ev_id = await asyncio.to_thread(
+            ctx.memory.record_evidence, ctx.agent_id, state.get("issue_number"),
+            ev.cmd, ev.exit_code, ev.verdict,
+            hypothesis=claim, method=ev.method, output=ev.output,
+            duration_s=ev.duration_s, artifact=path)
+        await asyncio.to_thread(
+            ctx.memory.attach_protocol_outcome, ev_id,
+            ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
+        status = VERIFY_STATUS[ev.verdict]
+        note = str(ev.meta.get("note", ""))
+        await asyncio.to_thread(
+            ctx.memory.update_hypothesis, hyp_id, status,
+            evidence_id=ev_id, note=note, protocol_path=path)
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
+            {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
+             "note": note[:200], "evidence": ev_id,
+             "criterion": criterion.as_dict()},
+        )
+        results.append({"claim": claim, "status": status, "note": note,
+                        "hypothesis_id": hyp_id, "evidence_id": ev_id})
+    state["verifications"] = results
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+    state["summary"] = f"P16bis verified {len(results)} claim(s) [{breakdown}]"
+    state["done"] = True
     return state
 
 
@@ -1101,6 +1229,7 @@ NODES = {
     "scan": node_scan,
     "claim": node_claim,
     "research": node_research,
+    "verify": node_verify,
     "plan": node_plan,
     "implement": node_implement,
     "open_pr": node_open_pr,
