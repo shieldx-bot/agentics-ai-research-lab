@@ -299,6 +299,24 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 f"P22 pruned {len(pruned_ws)} idle workspace(s): {pruned_ws}")
     except Exception:  # noqa: BLE001 — retention must never break the scan
         pruned_ws = []
+    # P23 replication: on schedule, re-run settled claims from their stored
+    # protocol source — the swarm's knowledge must survive re-measurement,
+    # not be asserted once. Drift (supported->refuted), overturns and
+    # contradictions land in the shared evidence feed (method='replay'), so
+    # every agent sees replication results, not just the replayer.
+    replay_report: list[dict] = []
+    try:
+        sweep_size = int(getattr(ctx.settings, "replay_sweep_size", 0) or 0)
+        every_n = int(getattr(ctx.settings, "replay_every_n_cycles", 1) or 1)
+        workspace = getattr(ctx, "workspace", None)
+        if sweep_size > 0 and every_n > 0 and ctx.cycle % every_n == 0 and workspace is not None:
+            from agentics.verify.replay import replay_settled
+            replay_report = replay_settled(
+                ctx.memory, workspace, limit=sweep_size, agent=ctx.agent_id)
+    except Exception:  # noqa: BLE001 — replication must never break the scan
+        replay_report = []
+    replayed_n = sum(1 for r in replay_report if r.get("replayed"))
+    replay_events = [r.get("event", "") for r in replay_report if r.get("replayed")]
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
@@ -316,6 +334,8 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + (f" Repaired stalled task(s): {repaired}." if repaired else "")
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
         + (f" P19 panel events: {len(swept_panels)}." if swept_panels else "")
+        + (f" P23 replayed {replayed_n} claim(s): {replay_events}."
+           if replayed_n else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     state["summary"] = summary

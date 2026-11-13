@@ -753,6 +753,60 @@ def hypotheses(
 
 
 @app.command()
+def replay(
+    limit: int = typer.Option(5, "--limit", "-l", help="số claim replay trong lần quét này"),
+    hyp_id: int = typer.Option(0, "--id", help="replay đúng 1 giả thuyết theo id"),
+) -> None:
+    """Owner: chạy lại (replicate) các claim đã settled từ protocol đã lưu (P23).
+
+    Mỗi replay là 2 lần chạy thật của protocol trong workspace riêng, machine
+    verdict so với tiêu chí đã pre-register: reconfirm giữ kiến thức, drift
+    (supported->refuted) sửa verified_knowledge, overturn đảo kết luận, unstable
+    đưa về inconclusive. Kết quả ghi vào evidence chung (method='replay') —
+    mọi agent đều thấy. Đây là phần trả lời trực tiếp cho giả thuyết 2 + 3."""
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    from agentics.github_ops.repo_workspace import RepoWorkspace
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.verify.replay import replay_hypothesis, replay_settled
+
+    memory = SharedMemory(settings.db_path)
+    try:
+        if hyp_id > 0:
+            report = [replay_hypothesis(memory, RepoWorkspace(
+                "owner-cli", settings, guard=None), hyp_id, agent="owner")]
+        else:
+            report = replay_settled(
+                memory, RepoWorkspace("owner-cli", settings, guard=None),
+                limit=max(1, limit), agent="owner")
+        if not report:
+            console.print("[yellow]Không có claim nào replay được[/] "
+                          "(chưa có claim settled mang protocol source).")
+            return
+        table = Table(title=f"P23 replay — {len(report)} claim(s)")
+        table.add_column("ID", justify="right")
+        table.add_column("Claim", overflow="fold")
+        table.add_column("Trước", justify="center")
+        table.add_column("Sau", justify="center")
+        table.add_column("Sự kiện")
+        for r in report:
+            color = {"claim_reconfirmed": "green", "claim_falsified": "red",
+                     "claim_overturned": "cyan", "claim_unstable": "yellow"}.get(
+                r.get("event", ""), "dim")
+            table.add_row(
+                str(r.get("hyp_id")),
+                (r.get("note") or r.get("claim", ""))[:100],
+                r.get("was", "-"), r.get("status", "-"),
+                f"[{color}]{r.get('event', '-')}[/]" if r.get("replayed")
+                else f"[dim]skipped: {r.get('note', '')[:40]}[/]",
+            )
+        console.print(table)
+    finally:
+        memory.close()
+
+
+@app.command()
 def assign_roles() -> None:
     """Print the role assignment for current accounts (dry-run)."""
     settings = _settings()

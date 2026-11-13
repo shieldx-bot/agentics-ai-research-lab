@@ -179,6 +179,15 @@ class Settings:
     # P10 layer 4 — integrity self-healing sweep interval (0 = off).
     integrity_interval_s: int = field(
         default_factory=lambda: _env_int("INTEGRITY_INTERVAL_S", 20))
+    # P23 — replay: settled claims are periodically re-run from their stored
+    # protocol source by the supervisor sweep. replay_sweep_size caps how many
+    # claims one sweep replays (0 = off); replay_every_n_cycles gates how
+    # often the sweep runs. Every outcome lands in shared evidence
+    # (method='replay') so the whole swarm sees replication results (H3).
+    replay_sweep_size: int = field(
+        default_factory=lambda: _env_int("REPLAY_SWEEP_SIZE", 2))
+    replay_every_n_cycles: int = field(
+        default_factory=lambda: _env_int("REPLAY_EVERY_N_CYCLES", 3))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(
