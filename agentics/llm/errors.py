@@ -90,3 +90,31 @@ def is_auth_failure(exc: BaseException) -> bool:
     if _HTTP_AUTH_STATUS.search(msg):
         return True
     return any(marker in msg for marker in AUTH_MARKERS)
+
+
+# Transport/session-level failure markers: the cloud browser, its session
+# slot, or the CDP link failed — these say NOTHING about the cookie, the
+# model, or the answer (matched lowercase against str(exc)).
+_INFRA_MARKERS: tuple[str, ...] = (
+    "target page, context or browser has been closed",   # playwright target-closed family
+    "maximum number of active sessions",                 # HB per-token cap while a stop propagates
+    "session not found",                                 # HB CDP endpoint 404 right after create
+    "connect_over_cdp",                                  # CDP websocket connect failures
+)
+
+
+def is_infra_failure(exc: BaseException) -> bool:
+    """True when the failure is session/transport-level rather than a
+    model/cookie failure.
+
+    The P20 fail-streak must not count these as provider failures: the free
+    plan's hard ~10-minute session cap once killed every session mid-ask,
+    and the rebuild burst's transient errors then read as five consecutive
+    "model failures" per agent — freezing the WHOLE swarm for the 900s
+    cooldown (live 2026-11-13 14:47-15:10) while sessions were actually
+    recovering on their own. A plain websocket read timeout is still a
+    provider failure: only the session-lifecycle classes are exempt."""
+    if type(exc).__name__ in ("TargetClosedError", "TargetClosed"):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _INFRA_MARKERS)

@@ -225,6 +225,14 @@ class Settings:
     # visible before failing an ask with a diagnostic error (challenge page,
     # logged-out wall, or a UI markup change).
     hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
+    # Free-plan Hyperbrowser sessions carry a hard duration cap (~10 min;
+    # live 2026-11-13: six sessions aged 9m37s-10m06s all died mid-ask inside
+    # one 30-second window, wrecking every in-flight call). Recycle each
+    # cloud session BEFORE the cap — between asks, while healthy — instead
+    # of losing everything at once. The client jitters this ±10-15% so a
+    # swarm never recycles in sync. 0 disables the guard.
+    hb_session_recycle_s: int = field(
+        default_factory=lambda: _env_int("HB_SESSION_RECYCLE_S", 480))
 
     # --- Adaptive planning & role prompts (LLM-authored) ---------------------
     # Role missions are WRITTEN by the LLM (shared swarm-wide via the
