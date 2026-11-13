@@ -33,6 +33,33 @@ class LLMError(RuntimeError):
     """Marker base for classifier-based checks (backends may reuse it)."""
 
 
+class LLMRefused(LLMError):
+    """The ask never reached the provider — a refusal, not a failure.
+
+    Three sources raise it today: the P20 budget gate is implicit (its
+    refusals never call ``ask``), the session host has no usable account
+    (empty pool / every account cooling down), and the Hyperbrowser
+    frontend circuit is open. The caller already knows the request was
+    never attempted, so the P20 fail-streak must NOT count it as a
+    provider failure — otherwise the breaker punishes the agent for the
+    breaker's own refusals and a dead window inflates into a dead hour
+    (live 2026-11-13: llm_usage rows 7-12 recorded 6 "failures" of 0.4ms
+    each while the frontend circuit was merely open)."""
+
+
+def is_llm_refusal(exc: BaseException) -> bool:
+    """True when the exception means 'the request never left the machine'.
+
+    Refusals (``LLMRefused``, an open Hyperbrowser frontend circuit) are
+    budget/telemetry events, NOT provider failures: they must not feed the
+    P20 fail-streak. The type-name check keeps this import-light — the
+    Hyperbrowser module is optional and errors.py must not import it at
+    module scope."""
+    if isinstance(exc, LLMRefused):
+        return True
+    return type(exc).__name__ == "HyperbrowserBackendUnavailable"
+
+
 def _hyperbrowser_error_types() -> tuple[type[BaseException], ...]:
     try:
         from agentics.llm.hyperbrowser_client import HyperbrowserError

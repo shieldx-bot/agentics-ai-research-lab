@@ -16,19 +16,24 @@ research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core aut
 research_fanout: 2
 
 # --- Role assignment ------------------------------------------------------
-# Fixed mapping account index (1-based) -> role.
-# Remove/leave empty for automatic round-robin assignment.
-role_map:
-  1: supervisor
-  2: researcher
-  3: researcher
-  4: coder
-  5: coder
-  6: writer
-  7: reviewer
-  8: reviewer
-  9: integrator
-  # 10: auto
+# Fixed mapping account index (1-based) -> role. Leave EMPTY (as below) for
+# the adaptive default: a lone agent researches (a single-token lab pinned to
+# supervisor would scan the backlog forever without ever calling the LLM),
+# two agents become supervisor+researcher, larger swarms round-robin with
+# supervisor/integrator guaranteed. Pin explicit roles ONLY when your token
+# pool matches this exact size — a fixed 9-slot map on a 1-token deployment
+# is what left the CLI run scanning instead of researching (2026-11-13).
+#
+# role_map:
+#   1: supervisor
+#   2: researcher
+#   3: researcher
+#   4: coder
+#   5: coder
+#   6: writer
+#   7: reviewer
+#   8: reviewer
+#   9: integrator
 
 # --- Ownership matrix (P3 in docs/POLICIES.md) -----------------------------
 # Writable research surface per role. The lab's own code (agentics/, configs/,

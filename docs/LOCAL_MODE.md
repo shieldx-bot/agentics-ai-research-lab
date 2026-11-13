@@ -168,6 +168,18 @@ Merge behaviour: with `AUTO_MERGE` on (default) the Integrator merges
 approved MRs serially after tier-2 passes; with `AUTO_MERGE` off the queue
 only records readiness and the owner merges by hand.
 
+Single-token labs: the swarm is sized by the Hyperbrowser token pool, so
+`HB_API_KEY` (one token) means ONE agent. `assign_roles` gives a lone agent
+the **researcher** role — a lone supervisor would only scan the backlog and
+never call the LLM (live 2026-11-13) — and pins supervisor+researcher for
+two agents. Pin explicit roles in `configs/lab.yaml` `role_map` only when
+your token pool matches that exact size. When the configured research topic
+is already covered (P7: >= 3 vector hits), the researcher rotates through
+fresh angles (benchmarks, open problems, deployments, recent advances) and
+journals `research_topic_rotated` — an angle whose label already appears in
+a stored finding title counts as spent, so the lab keeps producing new
+findings instead of printing "skipping" forever.
+
 ### 4b. Switching research topic — `agentics reset-memory`
 
 Every memory surface is topic-bound, so a new topic needs a clean slate —

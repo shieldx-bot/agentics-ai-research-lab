@@ -224,6 +224,30 @@ class Orchestrator:
                     await asyncio.sleep(min(1.0, delay - waited))
                     waited += 1.0
             while not should_stop():
+                # P20 — when the circuit breaker is open the cycle would
+                # degrade at the first ask anyway (every node's budget gate
+                # refuses); sleeping through the cooldown keeps the journal
+                # quiet and the provider resting instead of burning ~12
+                # dead cycles per 15-minute window. STOP stays responsive
+                # (1s chunks) and the lease heartbeat task keeps beating.
+                budget = getattr(ctx, "budget", None)
+                if budget is not None:
+                    remaining = budget.breaker_remaining_s(ctx.agent_id)
+                    if remaining > 0:
+                        log.warning(
+                            "[%s] LLM circuit open — sleeping %.0fs "
+                            "instead of burning a dead cycle",
+                            tag, remaining)
+                        try:
+                            ctx.memory.journal(ctx.agent_id, "breaker_wait",
+                                               {"wait_s": round(remaining)})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        waited = 0.0
+                        while waited < remaining and not should_stop():
+                            await asyncio.sleep(1)
+                            waited += 1.0
+                        continue
                 try:
                     ctx.heartbeat("cycle-start")
                     await run_cycle(ctx)
