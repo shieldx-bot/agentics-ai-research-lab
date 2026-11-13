@@ -8,6 +8,11 @@ answers, so the demo needs no cookies and no network).
 What it shows, in order:
   1. the OWNER queues tasks (+ the seeded starter backlog);
   2. the SUPERVISOR scans, sweeps stale claims, tops the backlog up;
+  2b. the RESEARCHER researches, then SELF-VERIFIES its finding (P16bis):
+      claims are pre-registered with a quantitative criterion, protocols are
+      written into experiments/ and RUN twice in the guarded workspace, the
+      machine adjudicates measured-vs-criterion and the verdicts broadcast
+      to every agent (owner hypotheses 1-3, verified end to end);
   3. the CODER claims a task, researches, plans, implements, pushes a branch
      and opens an MR (the P10 guard and the pre-receive hook watch every push);
   4. the WRITER does the same for a docs task;
@@ -82,6 +87,30 @@ class FakeLLMHost:
         if purpose == "review":
             return _resp(json.dumps({"verdict": "approve",
                                      "comment": "demo review: changes look good"}))
+        if purpose == "verify":
+            # P16bis: 2 claims, each with a self-contained protocol. The first
+            # measures precision ~0.9 (criterion >= 0.9 -> supported); the
+            # second measures 0.5 (refuted). The verdict comes from the
+            # machine comparison, not from this fake LLM.
+            good = (
+                "import json\n"
+                "correct = sum(1 for i in range(200) if (i * 7) % 10 < 9)\n"
+                "print('toy simulation: 200 predictions')\n"
+                "print('AGENTICS_RESULT:', json.dumps({'precision': correct / 200}))\n"
+            )
+            bad = (
+                "import json\n"
+                "correct = sum(1 for i in range(200) if (i * 7) % 10 < 4)\n"
+                "print('AGENTICS_RESULT:', json.dumps({'precision': correct / 200}))\n"
+            )
+            return _resp(json.dumps({"hypotheses": [
+                {"claim": "ensemble voting reaches >=0.9 precision on the toy set",
+                 "metric": "precision", "op": ">=", "target": 0.9,
+                 "protocol": good},
+                {"claim": "single-tree baseline reaches >=0.9 precision on the toy set",
+                 "metric": "precision", "op": ">=", "target": 0.9,
+                 "protocol": bad},
+            ]}))
         # implement: return the full content of the file the plan mentions
         m = re.search(r'"path":\s*"([^"]+)"', query)
         path = m.group(1) if m else "docs/untitled.md"
@@ -175,6 +204,8 @@ async def main() -> None:
     ownership = OwnershipPolicy()
     supervisor = build_context("a01", Role.SUPERVISOR, settings, mem,
                                VectorStore(settings.chroma_path), local, ownership)
+    researcher = build_context("a02", Role.RESEARCHER, settings, mem,
+                               supervisor.vector, local, ownership)
     coder = build_context("a03", Role.CODER, settings, mem, supervisor.vector,
                           local, ownership)
     writer = build_context("a06", Role.WRITER, settings, mem, supervisor.vector,
@@ -187,6 +218,18 @@ async def main() -> None:
     # 2) supervisor scan -----------------------------------------------------
     await run_cycle(supervisor)
     show(mem, "after supervisor scan (backlog topped up)")
+
+    # 2b) researcher cycle: research -> verify (P16bis) -----------------------
+    await run_cycle(researcher)
+    show(mem, "after researcher cycle (finding verified by RUNNING protocols)")
+    print("  hypotheses:")
+    for h in mem.list_hypotheses(limit=5):
+        c = h["criterion"]
+        print(f"    h#{h['id']} [{h['status']}] {h['claim'][:64]!r} "
+              f"criterion: {c.get('metric')} {c.get('op')} {c.get('target')} "
+              f"— {h['verdict_note'][:70]}")
+    print(f"  verified knowledge now in every agent's prompt: "
+          f"{len(mem.verified_knowledge())} settled claim(s)")
 
     # 3) coder full cycle -----------------------------------------------------
     await run_cycle(coder)
@@ -235,7 +278,7 @@ async def main() -> None:
         capture_output=True, text=True).stdout.strip()
     print(f"\nmain history on the local bare repo:\n{log}")
 
-    for ctx in (supervisor, coder, writer, reviewer, integrator):
+    for ctx in (supervisor, researcher, coder, writer, reviewer, integrator):
         ctx.meta["personal"].close()
     mem.close()
 

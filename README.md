@@ -141,6 +141,18 @@ trước khi đốt chu kỳ); diff ở bước implement phải nằm trong **p
 bị script lạc ghi đè trong workspace — `INTEGRITY_INTERVAL_S=0` để tắt.
 Chi tiết: `docs/POLICIES.md` (P10 bổ sung, P13, P14).
 
+**P16/P16bis — agent tự kiểm chứng ý tưởng bằng code chạy thật:** một ý tưởng
+không được đánh giá bằng lời kết luận của LLM mà bằng **bằng chứng thực
+nghiệm** — plan khai báo `verify_cmds`/`hypotheses` (chốt tiêu chí định lượng
+TRƯỚC khi chạy, như pre-registration), protocol được viết và chạy 2 lần trong
+workspace có guard, máy so sánh số đo với tiêu chí để phán
+`confirmed/refuted/inconclusive` (protocol không tái lập được → inconclusive,
+không bao giờ đếm là thành công), và mọi verdict được broadcast cho cả đàn +
+inject vào prompt của từng agent (`verified_knowledge` — claim bị phản chứng
+sẽ không ai lặp lại). Owner xem bằng `agentics evidence` /
+`agentics hypotheses` và 2 panel trên dashboard. Chi tiết:
+[docs/VERIFICATION.md](docs/VERIFICATION.md).
+
 ---
 
 ## 4. Vai trò (roles) & luồng công việc

@@ -453,6 +453,60 @@ def evidence(
 
 
 @app.command()
+def hypotheses(
+    status: str = typer.Option("", "--status", "-s",
+                               help="chỉ hiện 1 trạng thái (supported/refuted/...)"),
+    limit: int = typer.Option(30, "--limit", "-l", help="số dòng tối đa"),
+) -> None:
+    """Owner: các giả thuyết đã đăng ký + kết luận máy chấm (P16bis).
+
+    Mỗi dòng là một claim được pre-register tiêu chí định lượng TRƯỚC khi
+    chạy protocol; verdict là kết quả so sánh số đo với tiêu chí — không
+    phải lời kết luận của LLM. Đây là phần trả lời trực tiếp cho giả thuyết 2."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        counts = mem.hypothesis_counts()
+        console.print("[bold]Giả thuyết (P16bis)[/]",
+                      " — ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+                      or "(chưa có)")
+        rows = mem.list_hypotheses(limit=limit, status=status or None)
+        table = Table(title="Pre-registered hypotheses"
+                      + (f" — status {status}" if status else ""))
+        table.add_column("ID", justify="right")
+        table.add_column("Task", justify="right")
+        table.add_column("Agent")
+        table.add_column("Trạng thái")
+        table.add_column("Giả thuyết", overflow="fold")
+        table.add_column("Tiêu chí")
+        table.add_column("Kết quả đo", overflow="fold")
+        for h in rows:
+            color = {"supported": "green", "refuted": "red"}.get(h["status"], "yellow")
+            c = h["criterion"]
+            crit = f"{c.get('metric', '-')} {c.get('op', '')} {c.get('target', '')}" \
+                if c else "-"
+            table.add_row(
+                str(h["id"]),
+                str(h["task_id"] if h["task_id"] is not None else "-"),
+                h["agent"], f"[{color}]{h['status']}[/]",
+                h["claim"], crit, h["verdict_note"] or "-",
+            )
+        console.print(table)
+        settled = mem.verified_knowledge(limit=5)
+        if settled:
+            console.print("[bold]Tri thức đã xác thực (mọi agent đều thấy)[/]")
+            for k in settled:
+                color = "green" if k["status"] == "supported" else "red"
+                console.print(f"  [{color}]{k['status'].upper()}[/] {k['claim'][:120]}"
+                              f" — {k['note'][:110]}")
+    finally:
+        mem.close()
+
+
+@app.command()
 def assign_roles() -> None:
     """Print the role assignment for current accounts (dry-run)."""
     settings = _settings()
