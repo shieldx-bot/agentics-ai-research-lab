@@ -29,6 +29,11 @@ def _settings(tmp_path: Path) -> Settings:
     }))
     s = Settings()
     s.accounts_dir = acc
+    # Unit tests must not depend on the machine's runtime backend choice:
+    # .env / lab.yaml may say "hyperbrowser" (datacenter deployments), which
+    # makes _lease() wrap accounts in HyperbrowserClient instead of
+    # PerplexityClient. Pin the raw-socket backend these tests assert on.
+    s.browser_backend = "local"
     return s                                  # default: perplexity-only mode
 
 
