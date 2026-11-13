@@ -78,18 +78,31 @@ class BudgetPolicy:
                     f"{streak} consecutive LLM failures — paused {int(self.cooldown_s)}s")
 
     # ------------------------------------------------------------ state
-    def breaker_open(self, agent: str = "") -> bool:
-        """True while the agent is in its post-failure cooldown."""
+    def breaker_remaining_s(self, agent: str = "") -> float:
+        """Seconds left in the post-failure cooldown (0 = breaker closed).
+
+        The cooldown anchors at the agent's most recent FAILED call, not
+        its last success: with a last-success anchor, one stale ok kept the
+        breaker permanently closed while 0.4ms refusals piled up in
+        llm_usage (live 2026-11-13, llm_usage rows 7-12) — the runaway the
+        breaker exists to bound ran unbounded. Anchored at the last
+        failure, the ladder is strict and fair: while the provider keeps
+        failing the agent gets one real attempt per cooldown window, and a
+        single real answer closes the breaker outright."""
         agent = agent or self.agent_id
         if not agent or self.memory is None or self.cooldown_s <= 0:
-            return False
+            return 0.0
         streak = self.memory.llm_fail_streak(agent)
         if streak < self.fail_streak_limit:
-            return False
-        last_ok = self.memory.last_llm_ok_ts(agent)
-        if last_ok is None:
-            return True                      # never succeeded: stay open
-        return (time.time() - last_ok) < self.cooldown_s
+            return 0.0
+        last_fail = self.memory.last_llm_fail_ts(agent)
+        if last_fail is None:
+            return self.cooldown_s          # streak without rows: arm fully
+        return max(0.0, self.cooldown_s - (time.time() - last_fail))
+
+    def breaker_open(self, agent: str = "") -> bool:
+        """True while the agent is in its post-failure cooldown."""
+        return self.breaker_remaining_s(agent) > 0.0
 
     def status(self) -> dict:
         """Dashboard/CLI snapshot: pool usage vs cap and open breakers."""

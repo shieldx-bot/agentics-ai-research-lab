@@ -808,10 +808,22 @@ class SharedMemory:
         return streak
 
     def last_llm_ok_ts(self, agent: str) -> float | None:
-        """When the agent last got a real answer — breaker cooldown anchor."""
+        """When the agent last got a real answer."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(ts) FROM llm_usage WHERE agent=? AND ok=1", (agent,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def last_llm_fail_ts(self, agent: str) -> float | None:
+        """When the agent's most recent FAILED call happened — the P20
+        breaker cooldown anchor. The window must start when the provider
+        last failed the agent, not when it last succeeded: anchored at the
+        last success, one stale ok made the breaker a permanent no-op while
+        instant refusals piled up (live 2026-11-13)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM llm_usage WHERE agent=? AND ok=0", (agent,)
             ).fetchone()
         return row[0] if row and row[0] else None
 
