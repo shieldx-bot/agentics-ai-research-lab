@@ -761,6 +761,67 @@ def hypotheses(
         mem.close()
 
 
+@app.command("verify-all")
+def verify_all(
+    limit: int = typer.Option(20, "--limit", "-l", help="số claim mới nhất được chạy lại"),
+    timeout: int = typer.Option(120, "--timeout", "-t", help="giới hạn giây mỗi protocol"),
+) -> None:
+    """Owner: tái chạy các claim đã settled từ protocol đã lưu (P23 replay).
+
+    Như một researcher thật lặp lại thí nghiệm cũ: claim giữ nguyên kết luận
+    -> claim_reconfirmed; bị lật ngược -> claim_falsified / claim_overturned
+    (tri thức chung được sửa tự động); không chạy được nữa -> claim_unstable.
+    Mọi kết quả ghi vào bảng evidence dùng chung (method='replay')."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.config import PROJECT_ROOT
+    from agentics.github_ops.repo_workspace import RepoWorkspace
+    from agentics.local_ops import LocalRepo
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.verify.replay import replay_settled
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        pending = mem.settled_hypotheses(limit=limit, require_code=True)
+        if not pending:
+            console.print("[bold]P23 replay[/]: chưa có claim settled nào "
+                          "kèm protocol đã lưu — không có gì để tái chạy.")
+            return
+        console.print(f"[bold]P23 replay[/]: tái chạy {len(pending)} claim "
+                      "settled mới nhất trong workspace owner-replay…")
+        LocalRepo(settings).ensure(src=PROJECT_ROOT)
+        ws = RepoWorkspace("owner-replay", settings)
+        ws.sync_main()
+        reports = replay_settled(mem, ws, limit=limit, agent="owner",
+                                 timeout=timeout)
+        table = Table(title="Re-verification (P23) — settled claims, re-run")
+        table.add_column("Claim", justify="right")
+        table.add_column("Kết luận cũ")
+        table.add_column("Kết luận mới")
+        table.add_column("Sự kiện")
+        table.add_column("Ghi chú", overflow="fold")
+        flipped = 0
+        for r in reports:
+            old = r.get("was", "-")
+            new = r.get("status", "-")
+            if r.get("replayed") and old != new:
+                flipped += 1
+            color = {"claim_reconfirmed": "green", "claim_falsified": "red",
+                     "claim_overturned": "yellow"}.get(r.get("event", ""), "dim")
+            table.add_row(
+                f"h#{r['hyp_id']}", str(old),
+                f"[{color}]{new}[/]" if r.get("replayed") else "-",
+                r.get("event", "-") or "-",
+                (r.get("note") or "")[:160],
+            )
+        console.print(table)
+        console.print(f"[bold]{flipped}[/] claim bị lật kết luận sau khi tái "
+                      "chạy — tri thức chung đã được sửa (xem journal "
+                      "claim_falsified / claim_overturned).")
+    finally:
+        mem.close()
+
+
 @app.command()
 def replay(
     limit: int = typer.Option(5, "--limit", "-l", help="số claim replay trong lần quét này"),

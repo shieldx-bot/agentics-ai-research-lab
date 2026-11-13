@@ -79,7 +79,12 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
                                   "lock_conflict", "task_repair",
                                   "merge_failed", "p16_inconclusive",
                                   "p16_hypothesis_invalid",
-                                  "panel_rejected", "panel_sweep")
+                                  "panel_rejected", "panel_sweep",
+                                  # P23: the swarm's knowledge disagrees
+                                  # with itself, or a settled claim drifted
+                                  "claim_contradiction", "claim_falsified",
+                                  "claim_overturned", "claim_unstable",
+                                  "claim_replay_blocked")
         ][:12],
         "memory": memory.memory_stats(),
         "activity": memory.recent_journal(limit=40),

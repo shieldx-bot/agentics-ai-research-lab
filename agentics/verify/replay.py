@@ -118,5 +118,5 @@ def replay_settled(memory, workspace, limit: int = 20, agent: str = "owner",
                                          agent=agent, timeout=timeout))
         except Exception as exc:  # noqa: BLE001 — never break the sweep
             out.append({"hyp_id": hyp["id"], "replayed": False,
-                        "note": f"sweep error: {exc}"[:200]})
+                        "note": f"sweep error: {type(exc).__name__}: {exc}"[:200]})
     return out

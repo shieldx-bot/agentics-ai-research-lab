@@ -15,6 +15,9 @@ from pathlib import Path
 
 import pytest
 
+from agentics.config import Settings
+from agentics.github_ops.repo_workspace import RepoWorkspace
+from agentics.local_ops import LocalRepo
 from agentics.memory.shared_memory import SharedMemory
 from agentics.verify.replay import replay_hypothesis, replay_settled
 
@@ -165,3 +168,43 @@ def test_replayed_flip_of_the_same_row_is_not_a_contradiction(tmp_path, mem):
     events = _events(mem)
     assert events.count("claim_falsified") == 1
     assert "claim_contradiction" not in events
+
+
+# ------------------------------------------------- real workspace (CLI path)
+def test_replay_sweep_on_a_real_workspace(tmp_path):
+    """The exact sequence `agentics verify-all` runs: real bare origin, real
+    clone, real protocol executions — no fakes."""
+    import subprocess as sp
+
+    def git(cwd, *args):
+        sp.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+    seed = tmp_path / "seed"
+    git(tmp_path, "init", "-b", "main", str(seed))
+    git(seed, "config", "user.email", "t@t")
+    git(seed, "config", "user.name", "t")
+    (seed / "README.md").write_text("seed\n", encoding="utf-8")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-m", "seed")
+
+    settings = Settings(data_dir=tmp_path / "data")
+    settings.ensure_dirs()
+    repo = LocalRepo(settings)
+    repo.ensure(src=seed)
+    ws = RepoWorkspace("owner-replay", settings)
+    ws.sync_main()
+
+    mem = SharedMemory(tmp_path / "mem.db")
+    try:
+        sup = mem.add_hypothesis(
+            "a02", "ensemble reaches >=0.9 precision",
+            {"metric": "precision", "op": ">=", "target": 0.9},
+            status="supported", protocol_code=GOOD_CODE)
+        rep = replay_settled(mem, ws, limit=5, agent="owner")
+        assert len(rep) == 1 and rep[0]["replayed"]
+        assert rep[0]["event"] == "claim_reconfirmed"
+        assert mem.get_hypothesis(sup)["attempts"] >= 1
+        # the replay artifact lives in the workspace, queryable by the owner
+        assert (ws.path / f"experiments/replay_h{sup}.py").exists()
+    finally:
+        mem.close()

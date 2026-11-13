@@ -77,6 +77,12 @@ class Criterion:
 
     @classmethod
     def from_dict(cls, d: dict) -> Criterion:
+        if not isinstance(d, dict):
+            # ValueError, not TypeError: parse_hypothesis (and every caller)
+            # classifies malformed criteria via ValueError and journals them.
+            raise ValueError(  # noqa: TRY004
+                "criterion must be a {metric, op, target} object, "
+                f"got {type(d).__name__}")
         return cls(
             metric=str(d.get("metric", "")),
             op=str(d.get("op", ">=")),
@@ -133,7 +139,7 @@ def _agree(a: Any, b: Any) -> bool:
     """One metric value pair agrees: numbers within noise, text exactly."""
     if isinstance(a, bool) != isinstance(b, bool):
         return False
-    if isinstance(a, bool) or isinstance(a, str) or isinstance(b, str):
+    if isinstance(a, (bool, str)) or isinstance(b, str):
         return a == b
     na, nb = _num(a), _num(b)
     if na is not None and nb is not None:
