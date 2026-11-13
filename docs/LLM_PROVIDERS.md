@@ -3,6 +3,12 @@
 The lab talks to two free web frontends through browser credentials. Both are
 unofficial APIs and can change or break at any time; use your own accounts.
 
+> **Research without any LLM cookie:** since the free-tools commit, a dead
+> cookie pool no longer kills the research node — `node_research` falls back
+> to keyless official APIs (arXiv / OpenAlex / Crossref) that return real
+> publisher metadata, and every finding's BibTeX is grounded in that metadata.
+> See [FREE_TOOLS.md](FREE_TOOLS.md).
+
 ## Perplexity (`LLM_PROVIDER=perplexity`, default)
 
 * Transport: cookie WebSocket (socket.io v4), `agentics/llm/perplexity_client.py`.

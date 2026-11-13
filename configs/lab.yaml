@@ -75,6 +75,18 @@ integrity_interval_s: 20
 # --- Perplexity ------------------------------------------------------------
 pplx_timeout: 180
 
+# --- Free keyless research tools (docs/FREE_TOOLS.md) -------------------------
+# Official publisher APIs (arXiv / OpenAlex / Crossref / HuggingFace /
+# Wikipedia / DuckDuckGo): real metadata, no key. node_research falls back
+# to them when the LLM pools are dead, and every finding's BibTeX is grounded
+# in publisher metadata instead of scraped <title> tags.
+free_tools_enabled: true
+free_tools_timeout: 15
+# Optional polite-pool email for OpenAlex/Crossref (recommended in prod).
+# Keep it commented unless you want YAML to win over FREE_TOOLS_MAILTO in
+# .env — an empty string here would clear the env value.
+# free_tools_mailto: "you@example.org"
+
 # --- Browser backend --------------------------------------------------------
 # "hyperbrowser" = Perplexity cookie sessions run on a Hyperbrowser cloud
 # browser (stealth + residential proxy) — required on datacenter IPs, where
