@@ -217,6 +217,11 @@ async def main() -> None:
                            local, ownership)
     reviewer = build_context("a07", Role.REVIEWER, settings, mem,
                              supervisor.vector, local, ownership)
+    # P19 needs a PANEL: quorum accept votes (default 2) from DIFFERENT
+    # agents, and P24bis spends a reviewer cycle on replication first — one
+    # lone reviewer can never reach quorum, so the demo fields two.
+    reviewer2 = build_context("a08", Role.REVIEWER, settings, mem,
+                              supervisor.vector, local, ownership)
     integrator = build_context("a09", Role.INTEGRATOR, settings, mem,
                                supervisor.vector, local, ownership)
 
@@ -262,10 +267,12 @@ async def main() -> None:
     await run_cycle(writer)
     show(mem, "after writer cycle")
 
-    # 6) reviewer cross-reviews both MRs ----------------------------------------
-    await run_cycle(reviewer)
-    await run_cycle(reviewer)
-    show(mem, "after reviews (both MRs approved)")
+    # 6) reviewers cross-review both MRs (P5) + replicate settled claims (P24bis)
+    #    Rounds alternate the two reviewers until BOTH panels reach quorum.
+    for _ in range(4):
+        await run_cycle(reviewer)
+        await run_cycle(reviewer2)
+    show(mem, "after reviews (panel voted both MRs)")
 
     # 7) integrator drains the queue ----------------------------------------------
     await run_cycle(integrator)
@@ -283,7 +290,8 @@ async def main() -> None:
         capture_output=True, text=True).stdout.strip()
     print(f"\nmain history on the local bare repo:\n{log}")
 
-    for ctx in (supervisor, researcher, coder, writer, reviewer, integrator):
+    for ctx in (supervisor, researcher, coder, writer, reviewer, reviewer2,
+                integrator):
         ctx.meta["personal"].close()
     mem.close()
 
