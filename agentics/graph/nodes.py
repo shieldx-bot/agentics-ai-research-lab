@@ -920,6 +920,12 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             state["changed_files"] = sorted(
                 set(state.get("changed_files") or []) | {hyp.script_path})
             note = (ev.meta.get("note") or ev.output[:160]) if ev.meta else ev.output[:160]
+            # the verdict rides the MR body too: the reviewer and the owner
+            # see it in the verification line, not only in the evidence table
+            state["verification"] = (
+                f"{state.get('verification', '')} | "
+                f"P16 {hyp.hypothesis_id}: {ev.verdict} ({note[:120]})"
+            )[:500]
             if ev.verdict == "refuted":
                 return await _yield(
                     ctx, state,
