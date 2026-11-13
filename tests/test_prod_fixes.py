@@ -347,7 +347,10 @@ def _mem_ctx(tmp_path, role, llm):
         vector=SimpleNamespace(available=False),
         llm=llm,
         meta={"personal": FakePersonal()},
-        settings=SimpleNamespace(research_topic="NFV automation"),
+        # free tools off: these tests pin the LLM-only behaviour — the
+        # fallback path (enabled) has its own suite in test_free_tools.py
+        settings=SimpleNamespace(research_topic="NFV automation",
+                                 free_tools_enabled=False),
         heartbeat=lambda status="working": None,
         report=lambda **k: None,
     )

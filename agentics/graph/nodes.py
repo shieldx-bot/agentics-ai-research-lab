@@ -32,6 +32,7 @@ from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
+from agentics.research import free_tools
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
 from agentics.verify_ops import (
@@ -337,6 +338,85 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
+# ---------------------------------------------------------------- research helpers
+async def _grounded_bibtex(ctx: AgentContext, urls: list[str]) -> str:
+    """BibTeX from REAL publisher metadata (arXiv/Crossref) with a safe
+    fallback to the legacy <title> scrape for unknown URLs — grounded
+    citations beat scraped ones, but a broken source must never break the
+    cycle (docs/FREE_TOOLS.md)."""
+    try:
+        return await free_tools.enriched_bibtex(list(urls), settings=ctx.settings)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[%s] bibtex grounding fell back to legacy: %s", ctx.agent_id, exc)
+        return cite_fmt.to_bibtex(cite_fmt.parse_citations(list(urls)))
+
+
+async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
+                           answer: str, citations: list[str], source: str) -> ResearchState:
+    """Shared tail of node_research: persist the finding and route the cycle.
+
+    One code path for both evidence sources (LLM cookies and the free
+    keyless APIs) so shared memory / vector store rows keep the exact same
+    shape regardless of where the metadata came from."""
+    state["papers"] = [{"title": topic, "answer": answer}]
+    state["citations"] = list(citations)
+    title = f"Findings: {topic}"
+    content = f"{answer[:6000]}\n\n## BibTeX\n\n{state['bibtex'][:3000]}"
+    fid = await asyncio.to_thread(
+        ctx.memory.add_finding,
+        ctx.agent_id, title, content, list(citations), state.get("issue_number"),
+    )
+    await asyncio.to_thread(
+        ctx.vector.add, content,
+        {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
+    )
+    await asyncio.to_thread(
+        ctx.memory.post_message,
+        ctx.agent_id, "broadcast",
+        f"New finding #{fid} on '{topic}' with {len(citations)} citations (source: {source}).",
+        state.get("issue_number"),
+    )
+    if ctx.role == Role.RESEARCHER:
+        # P16bis (H2): the finding's claims must be VERIFIED by running code,
+        # not trusted because an LLM wrote them — the cycle continues into
+        # node_verify, which pre-registers hypotheses and adjudicates.
+        state["finding_id"] = fid
+        state["finding_text"] = content[:4000]
+        state["action"] = "verify"
+    else:
+        state["action"] = "plan"
+    return state
+
+
+async def _free_tools_fallback(ctx: AgentContext, state: ResearchState,
+                               topic: str, reason: str) -> ResearchState:
+    """LLM unavailable -> real-metadata research via the free keyless APIs.
+
+    arXiv/OpenAlex/Crossref ground the finding in verifiable metadata so a
+    dead cookie pool no longer wastes the whole cycle (docs/FREE_TOOLS.md).
+    When the free tools are disabled (or every source comes up empty) the
+    original degrade-to-error behaviour is preserved exactly."""
+    if not getattr(ctx.settings, "free_tools_enabled", True):
+        state["error"] = reason or "research unavailable"
+        state["done"] = True
+        return state
+    try:
+        fb = await free_tools.fallback_research(topic, settings=ctx.settings)
+    except Exception as exc:  # noqa: BLE001 — a source outage must not crash the cycle
+        log.warning("[%s] free-tools fallback failed: %s", ctx.agent_id, exc)
+        fb = None
+    if fb is None or not fb.ok:
+        state["error"] = reason or "research unavailable (free-tools fallback empty)"
+        state["done"] = True
+        return state
+    log.info("[%s] research continued via free tools (%s)", ctx.agent_id, reason)
+    acc = getattr(ctx.llm, "account", None)
+    ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
+    ctx.meta["research_source"] = "free-tools"
+    state["bibtex"] = fb.bibtex
+    return await _finish_research(ctx, state, topic, fb.answer, fb.citations, "free-tools")
+
+
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings.
 
@@ -364,48 +444,25 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         return state
 
     if ctx.llm is None:
-        state["error"] = "no LLM account available"
-        state["done"] = True
-        return state
+        return await _free_tools_fallback(ctx, state, topic,
+                                          reason="no LLM account available")
+    resp = None
+    llm_error = ""
     try:
         resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
         log.warning("[%s] research llm call failed: %s", ctx.agent_id, exc)
-        state["error"] = f"research llm call failed: {exc}"
-        state["done"] = True
-        return state
+        llm_error = f"research llm call failed: {exc}"
+    if resp is None or not resp.ok:
+        return await _free_tools_fallback(
+            ctx, state, topic,
+            reason=llm_error or "research llm returned an empty answer",
+        )
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
-    state["papers"] = [{"title": topic, "answer": resp.answer}]
-    state["citations"] = list(resp.citations)
-    state["bibtex"] = cite_fmt.to_bibtex(cite_fmt.parse_citations(resp.citations))
-
-    title = f"Findings: {topic}"
-    content = f"{resp.answer[:6000]}\n\n## BibTeX\n\n{state['bibtex'][:3000]}"
-    fid = await asyncio.to_thread(
-        ctx.memory.add_finding,
-        ctx.agent_id, title, content, resp.citations, state.get("issue_number"),
-    )
-    await asyncio.to_thread(
-        ctx.vector.add, content,
-        {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
-    )
-    await asyncio.to_thread(
-        ctx.memory.post_message,
-        ctx.agent_id, "broadcast",
-        f"New finding #{fid} on '{topic}' with {len(resp.citations)} citations.",
-        state.get("issue_number"),
-    )
-    if ctx.role == Role.RESEARCHER:
-        # P16bis (H2): the finding's claims must be VERIFIED by running code,
-        # not trusted because an LLM wrote them — the cycle continues into
-        # node_verify, which pre-registers hypotheses and adjudicates.
-        state["finding_id"] = fid
-        state["finding_text"] = content[:4000]
-        state["action"] = "verify"
-    else:
-        state["action"] = "plan"
-    return state
+    ctx.meta["research_source"] = "llm"
+    state["bibtex"] = await _grounded_bibtex(ctx, resp.citations)
+    return await _finish_research(ctx, state, topic, resp.answer, resp.citations, "llm")
 
 
 # ---------------------------------------------------------------- verify (P16bis)
