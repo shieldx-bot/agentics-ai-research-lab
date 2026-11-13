@@ -144,6 +144,13 @@ class Settings:
     # P13 — per-file lock TTL in the swarm (anti "hai agent đè tay nhau").
     file_lock_ttl_minutes: int = field(
         default_factory=lambda: _env_int("FILE_LOCK_TTL_MINUTES", 30))
+    # P18 — peer panel review (đánh giá lẫn nhau): how many cross-reviewers
+    # must unanimously accept before an MR passes, and how long the author has
+    # to defend their point once ONE reject vote opens the defense round.
+    peer_panel_size: int = field(
+        default_factory=lambda: _env_int("PEER_PANEL_SIZE", 2))
+    peer_defense_ttl_minutes: int = field(
+        default_factory=lambda: _env_int("PEER_DEFENSE_TTL_MINUTES", 30))
     # P10 layer 4 — integrity self-healing sweep interval (0 = off).
     integrity_interval_s: int = field(
         default_factory=lambda: _env_int("INTEGRITY_INTERVAL_S", 20))
