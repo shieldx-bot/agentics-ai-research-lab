@@ -9,6 +9,11 @@ evolution_every_n_cycles: 10   # 0 = never open self-evolution issues
 
 # --- Research ------------------------------------------------------------
 research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core automation"
+# P18b research fan-out (agentics/graph/nodes.py): > 1 asks complementary
+# angles (benchmarks / open problems) IN PARALLEL on other Hyperbrowser
+# tokens of the pool — 2 = survey + 1 angle, 3 = all three. Every angle
+# passes the P20 budget gate; 1 disables the fan-out entirely.
+research_fanout: 2
 
 # --- Role assignment ------------------------------------------------------
 # Fixed mapping account index (1-based) -> role.

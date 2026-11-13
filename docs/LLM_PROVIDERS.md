@@ -186,6 +186,23 @@ Scaling in cloud-browser mode (P18 token pool):
 * offline unit tests never create sessions; live check:
   `HB_API_KEYS=tk1,tk2,tk3 python scripts/live_research_run.py`
 
+Research fan-out (P18b, `research_fanout` in `configs/lab.yaml` or
+`RESEARCH_FANOUT`):
+
+* when > 1, `node_research` asks complementary angles — benchmarks &
+  datasets, limitations & open problems — IN PARALLEL, each on a different
+  pool identity (a different Hyperbrowser token with the P18 pool, or a
+  different cookie account on the local backend). The angle views wrap
+  round-robin from the agent's own token and are capped at pool size − 1,
+  so an angle never queues behind an ask already running on the same
+  identity.
+* all answers merge into ONE finding (survey first, angles under their own
+  headings, citations deduped) feeding one batched BibTeX grounding call;
+  the P20 budget gate and usage ledger apply to every angle; the fan-out
+  is journalled per agent (`research_fanout` event, meta `research_fanout`).
+* `1` disables the fan-out (legacy single-ask behavior — the safe default;
+  `configs/lab.yaml` ships with `research_fanout: 2` = survey + 1 angle).
+
 ### Failure handling
 
 * A missing composer is not automatically treated as a bad cookie. The client

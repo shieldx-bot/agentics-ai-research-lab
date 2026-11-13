@@ -244,6 +244,13 @@ class Settings:
     # Optional polite-pool contact for OpenAlex/Crossref (a plain email).
     # Not required, but it puts the calls in the friendlier rate-limit tier.
     free_tools_mailto: str = field(default_factory=lambda: _env("FREE_TOOLS_MAILTO"))
+    # P18b research fan-out: when > 1, node_research asks complementary
+    # angles (survey / benchmarks / open problems) IN PARALLEL — each extra
+    # angle runs on a different Hyperbrowser token of the pool (or a
+    # different cookie account on the local backend). Results merge into one
+    # finding; every angle still passes the P20 budget gate and the fan-out
+    # is journalled. 1 keeps the single-ask behaviour.
+    research_fanout: int = field(default_factory=lambda: _env_int("RESEARCH_FANOUT", 1))
 
     @property
     def owner(self) -> str:

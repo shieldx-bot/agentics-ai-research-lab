@@ -509,6 +509,115 @@ async def _grounded_bibtex(ctx: AgentContext, urls: list[str]) -> str:
         return cite_fmt.to_bibtex(cite_fmt.parse_citations(list(urls)))
 
 
+# ---------------------------------------------------------------- research fan-out (P18b)
+_FANOUT_ANGLES = (
+    ("benchmarks & datasets",
+     "Focus on benchmark suites, public datasets and reproducible evaluation "
+     "protocols for the topic. Name concrete datasets and metric numbers."),
+    ("limitations & open problems",
+     "Focus on failure modes, limitations, negative results and open research "
+     "problems reported for the topic. Cite the papers that report them."),
+)
+
+
+def _fanout_views(ctx: AgentContext, n_extra: int) -> list:
+    """One extra BrowserSessionHost view per research angle, each on a
+    DIFFERENT pool identity than the agent's own pinned view — with the P18
+    token pool that is a different Hyperbrowser token (a genuinely parallel
+    cloud session); on the local websocket backend it is a different cookie
+    account. Fewer slots than angles -> fewer angles, never contention."""
+    host = ctx.llm
+    if host is None or not hasattr(host, "view"):
+        return []
+    backend = (getattr(ctx.settings, "browser_backend", "") or "local").lower()
+    if backend == "hyperbrowser":
+        capacity = max(1, len(getattr(ctx.settings, "hyperbrowser_api_keys", None) or []))
+    else:
+        try:
+            capacity = len(host.pools["perplexity"].accounts) or 1
+        except Exception:  # noqa: BLE001 — probing the pool must not break research
+            capacity = 1
+    if capacity < 2 or n_extra < 1:
+        return []                       # a single identity cannot fan out
+    base = getattr(host, "prefer_index", 0) or 0
+    views = []
+    for k in range(1, min(n_extra + 1, capacity)):
+        views.append(host.view(prefer_index=(base + k) % capacity))
+    return views
+
+
+async def _fanout_angles(ctx: AgentContext, base_query: str, n_extra: int,
+                         budget) -> list[tuple[str, object]]:
+    """Run the complementary research angles in parallel on the extra views.
+
+    Every angle passes the same P20 budget gate as the primary ask and is
+    recorded in the usage ledger; a blocked, failed or empty angle simply
+    contributes nothing instead of breaking the finding."""
+    views = _fanout_views(ctx, n_extra)
+    if not views:
+        return []
+
+    async def one(view, angle):
+        label, hint = angle
+        if budget is not None:
+            allowed, why = budget.can_ask(ctx.agent_id)
+            if not allowed:
+                log.info("[%s] fan-out angle '%s' skipped by budget: %s",
+                         ctx.agent_id, label, why)
+                return None
+        started = time.monotonic()
+        try:
+            r = await papers_mod.search_papers(
+                view,
+                f"{base_query}\n\n[Angle: {label}] {hint}",
+                purpose="research")
+        except Exception as exc:  # noqa: BLE001 — one angle must not kill the finding
+            log.warning("[%s] fan-out angle '%s' failed: %s", ctx.agent_id, label, exc)
+            return None
+        if budget is not None:
+            budget.record(ctx.agent_id, "research", bool(r and r.ok),
+                          time.monotonic() - started)
+        if r is None or not r.ok:
+            return None
+        return label, r
+
+    results = await asyncio.gather(
+        *(one(v, a) for v, a in zip(views, _FANOUT_ANGLES[:len(views)])))
+    ran = [r for r in results if r is not None]
+    if ran:
+        ctx.meta["research_fanout"] = 1 + len(ran)
+        try:
+            ctx.memory.journal(ctx.agent_id, "research_fanout",
+                               {"angles": [label for label, _ in ran]})
+        except Exception:  # noqa: BLE001 — telemetry must never gate harder
+            pass
+    return ran
+
+
+def _merge_research(primary, extras: list[tuple[str, object]]):
+    """Merge parallel angle answers into the primary finding: primary text
+    first, then each angle under its own heading; citations deduped in
+    order. The merged shape is exactly the LLMResponse the rest of the
+    pipeline already consumes."""
+    from agentics.llm.perplexity_client import LLMResponse
+
+    parts = [primary.answer.rstrip()]
+    citations = list(primary.citations)
+    seen = set(citations)
+    for label, r in extras:
+        parts.append(f"## Supplementary angle — {label}\n{r.answer.strip()}")
+        for c in r.citations:
+            if c and c not in seen:
+                seen.add(c)
+                citations.append(c)
+    return LLMResponse(
+        answer="\n\n".join(parts),
+        citations=citations,
+        raw=getattr(primary, "raw", None),
+        elapsed_s=getattr(primary, "elapsed_s", 0.0),
+    )
+
+
 async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
                            answer: str, citations: list[str], source: str) -> ResearchState:
     """Shared tail of node_research: persist the finding and route the cycle.
@@ -638,6 +747,17 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
             ctx, state, topic,
             reason=llm_error or "research llm returned an empty answer",
         )
+    # P18b fan-out: extra complementary angles asked in PARALLEL on other
+    # pool identities (different Hyperbrowser tokens / cookie accounts).
+    # Each angle is budget-gated; the merged answer feeds the same finding
+    # pipeline (deduped citations -> one batched BibTeX grounding call).
+    fanout = max(1, int(getattr(ctx.settings, "research_fanout", 1) or 1))
+    if fanout > 1:
+        extras = await _fanout_angles(ctx, query, fanout - 1, budget)
+        if extras:
+            log.info("[%s] research fan-out merged %d extra angle(s)",
+                     ctx.agent_id, len(extras))
+            resp = _merge_research(resp, extras)
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     ctx.meta["research_source"] = "llm"
