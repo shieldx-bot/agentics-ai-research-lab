@@ -541,6 +541,47 @@ def evidence(
 
 
 @app.command()
+def audit(
+    event: str = typer.Option("", "--event", "-e", help="lọc theo loại sự kiện (merge/mr_reject/task_exempt_set/...)"),
+    limit: int = typer.Option(50, "--limit", "-l", help="số dòng tối đa"),
+) -> None:
+    """Owner: nhật ký kiểm toán bất biến (P19) — merge, từ chối merge, miễn
+    protected path, re-verdict bằng chứng. Bảng này KHÔNG BAO GIỜ bị trim:
+    đối chiếu sau sự cố vẫn đầy đủ dù journal vận hành đã cắt gọn."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        rows = mem.audit_recent(limit=limit)
+        if event:
+            rows = [r for r in rows if r["event"] == event]
+        total = mem.audit_count()
+        console.print(f"[bold]Audit trail (P19)[/] — {total} dòng bất biến, "
+                      f"hiện {len(rows)} mới nhất")
+        table = Table(title="Immutable audit log")
+        table.add_column("ID", justify="right")
+        table.add_column("Thời điểm", justify="right")
+        table.add_column("Agent")
+        table.add_column("Sự kiện")
+        table.add_column("Chi tiết", overflow="fold")
+        import json as _json
+        import time as _time
+        for r in reversed(rows):
+            try:
+                detail = _json.dumps(_json.loads(r["detail"]), ensure_ascii=False)
+            except Exception:  # noqa: BLE001
+                detail = r["detail"]
+            table.add_row(
+                str(r["id"]), str(int(r["ts"])), r["agent"], r["event"], detail,
+            )
+        console.print(table)
+    finally:
+        mem.close()
+
+
+@app.command()
 def hypotheses(
     status: str = typer.Option("", "--status", "-s",
                                help="chỉ hiện 1 trạng thái (supported/refuted/...)"),

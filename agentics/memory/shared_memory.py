@@ -205,7 +205,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 CREATE INDEX IF NOT EXISTS idx_findings_issue ON findings(issue);
 CREATE INDEX IF NOT EXISTS idx_journal_agent ON journal(agent);
 CREATE INDEX IF NOT EXISTS idx_evidence_agent ON evidence(agent);
--- P18 — peer panel review: agents evaluate each OTHER's MRs by vote. The
+-- P19 — peer panel review: agents evaluate each OTHER's MRs by vote. The
 -- panel state machine lives here so every thread (and the dashboard) reads
 -- the same truth: who voted, what was objected, what was defended.
 CREATE TABLE IF NOT EXISTS mr_panels (
@@ -567,7 +567,18 @@ class SharedMemory:
                 "UPDATE evidence SET verdict=?, note=?, verdict_by=? WHERE id=?",
                 (verdict, note[:600], by[:64], ev_id),
             )
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+        if changed:
+            # P19 — immutable audit: overwriting a verdict is exactly the kind
+            # of action a production audit trail exists for (who re-judged
+            # what, when, and on what grounds).
+            try:
+                self.audit(by or "system", "evidence_reverdict", {
+                    "evidence_id": ev_id, "verdict": verdict,
+                    "note": note[:300]})
+            except Exception:  # noqa: BLE001 — audit must never gate the update
+                pass
+        return changed
 
     def _evidence_row(self, r) -> dict:
         return {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
@@ -1175,6 +1186,13 @@ class SharedMemory:
         if changed:
             self.journal(agent, "task_exempt_set" if exempt else "task_exempt_cleared",
                          {"task": task_id})
+            # P19 — immutable audit: lifting a protected-path exemption is a
+            # security decision; it must be traceable after the journal trims.
+            try:
+                self.audit(agent, "task_exempt_set" if exempt else "task_exempt_cleared",
+                           {"task": task_id})
+            except Exception:  # noqa: BLE001
+                pass
 
     def task_counts(self) -> dict[str, int]:
         with self._lock:
@@ -1274,12 +1292,21 @@ class SharedMemory:
         Only a changes_requested MR authored by ``agent`` is reopened; reviewer
         fields are cleared so the (possibly different) reviewer starts fresh.
         The task goes back to in_review if it was parked elsewhere.
+
+        P19: an MR whose panel is in the defense round can NOT be reopened —
+        the author must submit the defense (submit_defense); silently flipping
+        the MR back to 'open' would bypass the panel's veto.
         """
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT author, status, task_id FROM reviews WHERE id=?", (mr_id,)
             ).fetchone()
             if row is None or row[1] != "changes_requested":
+                return False
+            panel = self._conn.execute(
+                "SELECT state FROM mr_panels WHERE mr_id=?", (mr_id,)
+            ).fetchone()
+            if panel is not None and panel[0] == "defense":
                 return False
             author, _, task_id = row
             self._conn.execute(
@@ -1292,11 +1319,11 @@ class SharedMemory:
         self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
         return True
 
-    # ------------------------------------------------------------ P18 peer panels
+    # ------------------------------------------------------------ P19 peer panels
     def ensure_panel(self, mr_id: int, opened_ts: float | None = None) -> dict:
         """Create the panel row for an MR if missing (voting, round 1); return it.
 
-        Idempotent and lazy: legacy MRs opened before P18 get a panel the first
+        Idempotent and lazy: legacy MRs opened before P19 get a panel the first
         time any reviewer touches them, so no migration backfill is needed."""
         with self._lock, self._conn:
             self._conn.execute(

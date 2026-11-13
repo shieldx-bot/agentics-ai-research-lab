@@ -1,4 +1,4 @@
-"""P18 — the peer panel engine: the mechanical rulebook.
+"""P19 — the peer panel engine: the mechanical rulebook.
 
 Owner's contract being tested here:
   * agents vote on each OTHER's MRs; the author can never vote (P5);

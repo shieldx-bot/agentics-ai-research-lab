@@ -27,6 +27,7 @@ from agentics.memory.personal_memory import PersonalMemory
 from agentics.policies.budget import BudgetPolicy
 from agentics.memory.shared_memory import SharedMemory
 from agentics.memory.vector_store import VectorStore
+from agentics.peer_review import PeerPanel
 from agentics.policies.ownership import OwnershipPolicy
 from agentics.graph.research_graph import run_cycle
 from agentics.stop import should_stop
@@ -164,6 +165,11 @@ class Orchestrator:
                     fail_streak_limit=self.settings.llm_fail_streak_limit,
                     cooldown_s=self.settings.llm_breaker_cooldown_s,
                     agent_id=agent_id,
+                ),
+                panel=PeerPanel(
+                    self.memory,
+                    panel_size=self.settings.peer_panel_size,
+                    defense_ttl_minutes=self.settings.peer_defense_ttl_minutes,
                 ),
                 meta={"account": getattr(first, "name", "shared"), "personal": personal},
             )

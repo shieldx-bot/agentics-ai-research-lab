@@ -151,7 +151,8 @@ def test_reviewer_fast_rejects_branch_with_unreported_protected_files(lab, monke
     assert state["review_verdict"] == "request_changes"
     assert "P10 protected paths" in state["review_comment"]
     assert "agentics/sneak.py" in state["review_comment"]
-    assert lab.mem.get_review(mr_id)["status"] == "changes_requested"
+    assert lab.mem.get_panel(mr_id)["state"] == "defense"   # P19: author must defend
+    assert lab.mem.get_review(mr_id)["status"] == "open"
     assert lab.mem.mq_pending() == []
 
 
@@ -256,4 +257,4 @@ def test_layer4_honors_owner_exemption_but_never_accounts(lab):
     state2 = asyncio.run(nodes.node_review(ctx2, {}))
     assert state2["review_verdict"] == "request_changes"
     assert "accounts/cookies.json" in state2["review_comment"]
-    assert lab.mem.get_review(mr2)["status"] == "changes_requested"
+    assert lab.mem.get_panel(mr2)["state"] == "defense"     # P19: author must defend

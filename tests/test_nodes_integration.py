@@ -486,7 +486,7 @@ def test_reviewer_approves_foreign_mr_and_enqueues(mem, monkeypatch):
     assert state["review_verdict"] == "approve"
     assert enqueued == [(mr_id, "a04")]
     review = mem.get_review(mr_id)
-    assert review["status"] == "approved" and review["approved_by"] == "a07"
+    assert review["status"] == "approved" and "a07" in review["approved_by"]
     assert any(j["event"] == "review" for j in mem.recent_journal())
 
 
@@ -497,13 +497,15 @@ def test_reviewer_never_reviews_own_mr(mem):
 
 
 def test_reviewer_cannot_approve_mr_touching_protected_paths(mem, monkeypatch):
-    """P10 layer 3 (review side): an 'approve' is downgraded on protected diffs."""
+    """P10 layer 3 (review side): the reject vote opens the defense round —
+    the MR can never pass while the objection stands (P19)."""
     mr_id = _mr(mem, author="a04", files=("agentics/policies/claims.py",))
     _llm_json(monkeypatch, payload={"verdict": "approve", "comment": "ok"})
     state = asyncio.run(nodes.node_review(_ctx(mem, role=Role.REVIEWER, agent_id="a07"), {}))
     assert state["review_verdict"] == "request_changes"
     assert "P10 protected paths" in state["review_comment"]
-    assert mem.get_review(mr_id)["status"] == "changes_requested"
+    assert mem.get_panel(mr_id)["state"] == "defense"      # author must defend
+    assert mem.get_review(mr_id)["status"] == "open"
     assert mem.mq_pending() == []
 
 
@@ -512,9 +514,10 @@ def test_requested_changes_recorded_for_author(mem, monkeypatch):
     _llm_json(monkeypatch, payload={"verdict": "request_changes", "comment": "tests missing"})
     state = asyncio.run(nodes.node_review(_ctx(mem, role=Role.REVIEWER, agent_id="a07"), {}))
     assert state["review_verdict"] == "request_changes"
-    review = mem.get_review(mr_id)
-    assert review["status"] == "changes_requested"
-    assert "tests missing" in review["verdict_comment"]
+    assert mem.get_panel(mr_id)["state"] == "defense"
+    objections = mem.panel_objections(mr_id, round=1)
+    assert [o["voter"] for o in objections] == ["a07"]
+    assert "tests missing" in objections[0]["objection"]
 
 
 # ------------------------------------------------------------ integrate (local)

@@ -20,6 +20,7 @@ from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role
 from agentics.graph.nodes import (
     node_claim,
+    node_defend,
     node_implement,
     node_integrate,
     node_open_pr,
@@ -30,6 +31,7 @@ from agentics.graph.nodes import (
     node_scan,
     node_start,
     node_verify,
+    pending_defense,
 )
 from agentics.graph.state import ResearchState
 
@@ -73,12 +75,24 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
         return await node_review(ctx, state)
 
     g.add_node("review", review_node)
+
+    async def defend_node(state: ResearchState) -> ResearchState:
+        return await node_defend(ctx, state)
+
+    g.add_node("defend", defend_node)
     g.add_node("integrate", lambda s: node_integrate(ctx, s))
     g.add_node("reflect", lambda s: node_reflect(ctx, s))
 
     g.set_entry_point("start")
 
     def route_from_start(state: ResearchState) -> str:
+        # P19: defending my challenged MR outranks every default role action —
+        # one unanswered objection rejects the MR, so the author goes first.
+        try:
+            if pending_defense(ctx) is not None:
+                return "defend"
+        except Exception:  # noqa: BLE001 — a routing read must never kill the cycle
+            pass
         return {
             Role.SUPERVISOR: "scan",
             Role.RESEARCHER: "research",
@@ -90,7 +104,8 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
 
     g.add_conditional_edges("start", route_from_start, {
         "scan": "scan", "research": "research", "claim": "claim",
-        "review": "review", "integrate": "integrate", "reflect": "reflect",
+        "review": "review", "integrate": "integrate", "defend": "defend",
+        "reflect": "reflect",
     })
     g.add_edge("scan", "reflect")
     # A node that sets `done` (nothing to do, lost a race, yielded) or `error` must
@@ -140,6 +155,8 @@ def _node_digest(node: str, out: dict) -> str:
         return f"{head}opened MR !{out.get('pr_number')}"
     if node == "review":
         return f"reviewed !{out.get('pr_number', '')}: {out.get('review_verdict', '')}"[:200]
+    if node == "defend":
+        return f"defended !{out.get('pr_number', '')}: {out.get('defense_outcome', '')}"[:200]
     if node == "integrate":
         return f"merged {out.get('summary', '')}"[:200]
     if out.get("error"):
@@ -153,7 +170,8 @@ def _node_payload(node: str, out: dict) -> dict:
     """Structured fields for the journal row (dashboards filter on these)."""
     payload: dict = {"node": node, "action": out.get("action", "")}
     for key in ("issue_number", "pr_number", "yield_reason",
-                "experiment_verdict", "mechanical_review", "review_verdict"):
+                "experiment_verdict", "mechanical_review", "review_verdict",
+                "panel_decision", "defense_outcome", "panel_digest"):
         if out.get(key):
             payload[key] = out[key]
     if out.get("error"):

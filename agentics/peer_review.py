@@ -1,4 +1,4 @@
-"""P18 — the peer panel: agents evaluate each OTHER's work by vote.
+"""P19 — the peer panel: agents evaluate each OTHER's work by vote.
 
 Motivation (owner): "cải tiến cơ chế tự đánh giá lẫn nhau, nhằm cải thiện
 kết quả chung — nếu kết quả bỏ phiếu chỉ cần agent không chấp nhận, hoặc
@@ -119,7 +119,7 @@ class PeerPanel:
         if panel["state"] == DEFENSE and panel["due_ts"]:
             left = max(0, int(panel["due_ts"] - self._now()))
             due = f", defense due in {left // 60}m"
-        return (f"P18 panel !#{mr_id} r{panel['round']} {panel['state']} "
+        return (f"P19 panel !#{mr_id} r{panel['round']} {panel['state']} "
                 f"[{breakdown}]{due}")
 
     # ------------------------------------------------------------ voting
@@ -148,11 +148,15 @@ class PeerPanel:
         if vote == "reject":
             self.memory.record_panel_objection(
                 mr_id, panel["round"], voter, reason or "no reason given")
-        return self.tally(mr_id)
+        return self.tally(mr_id, note=reason if vote == "accept" else "")
 
     # ------------------------------------------------------------ tally
-    def tally(self, mr_id: int) -> PanelDecision:
-        """Apply the panel rules to the CURRENT round's votes."""
+    def tally(self, mr_id: int, note: str = "") -> PanelDecision:
+        """Apply the panel rules to the CURRENT round's votes.
+
+        ``note`` is the deciding voter's comment — it rides the MR record so
+        the owner sees WHY the panel said yes (e.g. the mechanical tier-2
+        prefix and the P16 evidence digest)."""
         mr = self._mr(mr_id)
         panel = self.memory.get_panel(mr_id)
         if mr is None or panel is None:
@@ -179,7 +183,7 @@ class PeerPanel:
             eligible = self.eligible_voters(mr["author"])
             quorum = min(self.panel_size, len(eligible))
             if accepts and len(accepts) >= quorum:
-                return self._approve(mr_id, [v["voter"] for v in accepts])
+                return self._approve(mr_id, [v["voter"] for v in accepts], note=note)
             return PanelDecision(OUT_WAITING, mr_id,
                                  reason=f"{len(accepts)}/{quorum} accept votes",
                                  panel=panel, votes=votes)
@@ -202,12 +206,15 @@ class PeerPanel:
                                  reason=f"awaiting re-vote from {unswung}",
                                  panel=panel, votes=votes)
         return self._approve(mr_id, list(dict.fromkeys(
-            [v["voter"] for v in self.memory.panel_votes(mr_id) if v["vote"] == "accept"])))
+            [v["voter"] for v in self.memory.panel_votes(mr_id) if v["vote"] == "accept"])),
+            note=note)
 
-    def _approve(self, mr_id: int, voters: list[str]) -> PanelDecision:
+    def _approve(self, mr_id: int, voters: list[str], note: str = "") -> PanelDecision:
         by = f"panel[{','.join(voters)[:200]}]"
-        self.memory.set_review_verdict(mr_id, "approved", by,
-                                       f"P18 unanimous panel: {voters}")
+        comment = f"P19 unanimous panel: {voters}"
+        if note.strip():
+            comment = f"{comment} — {note[:400]}"
+        self.memory.set_review_verdict(mr_id, "approved", by, comment)
         self.memory.set_panel(mr_id, state=APPROVED, clear_due=True)
         self.memory.set_trace_outcome(mr_id, "approved")
         panel = self.memory.get_panel(mr_id)
@@ -232,7 +239,7 @@ class PeerPanel:
                              "task": (mr or {}).get("task_id")})
         self.memory.post_message(
             by, "alert",
-            f"P18 panel REJECTED MR #{mr_id} (final): {reason[:200]}",
+            f"P19 panel REJECTED MR #{mr_id} (final): {reason[:200]}",
             (mr or {}).get("task_id"),
         )
         panel = self.memory.get_panel(mr_id)
@@ -283,7 +290,7 @@ class PeerPanel:
                             {"mr": mr_id, "covers": list(rebuttals)[:10]})
         self.memory.post_message(
             author, "broadcast",
-            f"P18 defense of MR #{mr_id} submitted — objectors {list(rebuttals)[:5]} "
+            f"P19 defense of MR #{mr_id} submitted — objectors {list(rebuttals)[:5]} "
             "re-vote now (one reject ends the MR).",
             mr.get("task_id"),
         )
