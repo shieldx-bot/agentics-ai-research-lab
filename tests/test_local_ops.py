@@ -384,3 +384,45 @@ def test_drain_survives_a_broken_layer4_rescan(mem):
                           merge=lambda m: True, scan_branch=broken_scan)
     assert drained == 1                            # fell back, merged anyway
     assert mem.get_review(mr)["status"] == "merged"
+
+
+def test_no_integrator_drain_does_not_burn_merge_attempts(mem):
+    """Draining the queue while no Integrator is wired must not pre-spend the
+    MAX_ATTEMPTS budget — the MR's first REAL conflict still gets the full
+    retries instead of failing as 'not mergeable after 3 attempts'."""
+    tid = mem.create_task("no integrator yet")
+    mr = mem.open_review(tid, "MR", "body", author="a04",
+                         branch="agent/a04/task-1-x", files=[])
+    mem.mq_enqueue(mr, author="a04")
+    queue = LocalMergeQueue(mem, auto_merge=True, guard=ProtectedPathsGuard())
+    queue.drain("a09", verify=lambda m: (True, ""))     # no merge callback
+    queue.drain("a09", verify=lambda m: (True, ""))     # ...again
+    assert mem.mq_pending()[0]["attempts"] == 0         # nothing was attempted
+    assert queue.drain("a09", verify=lambda m: (True, ""),
+                       merge=lambda m: False) == 0      # real attempt 1
+    assert mem.mq_pending()[0]["attempts"] == 1         # budget counts real tries
+    assert mem.get_review(mr)["status"] == "open"       # not failed mid-flight
+    assert queue.drain("a09", verify=lambda m: (True, ""),
+                       merge=lambda m: False) == 0      # attempt 2
+    assert queue.drain("a09", verify=lambda m: (True, ""),
+                       merge=lambda m: False) == 0      # attempt 3 -> failed
+    assert mem.get_review(mr)["status"] == "failed"
+
+
+def test_failure_investigation_dedupes_beyond_the_last_500_tasks(settings, mem):
+    """'An investigated failure never re-opens' relied on a last-500-titles
+    set — once the lab outgrew the window the old title fell out and the same
+    failure was re-opened forever. Point lookup makes the rule unbounded."""
+    tid0 = mem.create_task("Investigate failure (code): boom", body="b",
+                           category="bugfix", agent="supervisor")
+    mem.set_task_status(tid0, "merged")                 # investigated long ago
+    for i in range(600):                                # push it out of any
+        t = mem.create_task(f"filler task {i}", body="b",   # fixed window
+                            category="docs", agent="owner")
+        mem.set_task_status(t, "merged")
+    mem.add_trace("a05", "coder", 1, "failed", category="code", failure="boom")
+    created = TaskSource(mem, settings)._open_failure_investigation()
+    assert created == 0                                 # NOT re-opened
+    titles = [t["title"] for t in mem.list_tasks(limit=1000)
+              if t["title"].startswith("Investigate failure")]
+    assert titles == ["Investigate failure (code): boom"]

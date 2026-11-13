@@ -1149,6 +1149,17 @@ class SharedMemory:
             for r in rows
         ]
 
+    def task_title_exists(self, title: str) -> bool:
+        """True when ANY task (any state, incl. merged/failed) already has
+        this exact title. A point lookup — unlike loading list_tasks into a
+        set, it keeps "an investigated failure never re-opens" true for labs
+        that outgrow any fixed window of recent titles."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM tasks WHERE title=? LIMIT 1", (title,)
+            ).fetchone()
+        return row is not None
+
     def list_tasks(self, limit: int = 30, status: str | None = None) -> list[dict]:
         sql = (
             "SELECT id, ts, title, body, category, labels, status, claimed_by, "

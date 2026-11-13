@@ -270,7 +270,6 @@ class TaskSource:
 
     def _open_failure_investigation(self) -> int:
         """Turn the newest un-investigated failed trace into a bugfix task."""
-        known = {t["title"] for t in self.memory.list_tasks(limit=500)}
         for trace in self.memory.recent_traces(limit=5, failures_only=True):
             failure = " ".join(
                 str(trace.get("failure") or trace.get("attempted") or "").split()
@@ -281,8 +280,10 @@ class TaskSource:
             title = (f"Investigate failure ({trace.get('category', 'unknown')}): "
                      f"{snippet}")
             # a failure already investigated (any state, incl. merged) must not
-            # re-open — recurring failures are the evolution task's job
-            if title in known:
+            # re-open — recurring failures are the evolution task's job. Point
+            # lookup so the rule holds even when the lab outgrew a fixed
+            # recent-titles window.
+            if self.memory.task_title_exists(title):
                 continue
             task_id = self.memory.create_task_if_absent(
                 title,
@@ -544,8 +545,12 @@ class LocalMergeQueue:
                 continue
             if merge is None:
                 # no merge callback wired in this process: leave it queued for
-                # an Integrator that has one
-                self.memory.mq_mark(mr_id, "queued", bump_attempt=True)
+                # an Integrator that has one. Nothing was actually attempted,
+                # so the attempt budget must not burn — a queue drained while
+                # no Integrator is live used to pre-spend MAX_ATTEMPTS, and
+                # the first real conflict later failed the MR as
+                # "not mergeable after 3 attempts" on its first real try.
+                self.memory.mq_mark(mr_id, "queued", bump_attempt=False)
                 continue
             if bool(merge(mr_id)):
                 self.memory.mq_mark(mr_id, "merged")
