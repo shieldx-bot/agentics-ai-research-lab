@@ -34,6 +34,7 @@ document describes how the pieces compose today.
 | --- | --- | --- | --- |
 | declared checks (MR flow) | `verify_ops.py` (`run_experiments`) | Coder/Writer: `verify_cmds` declared in `node_plan`, executed in `node_implement` before push | process exit code (`confirmed` / `refuted` / `inconclusive`) |
 | hypothesis contract (MR flow) | `agentics/verify/` (`hypothesis.py`, `experiment.py`: register_hypothesis → run_hypothesis → settle_hypothesis) | Coder/Writer: `hypotheses` declared in `node_plan` (claim + prediction + criterion + experiment code) | measurement vs criterion, re-adjudicated from the protocol's `AGENTICS_RESULT` output, 2-run reproducibility gate |
+| plan-hypothesis bridge (MR flow) | `agentics/verify/runner.py` (`ExperimentRunner`), wired in `node_implement` | same declared `hypotheses` — the runner materializes the protocol, runs `run_protocol`, and judges | marker path (`AGENTICS_RESULT`) or the RESULT-FILE fallback (`results/<id>.json` with `{"value": n}`); missing both is `inconclusive`, never guessed |
 | research claims (researcher flow) | `verify_metrics.py` (`Criterion`, `run_protocol`) + `graph/nodes.node_verify` | Researcher: after storing a finding, `node_verify` extracts up to 2 quantitative claims, pre-registers each with a criterion, writes one protocol per claim into `experiments/verify_h<id>.py` and runs it TWICE | measured metric vs pre-registered criterion + reproducibility check |
 | shared ledger | `SharedMemory.record_evidence` / `attach_protocol_outcome` / `add_hypothesis` / `update_hypothesis` | every layer above | — |
 | shared knowledge | `verified_knowledge()` → `_memory_context` → every system prompt; dashboard panel; `agentics evidence` / `agentics hypotheses` CLI | automatic | — |
@@ -87,7 +88,33 @@ protocol twice; if the two runs' metrics differ, the evidence is
 `inconclusive` ("runs disagree — protocol is not reproducible") and the
 hypothesis can never become `supported` on that evidence.
 
-## 6. Owner surfaces
+## 6. The reviewer runs code before it opines
+
+`node_review` spends zero LLM tokens on an MR that cannot survive its own
+measurements — two mechanical gates run BEFORE any model opinion:
+
+* **declared-checks re-run** — the reviewer re-executes up to 3 of the
+  author's recorded checks on the pushed branch in its own workspace and
+  records them as `method="reviewer_rerun"` evidence; a re-run that refutes
+  the author's check vetoes the approval outright ("evidence overrides model
+  opinion");
+* **tier-2 full-suite gate** (`verify_merge`) — the reviewer merges
+  main+MR into a throw-away copy and runs the full pytest suite. This
+  catches an MR that declared NO checks at all and mirrors the owner's
+  `agentics mr merge` path and the Integrator's drain gate; failing it is
+  `request_changes` with the reason, approvals carry
+  `[mechanical: tier-2 passed]`. When the context has no tier-2 capability
+  (node-level tools/tests), the prompt says so explicitly instead of
+  pretending the tests ran.
+
+## 7. Streaming — the swarm is never a blackbox
+
+`run_cycle` drives the graph with `astream` and journals one digest line per
+completed node (`event="node"`, with verdict/mechanical/review fields) —
+`agentics watch` and the dashboard render each step live instead of waiting
+for the cycle to end.
+
+## 8. Owner surfaces
 
 ```bash
 python -m agentics.cli evidence            # every recorded run (P16)
@@ -122,10 +149,11 @@ deserve a fresh run. Pinned by `tests/test_hypothesis_dedup.py`.
 
 ## 8. Testing
 
+
 `tests/test_verify_ops.py` (exit-code evidence), `tests/test_verify_metrics.py`
 (criterion adjudication + reproducibility), `tests/test_evidence_memory.py`
 (shared ledger), `tests/test_hypothesis_memory.py` (lifecycle + verified
 knowledge), `tests/test_node_verify.py` (researcher flow node-level),
-`tests/test_p16_bridge.py` (plan-declared hypotheses), plus the demo:
+`tests/test_p16_bridge.py` (plan-declared hypotheses), `tests/test_experiment_runner.py` (runner verdict paths, tier-2 gate, streaming), plus the demo:
 `python scripts/local_mode_demo.py` prints a `supported` and a `refuted`
 hypothesis from real protocol executions.

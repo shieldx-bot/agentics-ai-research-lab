@@ -1140,38 +1140,66 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         comment = (f"P10 protected paths in diff (branch re-scan): {violations[:5]} "
                    "— cannot be approved (owner-only code)")
     else:
-        files_desc = "\n".join(f"- {f}" for f in diff_files[:30])
-        ev_desc = ""
-        if ev_rows:
-            ev_lines = [
-                f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
-                f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
-                for e in ev_rows[-6:]
-            ]
-            ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
-                       + "\n".join(ev_lines))
-            if rerun_note:
-                ev_desc += f"\n\nReviewer's own re-runs: {rerun_note}"
-        prompt = (
-            f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
-            f"Files:\n{files_desc}\n\n"
-            f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
-            f"{ev_desc}\n\n"
-            'Reply ONLY JSON: {"verdict": "approve|request_changes", '
-            '"comment": "..."}'
-        )
-        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
-        if state.get("error"):             # reviewer unreachable — retry next cycle
-            state["done"] = True
-            return state
-        parsed = parse_json_block(answer)
-        verdict = parsed.get("verdict", "request_changes")
-        comment = parsed.get("comment", "auto review")
-        if ev_rows:                        # P16: make the evidence trail explicit
-            counts: dict[str, int] = {}
-            for e in ev_rows:
-                counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
-            comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
+        # Mechanical tier-2 gate — the reviewer is a real reviewer: it RUNS the
+        # full suite (merge main+MR in a throw-away copy + pytest) BEFORE any
+        # LLM opinion, complementing the declared-checks re-run above (which
+        # only re-executes what the author declared — this gate catches an MR
+        # with NO declared checks at all). Mirrors the owner's `agentics mr
+        # merge` and the Integrator's drain gate.
+        ws = getattr(ctx, "workspace", None)
+        verify_tier2 = getattr(ws, "verify_merge", None)
+        mech_ok, mech_note = True, "tier-2 not run: workspace cannot verify_merge"
+        if verify_tier2 is not None:
+            try:
+                mech_ok, mech_note = await asyncio.to_thread(
+                    verify_tier2, candidate["branch"])
+            except Exception as exc:  # noqa: BLE001 — an untestable MR is a failing MR
+                mech_ok, mech_note = False, f"mechanical check error: {exc}"
+        state["mechanical_review"] = "pass" if mech_ok else f"fail: {mech_note[:300]}"
+        if not mech_ok:
+            verdict = "request_changes"
+            comment = f"Mechanical review failed before LLM review: {mech_note}"
+        else:
+            files_desc = "\n".join(f"- {f}" for f in diff_files[:30])
+            ev_desc = ""
+            if ev_rows:
+                ev_lines = [
+                    f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
+                    f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
+                    for e in ev_rows[-6:]
+                ]
+                ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
+                           + "\n".join(ev_lines))
+                if rerun_note:
+                    ev_desc += f"\n\nReviewer's own re-runs: {rerun_note}"
+            prompt = (
+                f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
+                f"Files:\n{files_desc}\n\n"
+                f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
+                f"{ev_desc}\n\n"
+                + ("Mechanical check: tier-2 tests PASSED on main+MR (you ran them "
+                   "yourself — trust measurements over prose).\n\n"
+                   if verify_tier2 is not None else
+                   "Mechanical check: tier-2 NOT run in this context — weigh the "
+                   "author's recorded verification and the P16 evidence.\n\n")
+                + 'Reply ONLY JSON: {"verdict": "approve|request_changes", '
+                '"comment": "..."}'
+            )
+            answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
+            if state.get("error"):             # reviewer unreachable — retry next cycle
+                state["done"] = True
+                return state
+            parsed = parse_json_block(answer)
+            verdict = parsed.get("verdict", "request_changes")
+            comment = parsed.get("comment", "auto review")
+            if verify_tier2 is not None:
+                comment = f"[mechanical: tier-2 passed] {comment}"
+            if ev_rows:                        # P16: make the evidence trail explicit
+                counts: dict[str, int] = {}
+                for e in ev_rows:
+                    counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
+                comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
+
 
     if rerun_refuted and verdict == "approve":
         # Evidence overrides model opinion: an independent re-run that refutes

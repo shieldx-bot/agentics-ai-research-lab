@@ -72,6 +72,27 @@ class Hypothesis:
     def script_path(self) -> str:
         return f"{EXPERIMENT_DIR}/{self.hypothesis_id}.py"
 
+    @property
+    def result_path(self) -> str:
+        """Where the protocol may write its measured value (RESULT-FILE
+        convention: {"value": <number>}); the runner falls back to it when
+        the script prints no AGENTICS_RESULT marker."""
+        return f"{EXPERIMENT_DIR}/results/{self.hypothesis_id}.json"
+
+    # Flat aliases over the criterion — the plan contract (node_plan) speaks
+    # {metric, comparison, threshold}; the criterion keeps the canonical form.
+    @property
+    def metric(self) -> str:
+        return self.criterion.metric
+
+    @property
+    def comparison(self) -> str:
+        return self.criterion.op
+
+    @property
+    def threshold(self) -> float:
+        return self.criterion.target
+
     def to_json(self) -> str:
         return json.dumps(
             {
@@ -139,18 +160,15 @@ def parse_hypothesis(raw: object) -> tuple[Hypothesis | None, str]:
 
     crit_raw = raw.get("criterion")
     if not isinstance(crit_raw, dict):
-        # Flat form (plan-JSON contract, kept for compatibility): the proposal
-        # carries metric/comparison/threshold at the top level — normalized to
-        # the structured criterion so there is exactly ONE adjudicator shape.
-        crit_raw = {
-            "metric": raw.get("metric"),
-            "op": raw.get("comparison"),
-            "target": raw.get("threshold"),
-        }
-        if raw.get("tolerance") is not None:
-            crit_raw["tolerance"] = raw.get("tolerance")
-    if not isinstance(crit_raw, dict):
-        return None, "missing criterion object {metric, op, target}"
+        # Flat plan-declared shape (node_plan's contract): {metric, comparison,
+        # threshold} — the same criterion in a flatter coat; accept both so
+        # prompt and validator cannot drift apart.
+        if "metric" in raw and "comparison" in raw:
+            crit_raw = {"metric": raw.get("metric"), "op": raw.get("comparison"),
+                        "target": raw.get("threshold")}
+        else:
+            return None, "missing criterion object {metric, op, target}"
+
     try:
         criterion = Criterion.from_dict(crit_raw)
     except ValueError as exc:

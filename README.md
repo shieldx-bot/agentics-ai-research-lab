@@ -151,7 +151,8 @@ không bao giờ đếm là thành công), và mọi verdict được broadcast 
 inject vào prompt của từng agent (`verified_knowledge` — claim bị phản chứng
 sẽ không ai lặp lại). Owner xem bằng `agentics evidence` /
 `agentics hypotheses` và 2 panel trên dashboard. Chi tiết:
-[docs/VERIFICATION.md](docs/VERIFICATION.md).
+[docs/VERIFICATION.md](docs/VERIFICATION.md). Reviewer **tự chạy lại check của tác giả trên nhánh thật + full test suite (tier-2) trước khi hỏi LLM** — MR không qua được test bị từ chối với 0 token LLM.
+
 
 ---
 

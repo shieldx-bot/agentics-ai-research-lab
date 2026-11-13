@@ -59,6 +59,7 @@ class ResearchState(TypedDict, total=False):
     pr_number: int
     pr_url: str
     review_verdict: str            # approve | request_changes
+    mechanical_review: str         # reviewer's tier-2 run: pass | fail: …
     review_comment: str
     rework_mr: int                 # set while reworking this changes_requested MR
     # control
