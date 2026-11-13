@@ -1170,7 +1170,7 @@ class SharedMemory:
         defense: dict | None = None,
     ) -> None:
         """Patch the panel row; only the engine mutates state transitions."""
-        sets: list = []
+        sets: list[str] = []
         args: list = []
         if state is not None:
             sets.append("state=?"); args.append(state)
