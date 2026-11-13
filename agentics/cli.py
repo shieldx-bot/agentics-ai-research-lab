@@ -582,6 +582,123 @@ def audit(
 
 
 @app.command()
+def panel(
+    mr_id: int = typer.Option(0, "--mr", "-m",
+                              help="chi tiết 1 MR: mọi phiếu, objection, bản bảo vệ"),
+    state: str = typer.Option("", "--state", "-s",
+                              help="chỉ hiện panel ở 1 trạng thái (voting/defense/approved/rejected)"),
+    stats: bool = typer.Option(False, "--stats", help="số liệu cơ chế P19 (tỉ lệ duyệt, cứu được bởi bảo vệ...)"),
+    limit: int = typer.Option(20, "--limit", "-l", help="số panel tối đa"),
+) -> None:
+    """Owner: bảng bỏ phiếu đánh giá lẫn nhau (P19) — ai vote gì, phản đối ra sao,
+    đồng hồ bảo vệ còn bao lâu, và cơ chế có đang cải thiện kết quả chung không.
+
+    Đối tác terminal của cột panel trên dashboard; trạng thái panel là nguồn
+    sự thật chung của swarm."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        if stats:
+            st = mem.panel_stats()
+            by_state = st["by_state"]
+            if by_state:
+                console.print("[bold]Peer panel (P19)[/] — tổng:",
+                              " — ".join(f"{k}: {v}" for k, v in sorted(by_state.items())))
+            else:
+                console.print("[bold]Peer panel (P19)[/] — (chưa có panel nào)")
+                return
+            decided = st["decided"]
+            approved = by_state.get("approved", 0)
+            console.print(f"  [bold]tỉ lệ duyệt:[/] {st['approval_rate']:.0%} "
+                          f"({approved}/{decided} panel đã kết luận)")
+            if st["defended"]:
+                save = st["defense_save_rate"]
+                console.print(f"  [bold]đã vào vòng bảo vệ:[/] {st['defended']}"
+                              + (f" — bảo vệ cứu được {save:.0%}"
+                                 if save is not None else ""))
+            if st["rejected_why"]:
+                console.print("  [bold]lý do reject:[/]",
+                              ", ".join(f"{k}: {v}" for k, v in st["rejected_why"].items()))
+            if st["top_objectors"]:
+                console.print("  [bold]người phản đối nhiều nhất:[/]",
+                              ", ".join(f"{r['voter']} ({r['objections']})"
+                                        for r in st["top_objectors"]))
+            if st["votes"]:
+                console.print("  [bold]phiếu (vòng quyết định):[/]",
+                              " — ".join(f"{k}: {v}" for k, v in sorted(st["votes"].items())))
+            return
+        if mr_id:
+            p = mem.get_panel(mr_id)
+            if p is None:
+                console.print(f"[yellow]MR #{mr_id} chưa có panel.[/]")
+                return
+            review = mem.get_review(mr_id)
+            if review is not None:
+                console.print(f"[bold]MR #{mr_id}[/] — {review['title']} "
+                              f"(tác giả {review['author']})")
+            else:
+                console.print(f"[bold]MR #{mr_id}[/] (bản ghi MR đã mất)")
+            console.print(f"  trạng thái: [bold]{p['state']}[/], vòng {p['round']}")
+            if p["state"] == "defense" and p["due_ts"]:
+                import time as _t
+                left = max(0, int(p["due_ts"] - _t.time()))
+                console.print(f"  đồng hồ bảo vệ: còn [bold]{left // 60}p{left % 60:02d}s[/]")
+            for rnd in range(1, p["round"] + 1):
+                votes = mem.panel_votes(mr_id, round=rnd)
+                if votes:
+                    console.print(f"  [bold]phiếu vòng {rnd}:[/]")
+                    for v in votes:
+                        color = "green" if v["vote"] == "accept" else "red"
+                        console.print(f"    [{color}]{v['vote']:>6}[/] {v['voter']}"
+                                      f" — {v['reason'][:160]}")
+                objs = mem.panel_objections(mr_id, round=rnd)
+                if objs:
+                    console.print(f"  [bold]objection vòng {rnd}:[/]")
+                    for o in objs:
+                        console.print(f"    [red]•[/] {o['voter']} — {o['objection'][:200]}")
+            defense = p.get("defense") or {}
+            if defense.get("rebuttals"):
+                console.print("  [bold]bản bảo vệ đã nộp:[/]")
+                for k, text in list(defense["rebuttals"].items())[:6]:
+                    console.print(f"    → {k}: {text[:200]}")
+                if defense.get("evidence_ids"):
+                    console.print(f"    bằng chứng kèm theo: {defense['evidence_ids']}")
+            return
+        rows = mem.panels_overview(limit=limit, state=state)
+        if not rows:
+            console.print("(chưa có panel nào — MR mới sẽ tự mở panel khi reviewer vote)")
+            return
+        table = Table(title="Peer panels (P19)" + (f" — state={state}" if state else ""))
+        table.add_column("MR", justify="right")
+        table.add_column("Trạng thái")
+        table.add_column("Vòng", justify="right")
+        table.add_column("Tác giả")
+        table.add_column("Task", justify="right")
+        table.add_column("Đồng hồ bảo vệ", justify="right")
+        table.add_column("Tiêu đề / kết luận", overflow="fold")
+        import time as _t
+        now = _t.time()
+        for r in rows:
+            color = {"approved": "green", "rejected": "red",
+                     "defense": "cyan", "voting": "yellow"}.get(r["state"], "white")
+            clock = ""
+            if r["state"] == "defense" and r["due_ts"]:
+                clock = f"{max(0, int(r['due_ts'] - now)) // 60}p"
+            tail = (r["verdict_comment"] or r["title"] or "")[:120]
+            table.add_row(
+                str(r["mr_id"]), f"[{color}]{r['state']}[/]", str(r["round"]),
+                r["author"] or "?", str(r["task_id"] if r["task_id"] is not None else "-"),
+                clock, tail,
+            )
+        console.print(table)
+    finally:
+        mem.close()
+
+
+@app.command()
 def hypotheses(
     status: str = typer.Option("", "--status", "-s",
                                help="chỉ hiện 1 trạng thái (supported/refuted/...)"),

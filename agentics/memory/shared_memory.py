@@ -1511,6 +1511,101 @@ class SharedMemory:
             ).fetchall()
         return [self.get_panel(r[0]) for r in rows if self.get_panel(r[0]) is not None]
 
+    def panels_overview(self, limit: int = 20, state: str = "") -> list[dict]:
+        """Every panel joined with its MR (owner table view), newest first.
+
+        Read-only companion to ``panels_in_state``: the dashboard already
+        shows panels for open MRs; this shows ALL of them — including the
+        closed ones — so the owner can audit past verdicts from the CLI."""
+        sql = (
+            "SELECT p.mr_id, p.state, p.round, p.opened_ts, p.due_ts, "
+            "r.author, r.status, r.title, r.task_id, r.verdict_comment "
+            "FROM mr_panels p LEFT JOIN reviews r ON r.id = p.mr_id"
+        )
+        args: list = []
+        if state:
+            sql += " WHERE p.state=?"
+            args.append(state)
+        sql += " ORDER BY p.updated_ts DESC, p.mr_id DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"mr_id": r[0], "state": r[1], "round": r[2], "opened_ts": r[3],
+             "due_ts": r[4], "author": r[5], "mr_status": r[6], "title": r[7],
+             "task_id": r[8], "verdict_comment": r[9]}
+            for r in rows
+        ]
+
+    def panel_stats(self, since_ts: float = 0.0) -> dict:
+        """How is the P19 mechanism itself performing? (owner analytics, read-only)
+
+        Answers the question behind the mechanism — "cải thiện kết quả chung":
+        how many MRs the panel approved on first unanimous vote, how many
+        needed a defense round and whether the defense saved or killed them,
+        and who raises the objections that shape quality."""
+        with self._lock:
+            st_rows = self._conn.execute(
+                "SELECT p.state, COUNT(*) FROM mr_panels p "
+                "WHERE p.opened_ts>=? GROUP BY p.state", (since_ts,),
+            ).fetchall()
+            defense_rows = self._conn.execute(
+                # the stored defense JSON always carries "ts"; '' (no defense)
+                # must not reach json_extract — a LIKE keeps the query total
+                "SELECT p.state, COUNT(*) FROM mr_panels p "
+                "WHERE p.opened_ts>=? AND p.defense LIKE '%\"ts\"%' "
+                "GROUP BY p.state", (since_ts,),
+            ).fetchall()
+            reject_rows = self._conn.execute(
+                "SELECT p.mr_id, r.verdict_comment FROM mr_panels p "
+                "JOIN reviews r ON r.id = p.mr_id "
+                "WHERE p.opened_ts>=? AND p.state='rejected'", (since_ts,),
+            ).fetchall()
+            obj_rows = self._conn.execute(
+                "SELECT o.voter, COUNT(*) FROM panel_objections o "
+                "JOIN mr_panels p ON p.mr_id = o.mr_id "
+                "WHERE p.opened_ts>=? GROUP BY o.voter ORDER BY COUNT(*) DESC",
+                (since_ts,),
+            ).fetchall()
+            vote_rows = self._conn.execute(
+                "SELECT v.vote, COUNT(*) FROM panel_votes v "
+                "JOIN mr_panels p ON p.mr_id = v.mr_id AND v.round = p.round "
+                "WHERE p.opened_ts>=? GROUP BY v.vote", (since_ts,),
+            ).fetchall()
+        by_state = {s: n for s, n in st_rows}
+        approved = by_state.get("approved", 0)
+        rejected = by_state.get("rejected", 0)
+        defended = {s: n for s, n in defense_rows}
+        saved_by_defense = defended.get("approved", 0)
+        # classify the rejections by the engine's stable reason prefixes
+        why: dict[str, int] = {}
+        for _mr_id, comment in reject_rows:
+            text = comment or ""
+            if text.startswith("defense incomplete"):
+                why["defense_incomplete"] = why.get("defense_incomplete", 0) + 1
+            elif text.startswith("defense rejected"):
+                why["objector_unmoved"] = why.get("objector_unmoved", 0) + 1
+            elif text.startswith("author conceded"):
+                why["conceded"] = why.get("conceded", 0) + 1
+            elif text.startswith("defense deadline"):
+                why["deadline"] = why.get("deadline", 0) + 1
+            else:
+                why["other"] = why.get("other", 0) + 1
+        decided = approved + rejected
+        return {
+            "by_state": by_state,
+            "decided": decided,
+            "approval_rate": (approved / decided) if decided else None,
+            # panels that reached round 2 = a defense actually happened
+            "defended": sum(defended.values()),
+            "saved_by_defense": saved_by_defense,
+            "defense_save_rate": (saved_by_defense / sum(defended.values()))
+                                 if sum(defended.values()) else None,
+            "rejected_why": why,
+            "top_objectors": [{"voter": v, "objections": n} for v, n in obj_rows[:5]],
+            "votes": {k: n for k, n in vote_rows},
+        }
+
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(
         self, agent: str, role: str, cycle: int, outcome: str,

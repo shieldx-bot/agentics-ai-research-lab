@@ -85,3 +85,80 @@ def test_panel_row_survives_reopen(tmp_path: Path):
     m2 = SharedMemory(db)
     assert m2.get_panel(4)["state"] == "voting"
     assert m2.panel_votes(4)[0]["voter"] == "rev-x"
+
+
+# ---------------------------------------------- owner visibility (P19 CLI)
+def _full_lifecycle(mem) -> tuple[int, int]:
+    """One approved-after-defense MR + one rejected-on-incomplete-defense MR."""
+    mem.heartbeat("coder-1", "coder", 1)
+    mem.heartbeat("rev-a", "coder", 1)
+    mem.heartbeat("rev-b", "writer", 1)
+    good = mem.open_review(task_id=None, title="good MR", body="b", author="coder-1",
+                           branch="agent/coder-1/g", files=["a.py"])
+    bad = mem.open_review(task_id=None, title="bad MR", body="b", author="rev-b",
+                          branch="agent/rev-b/b", files=["b.py"])
+    mem.ensure_panel(good)                        # the engine creates it on first vote
+    mem.ensure_panel(bad)
+    mem.record_panel_vote(good, 1, "rev-a", "reject", "metric not measured")
+    mem.record_panel_objection(good, 1, "rev-a", "metric not measured")
+    mem.record_panel_vote(good, 1, "rev-b", "accept", "fine")
+    mem.set_panel(good, state="defense", due_ts=999.0)
+    mem.set_panel(good, state="voting", round=2, clear_due=True,
+                  defense={"rebuttals": {"rev-a": "measured again, passes"},
+                           "evidence_ids": [3], "ts": 123.0})
+    mem.record_panel_vote(good, 2, "rev-a", "accept", "fair")
+    mem.set_panel(good, state="approved")
+    mem.set_review_verdict(good, "approved", "panel[rev-a,rev-b]", "P19 unanimous")
+    mem.record_panel_vote(bad, 1, "rev-a", "reject", "no evidence")
+    mem.record_panel_objection(bad, 1, "rev-a", "no evidence at all")
+    mem.set_panel(bad, state="defense", due_ts=999.0)
+    mem.set_review_verdict(bad, "failed", "rev-b",
+                           "defense incomplete — no rebuttal for ['rev-a']")
+    mem.set_panel(bad, state="rejected")
+    return good, bad
+
+
+def test_panels_overview_joins_mr_and_orders_newest_first(mem):
+    good, bad = _full_lifecycle(mem)
+    rows = mem.panels_overview()
+    assert [r["mr_id"] for r in rows] == [bad, good]      # newest (updated) first
+    g = rows[1]
+    assert g["state"] == "approved" and g["round"] == 2
+    assert g["author"] == "coder-1" and g["title"] == "good MR"
+    assert g["verdict_comment"] == "P19 unanimous"
+    assert mem.panels_overview(state="rejected")[0]["mr_id"] == bad
+    assert mem.panels_overview(state="voting") == []
+    assert mem.panels_overview(limit=1)[0]["mr_id"] == bad
+
+
+def test_panel_stats_counts_outcomes_and_classifies_rejections(mem):
+    good, bad = _full_lifecycle(mem)
+    st = mem.panel_stats()
+    assert st["by_state"] == {"approved": 1, "rejected": 1}
+    assert st["decided"] == 2
+    assert st["approval_rate"] == pytest.approx(0.5)
+    # the good MR reached round 2 with a stored defense -> defended & saved
+    assert st["defended"] == 1
+    assert st["saved_by_defense"] == 1
+    assert st["defense_save_rate"] == pytest.approx(1.0)
+    assert st["rejected_why"] == {"defense_incomplete": 1}
+    assert st["top_objectors"] == [{"voter": "rev-a", "objections": 2}]
+    # votes in the DECISIVE round: r2 accept (good) + r1 reject (bad)
+    assert st["votes"] == {"accept": 1, "reject": 1}
+
+
+def test_panel_stats_with_no_panels_is_all_zeros(mem):
+    st = mem.panel_stats()
+    assert st["by_state"] == {}
+    assert st["decided"] == 0
+    assert st["approval_rate"] is None
+    assert st["defended"] == 0 and st["saved_by_defense"] == 0
+    assert st["defense_save_rate"] is None
+    assert st["rejected_why"] == {} and st["top_objectors"] == []
+
+
+def test_panel_stats_since_filters_old_panels(mem):
+    _full_lifecycle(mem)
+    future = mem.get_panel(2)["opened_ts"] + 1.0
+    assert mem.panel_stats(since_ts=future)["by_state"] == {}
+    assert mem.panel_stats(since_ts=0.0)["decided"] == 2
