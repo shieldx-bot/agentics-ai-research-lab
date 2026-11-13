@@ -1,9 +1,13 @@
-"""P23bis — the replication engine: a peer re-runs the claim for real.
+"""P24bis — the replication engine: a peer re-runs the claim for real.
 
 Real SharedMemory, real protocol execution in a FRESH peer workspace (same
 contract as node_verify's tests: a plain directory whose run_command
 executes workspace scripts). No network, no git, no LLM — the replicator
 needs none: the criterion is frozen data and the verdict is machine-made.
+
+Composes with the predecessor's P24 ledger: the engine writes the canonical
+bookkeeping (hypotheses.replication) AND the provenance detail
+(replications table) — the tests below pin the double-ledger invariant.
 """
 from __future__ import annotations
 
@@ -79,8 +83,8 @@ def _supported(mem: SharedMemory, code: str = PROTOCOL,
 
 
 def _candidate(mem: SharedMemory, agent: str) -> dict:
-    pending = mem.pending_replications(agent)
-    assert pending, "a supported shareable claim must be pending for a peer"
+    pending = mem.hypotheses_needing_replication(agent)
+    assert pending, "a settled shareable claim must be pending for a peer"
     return pending[0]
 
 
@@ -90,9 +94,16 @@ def test_confirmed_replication_flags_common_knowledge(mem, tmp_path):
     report = replicate_candidate(mem, peer_ws, _candidate(mem, "reviewer-1"),
                                  "reviewer-1")
     assert report["verdict"] == "confirmed" and report["replicated"]
-    # the swarm sees the claim as independently replicated (H3)
+    # the swarm sees the claim as independently replicated (H3) — the P24
+    # ledger column is the single source of truth
     vk = mem.verified_knowledge()[0]
     assert vk["replicated"] is True and vk["id"] == hyp
+    assert mem.get_hypothesis(hyp)["replication"] == "confirmed"
+    # the provenance detail row exists: who replicated, what was measured
+    detail = mem.replication_for_evidence(ev)
+    assert detail["replicator"] == "reviewer-1"
+    assert detail["verdict"] == "confirmed"
+    assert detail["measured"]["precision"] == pytest.approx(0.9, abs=0.05)
     # the peer's own evidence row exists, clearly method-tagged
     peer_rows = [r for r in mem.latest_evidence(limit=5)
                  if r["method"] == "replication"]
@@ -116,6 +127,7 @@ def test_refuted_replication_overrides_the_author(mem, tmp_path):
     # the hypothesis is downgraded — dead claims stop posing as common ground
     hyp_row = mem.get_hypothesis(hyp)
     assert hyp_row["status"] == "refuted"
+    assert hyp_row["replication"] == "refuted"     # both ledgers agree
     assert "replication_refuted" in [j["event"] for j in mem.recent_journal()]
     assert mem.verified_knowledge()[0]["status"] == "refuted"
 
@@ -132,29 +144,36 @@ def test_inconclusive_replication_never_refutes(mem, tmp_path):
     assert row["verdict"] == "confirmed"
     assert mem.get_hypothesis(hyp)["status"] == "supported"
     assert "replication_inconclusive" in [j["event"] for j in mem.recent_journal()]
-    # the slot is consumed — the swarm will not burn compute retrying it
-    assert mem.pending_replications("reviewer-2") == []
+    # the P24 retry budget keeps the claim available for another peer
+    assert [h["id"] for h in
+            mem.hypotheses_needing_replication("reviewer-2")] == [hyp]
 
 
-def test_refused_self_replication_and_lost_slot(mem, tmp_path):
+def test_refused_self_replication_and_double_confirm_guard(mem, tmp_path):
     hyp, ev = _supported(mem)
-    # the author sees NO pending work (own claims are excluded) — build the
-    # candidate from a peer's view and try to run it as the author anyway:
-    # the engine must refuse self-replication as defense in depth.
+    # the author sees NO pending work (own claims are excluded by the P24
+    # selector) — build the candidate from a peer's view and try to run it
+    # as the author anyway: the engine refuses self-replication in depth.
     author_ws = PeerWS(tmp_path / "author-ws")
     report = replicate_candidate(mem, author_ws, _candidate(mem, "reviewer-1"),
                                  "researcher-1")
     assert not report["replicated"] and "self-replication" in report["note"]
     assert mem.replication_for_evidence(ev) is None   # nothing recorded
-    # a second peer taking the slot first leaves nothing for this one
-    cand_for_late = _candidate(mem, "reviewer-2")     # visible BEFORE the race
+    # once a peer's replication is confirmed, no second confirmation runs —
+    # even a direct engine call on a stale candidate skips it
     peer_ws = PeerWS(tmp_path / "peer-ws")
     first = replicate_candidate(mem, peer_ws, _candidate(mem, "reviewer-1"),
                                 "reviewer-1")
     assert first["replicated"]
+    cand_stale = {"id": hyp, "evidence_id": ev, "agent": "researcher-1",
+                  "claim": "the method reaches >=0.9 precision on the toy set",
+                  "criterion": {"metric": "precision", "op": ">=", "target": 0.9},
+                  "protocol_code": PROTOCOL, "replication": "confirmed"}
     late = replicate_candidate(mem, PeerWS(tmp_path / "late-ws"),
-                               cand_for_late, "reviewer-2")
-    assert not late["replicated"] and "slot taken" in late["note"]
+                               cand_stale, "reviewer-2")
+    assert not late["replicated"] and "already replicated" in late["note"]
+    # the canonical bookkeeping was NOT double-written
+    assert mem.get_hypothesis(hyp)["replication_attempts"] == 1
 
 
 def test_guard_blocked_write_is_journaled(mem, tmp_path):
@@ -167,17 +186,34 @@ def test_guard_blocked_write_is_journaled(mem, tmp_path):
     assert row["verdict"] == "confirmed"            # never a false refutation
 
 
-def test_replicate_pending_is_bounded_and_safe(mem, tmp_path):
+def test_replicate_pending_is_bounded_oldest_first(mem, tmp_path):
     hyp_a, _ev_a = _supported(mem, claim="claim A on the toy set")
     hyp_b, _ev_b = _supported(mem, author="researcher-2",
                               claim="claim B on the toy set")
     peer_ws = PeerWS(tmp_path / "peer-ws")
     reports = replicate_pending(mem, peer_ws, "reviewer-1", limit=1)
     assert len(reports) == 1 and reports[0]["replicated"]
-    assert reports[0]["hypothesis_id"] == hyp_b      # newest first
-    # one replication per cycle — claim A stays pending for the next one
+    assert reports[0]["hypothesis_id"] == hyp_a      # P24: oldest first
+    # one replication per cycle — claim B stays pending for the next one
     assert mem.replication_counts()["pending"] == 1
     second = replicate_pending(mem, peer_ws, "reviewer-1", limit=1)
-    assert len(second) == 1 and second[0]["hypothesis_id"] == hyp_a
+    assert len(second) == 1 and second[0]["hypothesis_id"] == hyp_b
     # an empty queue is a clean no-op
     assert replicate_pending(mem, peer_ws, "reviewer-1", limit=3) == []
+    counts = mem.replication_counts()
+    assert counts["replicated"] == 2 and counts["pending"] == 0
+
+
+def test_retry_budget_exhaustion(mem, tmp_path):
+    """After 2 inconclusive attempts the claim is no longer offered — a
+    permanently flaky claim cannot burn swarm compute forever (P24)."""
+    _supported(mem)
+    cand1 = _candidate(mem, "reviewer-1")
+    cand1["protocol_code"] = UNPARSABLE_PROTOCOL
+    replicate_candidate(mem, PeerWS(tmp_path / "ws1"), cand1, "reviewer-1")
+    cand2 = _candidate(mem, "reviewer-2")
+    cand2["protocol_code"] = UNPARSABLE_PROTOCOL
+    replicate_candidate(mem, PeerWS(tmp_path / "ws2"), cand2, "reviewer-2")
+    assert mem.hypotheses_needing_replication("reviewer-3") == []
+    counts = mem.replication_counts()
+    assert counts["replicated"] == 0 and counts["pending"] == 0

@@ -1074,15 +1074,15 @@ class SharedMemory:
 
         Injected into EVERY agent's memory context — refuted claims stop
         being repeated, supported claims become reusable common ground.
-        P23: each row carries `replicated` — True when an INDEPENDENT agent
-        (not the author) re-ran the protocol and the machine verdict agreed.
-        A prompt can then weigh "author-confirmed" against "independently
-        replicated" instead of treating both the same."""
+        P24: each row carries `replicated` — True when an INDEPENDENT agent
+        (not the author) re-ran the protocol and the machine verdict agreed
+        (hypotheses.replication == 'confirmed'). A prompt can then weigh
+        "author-confirmed" against "independently replicated" instead of
+        treating both the same."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, claim, status, verdict_note, criterion, evidence_id, "
-                "(SELECT COUNT(*) FROM replications r WHERE r.hypothesis_id="
-                "hypotheses.id AND r.verdict='confirmed') "
+                "(replication = 'confirmed') "
                 "FROM hypotheses WHERE status IN ('supported','refuted') "
                 "ORDER BY id DESC LIMIT ?", (limit,),
             ).fetchall()
@@ -1105,61 +1105,27 @@ class SharedMemory:
             rows = self._conn.execute(sql, (limit,)).fetchall()
         return [self._hypothesis_row(r) for r in rows]
 
-    # ------------------------------------- independent replication (P23bis)
-    # The replay sweep re-runs claims over TIME (same ledger, drift events);
-    # this layer adds the INDEPENDENCE dimension (H3's social side): a claim
-    # is "replicated" when a DIFFERENT agent re-runs the shareable protocol
-    # in its own workspace and the machine verdict agrees. The two compose:
-    # replay answers "does it still hold?", replication answers "could
-    # anyone else produce it?".
-    def pending_replications(self, agent: str, limit: int = 5) -> list[dict]:
-        """Supported hypotheses whose evidence no peer has replicated yet.
-
-        Rules encoded here:
-          * status='supported' with a CONFIRMED evidence row — only agreed
-            measurements are worth the swarm's compute;
-          * protocol_code non-empty — only shareable evidence is replicable;
-          * author != agent — never replicate my own claim (independence is
-            the whole point, mirrors P5's no-self-review);
-          * no replication row exists for the evidence yet — the first peer
-            to record wins the slot (claim-by-insert, race-free)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT h.id, h.claim, h.criterion, h.protocol_code, "
-                "h.protocol_path, h.agent AS author, h.evidence_id, h.task_id "
-                "FROM hypotheses h JOIN evidence e ON e.id = h.evidence_id "
-                "WHERE h.status='supported' AND e.verdict='confirmed' "
-                "AND COALESCE(h.protocol_code,'') != '' "
-                "AND h.agent != ? "
-                "AND NOT EXISTS (SELECT 1 FROM replications r "
-                "                WHERE r.evidence_id = h.evidence_id) "
-                "ORDER BY h.id DESC LIMIT ?", (agent, limit),
-            ).fetchall()
-        return [{"hypothesis_id": r[0], "claim": r[1],
-                 "criterion": json.loads(r[2] or "{}"),
-                 "protocol_code": r[3], "protocol_path": r[4],
-                 "author": r[5], "evidence_id": r[6], "task_id": r[7]}
-                for r in rows]
-
-    def record_replication(
+    # ------------------------------------- independent replication (P24bis)
+    # The P24 ledger above (hypotheses.replication + selection) is the
+    # CANONICAL once-per-swarm bookkeeping; this section adds the PROVENANCE
+    # detail: WHO replicated, what they measured, per-run runs and duration,
+    # linked to the author's evidence row. The two stay in sync by contract:
+    # the engine writes BOTH (record_replication = bookkeeping,
+    # record_replication_detail = provenance).
+    def record_replication_detail(
         self, evidence_id: int, hypothesis_id: int, replicator: str,
         verdict: str, measured: dict, runs: list,
         note: str = "", duration_s: float = 0.0,
     ) -> bool:
-        """Record MY independent replication of one evidence row (P23).
+        """Store the replication PROVENANCE of one evidence row (P24bis).
 
-        False means the slot is gone — another agent already replicated this
-        evidence (single-replication-per-evidence, checked AND enforced here
-        so the guarantee does not depend on the node). The caller simply
-        moves on, no lock machinery needed. Also broadcasts (H3): every
-        agent sees the replication result on the message bus."""
-        with self._lock:
-            taken = self._conn.execute(
-                "SELECT 1 FROM replications WHERE evidence_id=?",
-                (evidence_id,),
-            ).fetchone()
-        if taken:
-            return False
+        One row per (evidence, replicator) — the UNIQUE constraint is the
+        only gate, so the P24 retry budget stays intact (a second peer MAY
+        record its own attempt after an inconclusive first one). False means
+        THIS replicator already recorded its run. Also broadcasts (H3):
+        every agent sees the replication result on the message bus. The
+        caller still records the canonical bookkeeping via
+        record_replication(hyp_id, outcome)."""
         try:
             with self._lock, self._conn:
                 self._conn.execute(
@@ -1201,20 +1167,23 @@ class SharedMemory:
                 "duration_s": row[9]}
 
     def replication_counts(self) -> dict[str, int]:
-        """Swarm-wide replication stats for the dashboard/CLI."""
+        """Swarm-wide replication stats for the dashboard/CLI (P24 ledger).
+
+        `replicated`/`refuted` count settled claims by their replication
+        outcome; `pending` counts claims any independent peer could pick up
+        right now (the selector condition without the per-agent filter)."""
         with self._lock:
             n_replicated = self._conn.execute(
-                "SELECT COUNT(DISTINCT hypothesis_id) FROM replications "
-                "WHERE verdict='confirmed'").fetchone()[0]
+                "SELECT COUNT(*) FROM hypotheses WHERE replication='confirmed'"
+            ).fetchone()[0]
             n_refuted = self._conn.execute(
-                "SELECT COUNT(*) FROM replications WHERE verdict='refuted'"
+                "SELECT COUNT(*) FROM hypotheses WHERE replication='refuted'"
             ).fetchone()[0]
             n_pending = self._conn.execute(
-                "SELECT COUNT(*) FROM hypotheses h JOIN evidence e "
-                "ON e.id=h.evidence_id WHERE h.status='supported' "
-                "AND e.verdict='confirmed' AND COALESCE(h.protocol_code,'')!='' "
-                "AND NOT EXISTS (SELECT 1 FROM replications r "
-                "WHERE r.evidence_id=h.evidence_id)").fetchone()[0]
+                "SELECT COUNT(*) FROM hypotheses WHERE status='supported' "
+                "AND protocol_code != '' "
+                "AND (replication = '' OR (replication = 'inconclusive' "
+                "     AND replication_attempts < 2))").fetchone()[0]
         return {"replicated": n_replicated, "refuted": n_refuted,
                 "pending": n_pending}
 
