@@ -188,6 +188,12 @@ class Settings:
         default_factory=lambda: _env_int("REPLAY_SWEEP_SIZE", 2))
     replay_every_n_cycles: int = field(
         default_factory=lambda: _env_int("REPLAY_EVERY_N_CYCLES", 3))
+    # P24bis — independent replication: reviewers re-run settled claims from
+    # their stored protocols in their own workspaces. replication_limit caps
+    # how many claims ONE reviewer cycle replicates (0 = off). No LLM is
+    # involved: the criterion is frozen data and the verdict is machine-made.
+    replication_limit: int = field(
+        default_factory=lambda: _env_int("REPLICATION_LIMIT", 1))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(

@@ -1032,6 +1032,73 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
     return state
 
 
+def pending_replication(ctx: AgentContext, limit: int = 1) -> list[dict]:
+    """Settled claims the P24 selector offers ME for independent replication.
+
+    Routing helper — must never crash a cycle (same contract as
+    pending_defense): a read failure simply means "nothing to replicate"."""
+    try:
+        limit = int(limit or 0)
+        if limit <= 0:
+            return []
+        return ctx.memory.hypotheses_needing_replication(ctx.agent_id,
+                                                         limit=limit)
+    except Exception:  # noqa: BLE001 — routing must never crash on a read
+        return []
+
+
+async def node_replicate(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """Reviewer (P24bis): replicate a settled claim INDEPENDENTLY.
+
+    The swarm's common knowledge used to rest on ONE agent's protocol run —
+    the dedup gate made every other agent REUSE it, so a buggy or gaming
+    protocol poisoned verified_knowledge forever. This node gives the swarm
+    the scientific fix: a peer rebuilds the shareable protocol in its own
+    workspace (no LLM involved), runs the two-run reproducibility gate, and
+    the machine verdict is written to BOTH ledgers (P24 bookkeeping +
+    provenance detail) and broadcast (H3). A refuted replication closes the
+    ledger the P17 way: evidence re-verdicted, hypothesis downgraded; an
+    inconclusive one never refutes (P17 asymmetry) and the P24 retry budget
+    keeps the claim available for another peer."""
+    limit = int(getattr(ctx.settings, "replication_limit", 1) or 0)
+    if limit <= 0:
+        state["summary"] = "replication disabled (REPLICATION_LIMIT=0)"
+        state["done"] = True
+        return state
+    candidates = pending_replication(ctx, limit=limit)
+    if not candidates:
+        state["summary"] = "no claim awaiting independent replication"
+        state["done"] = True
+        return state
+    ctx.report(
+        node="replicate",
+        intent={
+            "goal": (f"Independently replicate {len(candidates)} settled "
+                     "claim(s) from their stored protocols"),
+            "why": ("P24bis: a supported claim must survive a DIFFERENT "
+                    "agent's re-run, not just its author's"),
+            "steps": ["pick oldest unreplicated claim", "rebuild protocol in "
+                      "my workspace", "run the 2-run gate", "record both "
+                      "ledgers + broadcast"],
+            "expected_files": [],
+        },
+    )
+    from agentics.verify.replication import replicate_pending
+    reports = await asyncio.to_thread(
+        replicate_pending, ctx.memory, ctx.workspace, ctx.agent_id,
+        limit=limit)
+    counts: dict[str, int] = {}
+    for r in reports:
+        v = r.get("verdict") or ("skipped" if not r.get("replicated") else "?")
+        counts[v] = counts.get(v, 0) + 1
+    breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+    state["replication_verdict"] = breakdown
+    state["summary"] = (f"P24bis replicated {len(reports)} claim(s) "
+                        f"[{breakdown}]")
+    state["done"] = True
+    return state
+
+
 async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: turn research into an implementation plan (LLM, JSON)."""
     category = state.get("category") or categorize_issue(
