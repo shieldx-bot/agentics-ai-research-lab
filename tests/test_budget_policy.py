@@ -288,6 +288,55 @@ def test_llm_ask_provider_failure_still_recorded():
     assert "llm plan call failed" in state["error"]
 
 
+# ------------------------------------------------------- infra vs provider
+def test_llm_ask_infra_failure_not_recorded_as_model_failure():
+    """The live 2026-11-13 storm: the free plan's ~10-minute session cap
+    killed every session mid-ask; the rebuild burst's Target-closed errors
+    then read as five consecutive "model failures" per agent and froze the
+    WHOLE swarm for the 900s cooldown while sessions were recovering on
+    their own. Transport failures must be loud but must not feed the
+    breaker."""
+    recorded = []
+
+    async def fake_ask(*a, **k):
+        raise RuntimeError(
+            "Page.evaluate: Target page, context or browser has been closed")
+
+    budget = BudgetPolicy(None, max_calls_per_hour=0)
+    budget.record = lambda *a, **k: recorded.append(a)
+    mem = _JournalMem()
+    state = {}
+    answer, _ = _run(_llm_ask(
+        _refusal_ctx(budget, fake_ask, mem), "p", purpose="research",
+        state=state))
+    assert answer == "" and recorded == []        # NOT a model failure
+    assert "infra failure" in state["error"]
+    assert any(e[1] == "llm_infra_failure" for e in mem.events)
+
+
+def test_llm_ask_session_cap_and_cdp_404_are_infra_too():
+    """The other two classes from the same live storm: a rebuild rejected by
+    the per-token cap (server counter still propagating), and a fresh
+    session whose CDP endpoint 404'd two seconds after create."""
+    for message in (
+        "Maximum number of active sessions (1) reached. Please close some "
+        "sessions before creating new ones.",
+        'BrowserType.connect_over_cdp: WebSocket error ... 404 Not Found '
+        '{"code":"not_found","message":"session not found"}',
+    ):
+        recorded = []
+
+        async def fake_ask(*a, _message=message, **k):
+            raise RuntimeError(_message)
+
+        budget = BudgetPolicy(None, max_calls_per_hour=0)
+        budget.record = lambda *a, **k: recorded.append(a)
+        state = {}
+        _run(_llm_ask(
+            _refusal_ctx(budget, fake_ask), "p", purpose="plan", state=state))
+        assert recorded == [], message
+
+
 def _run(coro):
     import asyncio
     return asyncio.run(coro)

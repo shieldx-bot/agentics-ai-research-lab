@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -198,6 +199,16 @@ class HyperbrowserClient:
         self._page: Any = None
         self._hb: Any = None
         self._ask_lock = asyncio.Lock()      # one UI conversation at a time
+        # Free-plan sessions die at a hard duration cap (~10 min; live
+        # 2026-11-13: six sessions aged 9m37s-10m06s all died mid-ask inside
+        # one 30-second window). Recycle each session BEFORE the cap —
+        # between asks, while healthy. Jitter desynchronizes the swarm so
+        # agents never rebuild all at once (that burst is what 429-stormed
+        # the rebuild path). 0 disables the guard.
+        base = int(getattr(settings, "hb_session_recycle_s", 480) or 0)
+        self._recycle_s = (
+            float(base) * random.uniform(0.9, 1.15) if base > 0 else 0.0)
+        self._session_started = 0.0
 
     # ------------------------------------------------------------- session
     def _session_params(self) -> dict:
@@ -213,7 +224,19 @@ class HyperbrowserClient:
     async def _ensure_session(self) -> None:
         """Caller must hold this token's lock (see _key_lock, non-reentrant)."""
         if self._page is not None:
-            return
+            if self._recycle_s <= 0:
+                return
+            age = time.monotonic() - self._session_started
+            if age < self._recycle_s:
+                return
+            # Proactive recycle: letting the server-side duration cap fire
+            # mid-ask cost the swarm every in-flight call at once — the
+            # 2026-11-13 mass extinction and its 429 rebuild storm. A session
+            # this old dies within minutes; rebuild it between asks instead.
+            log.info("hyperbrowser session %s aged %.0fs (>= %.0fs guard) — "
+                     "recycling before the duration cap for %s",
+                     self._session_id, age, self._recycle_s, self.account.name)
+            await self._teardown()               # fall through to a fresh create
         from hyperbrowser import Hyperbrowser
 
         self._hb = Hyperbrowser(api_key=self.api_key)
@@ -243,6 +266,7 @@ class HyperbrowserClient:
         if sess is None:
             raise RuntimeError("hyperbrowser session creation failed")
         self._session_id = sess.id
+        self._session_started = time.monotonic()
         log.info("hyperbrowser session %s created for %s", sess.id, self.account.name)
         try:
             from playwright.async_api import async_playwright

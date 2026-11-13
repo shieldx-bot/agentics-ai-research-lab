@@ -66,3 +66,41 @@ def test_is_llm_failure_spans_backends():
     assert is_llm_failure(RuntimeError(
         "no usable browser-session account for purpose 'plan'")) is True
     assert is_llm_failure(RuntimeError("github api 403 rate limited")) is False
+
+
+# ------------------------------------------------------- infra vs provider
+def test_is_infra_failure_matches_session_transport_classes():
+    """The three transport classes from the live 2026-11-13 storm: a session
+    that died mid-ask (playwright target-closed family), a rebuild rejected
+    by the per-token cap, and a fresh session whose CDP endpoint 404'd."""
+    from agentics.llm.errors import is_infra_failure
+
+    assert is_infra_failure(RuntimeError(
+        "Page.evaluate: Target page, context or browser has been closed"))
+    assert is_infra_failure(RuntimeError(
+        "Maximum number of active sessions (1) reached. Please close some "
+        "sessions before creating new ones."))
+    assert is_infra_failure(RuntimeError(
+        'BrowserType.connect_over_cdp: WebSocket error ... 404 Not Found '
+        '{"code":"not_found","message":"session not found"}'))
+
+
+def test_is_infra_failure_matches_playwright_target_closed_type():
+    from agentics.llm.errors import is_infra_failure
+
+    class TargetClosedError(Exception):
+        pass
+
+    assert is_infra_failure(TargetClosedError("ws disconnected code=1006"))
+
+
+def test_is_infra_failure_rejects_model_auth_and_timeout_failures():
+    """The exemption stays scoped: answer/UI outages, plain read timeouts
+    and auth failures still feed the P20 fail-streak."""
+    from agentics.llm.errors import is_infra_failure
+
+    assert not is_infra_failure(RuntimeError(
+        "Perplexity produced no answer text after 120s"))
+    assert not is_infra_failure(RuntimeError("websocket read timed out (op=60s)"))
+    assert not is_infra_failure(RuntimeError(
+        "account-03: session-token cookie missing after load"))
