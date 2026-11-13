@@ -1064,6 +1064,11 @@ async def node_replicate(ctx: AgentContext, state: ResearchState) -> ResearchSta
         },
     )
     from agentics.verify.replication import replicate_pending
+    # the peer's workspace must be a real clone BEFORE the engine writes the
+    # protocol into it — write_file creates directories eagerly, and a
+    # later sync_main would then refuse to clone into the non-empty dir
+    # (the local_mode_demo caught exactly this ordering bug).
+    await asyncio.to_thread(ctx.workspace.sync_main)
     reports = await asyncio.to_thread(
         replicate_pending, ctx.memory, ctx.workspace, ctx.agent_id,
         limit=limit)
