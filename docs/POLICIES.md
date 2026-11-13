@@ -316,3 +316,44 @@ Test: `tests/test_reviewer_rerun.py`, `tests/test_p17_protocol_rerun.py`
 (kể cả tái tạo thật trên RepoWorkspace: protocol chỉ tồn tại trên branch
 MR, main không có — sau re-run main phải sạch như cũ).
 Chi tiết: [VERIFICATION.md](VERIFICATION.md) mục 6.
+
+## P19 — Peer panel: đánh giá lẫn nhau bằng bỏ phiếu, một lời phản đối là đủ
+
+P5 chỉ cấm tự duyệt; P17 bắt reviewer tái tạo bằng chứng. Nhưng một reviewer
+duy nhất vẫn là một ý kiến. P19 (cơ chế "đánh giá lẫn nhau" của owner) biến
+mỗi MR thành một phiên bỏ phiếu của panel đồng nghiệp — kết quả chung quan
+trọng hơn ý kiến riêng:
+
+1. **Bỏ phiếu panel** — mọi MR có bảng `mr_panels`; reviewer hợp lệ (agent
+   đang sống, không phải tác giả — P5 chặn cứng trong engine) vote
+   `accept/reject` kèm lý do; một phiếu/vòng/reviewer, phiếu đầu giữ nguyên
+   (audit trail). Panel đủ `PEER_PANEL_SIZE` phiếu accept (mặc định 2, đặt
+   lớn = cả swarm) VÀ không có reject nào → MR `approved`.
+2. **Một phiếu reject là quyết định** — bất kỳ agent nào không chấp nhận,
+   MR lập tức vào vòng **bảo vệ (defense)**: các objection được ghi lại và
+   thông báo cho toàn swarm; MR KHÔNG được merge trong lúc đó.
+3. **Bảo vệ quan điểm một lần, kiểm tra cơ khí** — tác giả phải phản bác
+   TỪNG objection (key theo id người phản đối) trong hạn
+   `PEER_DEFENSE_TTL_MINUTES` (mặc định 30 phút), có thể kèm
+   `extra_checks` chạy thật trong workspace của chính mình (evidence
+   `method="defense_check"`). Thiếu một phản đối → coi như không bảo vệ
+   được → **reject chốt (final)**. Thuả thua (`concede`) → reject chốt.
+   Quá hạn không bảo vệ → reject chốt (sweep của Supervisor).
+4. **Sau bảo vệ: người phản đối giữ quyền phủ quyết** — vòng 2 chỉ thuộc
+   các reviewer từng reject. Vẫn còn một reject → MR **rejected final**:
+   verdict `failed`, tools gỡ, task trả về hàng đợi `open` cho lượt thử
+   mới (ai cũng có thể nhận), reason thành trace để swarm học (GEA).
+   Objector mất heartbeat bị coi là rút phản đối — swarm không đợi người
+   chết, nhưng phiếu reject đã bỏ thì không bao giờ bị xoá.
+5. **Chống lách** — MR đang defense không thể `reopen_review` âm thầm;
+   bỏ phiếu sau khi MR đã approved là vô hiệu (MR thuộc merge queue với
+   các gate riêng); panel state là nguồn sự thật chung, dashboard hiển thị
+   state + phiếu + đồng hồ bảo vệ cho owner.
+
+Engine cơ khí (không LLM): `agentics/peer_review.py` — node graph:
+`node_review` (vote), `node_defend` (bảo vệ, router ưu tiên cao nhất cho
+mọi role), sweep trong `node_scan`.
+
+Test: `tests/test_peer_review.py` (18 kịch bản luật), 
+`tests/test_peer_review_memory.py`, `tests/test_nodes_integration.py`
+(vote mở defense), `tests/test_dashboard_api.py` (owner nhìn thấy panel).

@@ -177,3 +177,29 @@ streaming), `tests/test_reviewer_rerun.py` + `tests/test_p17_protocol_rerun.py`
 proving the protocol is checked out of the MR branch), plus the demo:
 `python scripts/local_mode_demo.py` prints a `supported` and a `refuted`
 hypothesis from real protocol executions.
+
+## 11. P19 peer panel — the defense round is evidence-gated too
+
+The panel (see POLICIES.md P19) is where verification meets veto: a single
+reject vote opens a defense round, and the author's defense is only as good
+as the runs behind it.
+
+* **Vote with evidence** — `node_review` keeps the P16 re-run + P17
+  reproduction machinery ahead of the vote: a refuted re-run votes `reject`
+  even when the LLM says approve (evidence overrides model opinion), and the
+  mechanical tier-2 gate votes `reject` without spending one LLM token.
+* **Defend with runs** — `node_defend` executes the author's declared
+  `extra_checks` (python/pytest only, allowlisted, bounded) in the author's
+  own workspace and records them as evidence rows with
+  `method="defense_check"` — the panel sees measurements next to the
+  rebuttals; an inconclusive or refuted defense check is common knowledge
+  the objectors weigh in round 2.
+* **Finality is journalled** — every decisive outcome (`panel_approved`,
+  `panel_rejected`, defense broadcasts, deadline sweeps) lands in the
+  shared journal and the dashboard alerts card, so the owner sees WHO
+  rejected WHAT and WHY, and the swarm learns from every dead MR (GEA).
+
+Pinned by `tests/test_peer_review.py`, `tests/test_peer_review_memory.py`,
+the defense paths in `tests/test_nodes_integration.py` /
+`tests/test_layer4_guard.py` / `tests/test_experiment_runner.py`, and the
+owner surfaces in `tests/test_dashboard_api.py`.
