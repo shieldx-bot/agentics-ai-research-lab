@@ -12,5 +12,10 @@ rich>=13.7.1
 fastapi>=0.115.0
 uvicorn>=0.30.0
 
+# Hyperbrowser cloud browser — BROWSER_BACKEND=hyperbrowser (production on a
+# VPS). Missing SDK = every LLM ask dies with ModuleNotFoundError; tests pass
+# because they stub the client, so this MUST stay a hard requirement.
+hyperbrowser>=1.15
+
 # Vector memory (optional but recommended)
 chromadb>=0.5.0
