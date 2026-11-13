@@ -151,7 +151,11 @@ def cmds_from_evidence(
     The author's recorded runs carry the exact command strings; the reviewer
     re-runs those SAME commands in their own workspace instead of trusting
     the recorded output. Returns (cmd_str, argv, hypothesis) triples, newest
-    last, deduplicated, the reviewer's own runs excluded."""
+    last, deduplicated, the reviewer's own runs excluded.
+
+    Only method='run_command' rows are candidates: protocol rows re-adjudicate
+    through run_protocols_on_branch (their cmd strings are descriptive, not
+    runnable), and reviewer_rerun rows are themselves re-runs."""
     import shlex
 
     uniq: list[tuple[str, list[str], str]] = []
@@ -159,6 +163,8 @@ def cmds_from_evidence(
     for row in rows or []:
         if exclude_agent and row.get("agent") == exclude_agent:
             continue                        # never re-run my own runs
+        if (row.get("method") or "run_command") != "run_command":
+            continue                        # protocol rows: P17 path; reruns: never
         cmd = (row.get("cmd") or "").strip()
         if not cmd or cmd in seen:
             continue

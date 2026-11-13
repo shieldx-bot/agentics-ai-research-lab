@@ -370,3 +370,39 @@ class RepoWorkspace:
             self.sync_main()
             self._git("branch", "-D", "review/tmp", check=False)
         return results
+
+    def run_protocols_on_branch(self, branch: str, protocols, timeout: int = 300):
+        """Reviewer-side protocol reproduction (P17): check out origin/<branch>
+        into a throw-away branch and re-run each (script, Criterion) through
+        the FULL two-run adjudication.
+
+        An exit-code re-run cannot judge a quantitative claim — a protocol
+        always exits 0; the frozen criterion is the verdict. This method
+        re-measures: a script that still prints AGENTICS_RESULT but misses
+        the criterion is REFUTED here. Always restores a clean main; never
+        raises (a failed checkout yields one inconclusive Evidence per
+        protocol). Returns a list of verify_ops.Evidence."""
+        from agentics.verify_metrics import run_protocol
+        from agentics.verify_ops import Evidence
+
+        self.sync_main()
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "review/tmp", f"origin/{branch}")
+        except RuntimeError as exc:
+            return [Evidence(cmd=str(script), exit_code=128, verdict="inconclusive",
+                             output=f"checkout failed: {exc}")
+                    for script, _criterion in protocols]
+        out = []
+        try:
+            for script, criterion in protocols:
+                try:
+                    out.append(run_protocol(self, script, criterion, timeout=timeout))
+                except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the rest
+                    out.append(Evidence(cmd=str(script), exit_code=-1,
+                                        verdict="inconclusive",
+                                        output=f"reproduction error: {exc}"))
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "review/tmp", check=False)
+        return out
