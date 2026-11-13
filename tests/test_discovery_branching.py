@@ -161,6 +161,12 @@ class _S:
     verify_protocol_repair_rounds = 0
     discovery_novelty_min = 70
     branch_max_depth = 4
+    # legacy-mode for the branching tests: the settle anchor law and the
+    # discovery double-judge gate are covered by their own suite
+    # (tests/test_settle_anchor_law.py) — here they would only add fixture
+    # noise (no peer account, no citations in the fakes).
+    settle_require_anchor = False
+    discovery_second_judge = False
 
 
 GOOD_JUDGE = json.dumps({"non_obviousness": 85, "clarity": 80,

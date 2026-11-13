@@ -182,6 +182,9 @@ class _S:
     idea_max_attempts = 2
     world_context_notes = 12
     verify_protocol_repair_rounds = 0
+    # legacy mode: the anchor law + double-judge gate have their own suite
+    settle_require_anchor = False
+    discovery_second_judge = False
 
 
 GOOD_JUDGE = json.dumps({"non_obviousness": 85, "clarity": 80,

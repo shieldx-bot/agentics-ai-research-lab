@@ -486,6 +486,18 @@ class SharedMemory:
                 "ALTER TABLE hypotheses ADD COLUMN novelty REAL NOT NULL DEFAULT 0",
                 "ALTER TABLE hypotheses ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE hypotheses ADD COLUMN branch TEXT NOT NULL DEFAULT ''",
+                # Settle anchor law (verdict provenance round): owner_approved
+                # is the local-only escape hatch — an input of the verdict
+                # the agent did NOT author; unanchored supported verdicts
+                # wait here (or for P24 replication) before becoming common
+                # ground.
+                "ALTER TABLE hypotheses ADD COLUMN owner_approved INTEGER NOT NULL DEFAULT 0",
+                # experiment_ledger provenance columns: every settle records
+                # its self_authored_ratio (1.0 = fully self-graded) and the
+                # JSON list of external anchors that made the verdict trust-
+                # worthy (citation / peer_judge / replication / ...).
+                "ALTER TABLE experiment_ledger ADD COLUMN self_authored_ratio REAL",
+                "ALTER TABLE experiment_ledger ADD COLUMN anchors TEXT NOT NULL DEFAULT ''",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -1055,6 +1067,43 @@ class SharedMemory:
                 (max(0.0, min(100.0, float(novelty))), hyp_id))
         return cur.rowcount > 0
 
+    def owner_approve(self, hyp_id: int, note: str = "") -> bool:
+        """Owner escape hatch (local-only mode): the human explicitly
+        accepts a claim — a verdict input the agent did NOT author, so it
+        anchors the settle (self_authored_ratio drops below 1).
+
+        Journal event `owner_approved` carries the decision for the audit
+        trail. Idempotent: approving twice changes nothing (True only on
+        the FIRST approval)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET owner_approved=1 "
+                "WHERE id=? AND owner_approved=0",
+                (int(hyp_id),))
+            changed = cur.rowcount > 0
+            if changed:
+                self._conn.execute(
+                    "INSERT INTO journal (ts, agent, event, detail) "
+                    "VALUES (?,?,?,?)",
+                    (time.time(), "owner", "owner_approved", json.dumps({
+                        "hyp": int(hyp_id), "note": (note or "")[:300],
+                    }, ensure_ascii=False)))
+        return changed
+
+    def settle_anchor_state(self, hyp_id: int) -> dict:
+        """The anchor flags a settle can read from the hypothesis row itself:
+        independent replication confirmed (P24) and owner approval. Everything
+        else (citations, peer judge, pinned data) comes from the settle site's
+        own context and is passed in separately."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT replication, owner_approved FROM hypotheses "
+                "WHERE id=?", (int(hyp_id),)).fetchone()
+        if row is None:
+            return {"replicated": False, "owner_approved": False}
+        return {"replicated": (row[0] or "") == "confirmed",
+                "owner_approved": bool(row[1])}
+
     def nearest_discovery_ancestor(self, hyp_id: int) -> dict | None:
         """The NEAREST discovery root in this hypothesis's lineage (the row
         itself when it IS a discovery). Bandit feedback input: a branch
@@ -1288,8 +1337,11 @@ class SharedMemory:
         the same claim forever (the sweep re-checks newest-first for drift;
         this path replicates each claim ONCE per swarm).
 
-        A row qualifies when: the claim is SETTLED 'supported' (refuted and
-        inconclusive claims are dead ends / fresh runs, nothing to confirm),
+        A row qualifies when: the claim is SETTLED 'supported' — or the NEW
+        `unanchored` status (a machine verdict that PASSED its criterion but
+        rests entirely on agent-authored inputs; replication is exactly its
+        path to supported, so unanchored rows jump the queue) — refuted and
+        inconclusive claims are dead ends / fresh runs, nothing to confirm;
         the protocol source is stored (P23), the requesting agent is NOT the
         author, and the claim has not been replicated yet (or an earlier
         replication came back inconclusive — a sandbox hiccup — with fewer
@@ -1298,10 +1350,11 @@ class SharedMemory:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {self.HYP_COLS} FROM hypotheses "
-                "WHERE status='supported' AND protocol_code != '' AND agent != ? "
+                "WHERE status IN ('supported','unanchored') "
+                "AND protocol_code != '' AND agent != ? "
                 "AND (replication = '' OR (replication = 'inconclusive' "
                 "     AND replication_attempts < 2)) "
-                "ORDER BY id ASC LIMIT ?",
+                "ORDER BY (status = 'unanchored') DESC, id ASC LIMIT ?",
                 (agent, limit),
             ).fetchall()
         return [self._hypothesis_row(r) for r in rows]
@@ -1685,20 +1738,29 @@ class SharedMemory:
         self, agent: str, hyp_id: int | None, status: str, metric: str = "",
         measured: float | None = None, op: str = "", target: float | None = None,
         verdict_note: str = "", protocol_path: str = "", source: str = "",
-        description: str = "",
+        description: str = "", self_authored_ratio: float | None = None,
+        anchors: str = "",
     ) -> int:
         """Append one settle to the experiment ledger (autoresearch's
         results.tsv: commit -> hyp_id, metric -> measured, status ->
-        supported|refuted|inconclusive, description -> verdict note)."""
+        supported|refuted|inconclusive, description -> verdict note).
+
+        Provenance (settle anchor law): `self_authored_ratio` is the share
+        of the verdict's deciding inputs the agent authored (1.0 = fully
+        self-graded); `anchors` is the JSON list of external anchor kinds
+        that made the verdict trustworthy. Both are None/'' for rows that
+        predate the law or carry no machine verdict."""
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO experiment_ledger (ts, agent, hyp_id, status, "
                 "metric, measured, op, target, verdict_note, protocol_path, "
-                "source, description) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source, description, self_authored_ratio, anchors) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, hyp_id, status, (metric or "")[:120],
                  measured, (op or "")[:4], target, (verdict_note or "")[:400],
                  (protocol_path or "")[:300], (source or "")[:40],
-                 (description or "")[:400]))
+                 (description or "")[:400], self_authored_ratio,
+                 (anchors or "")[:200]))
             self._conn.execute(
                 "DELETE FROM experiment_ledger WHERE id NOT IN "
                 "(SELECT id FROM experiment_ledger ORDER BY id DESC LIMIT 500)")
@@ -1709,12 +1771,13 @@ class SharedMemory:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, ts, agent, hyp_id, status, metric, measured, op, "
-                "target, verdict_note, protocol_path, source, description "
+                "target, verdict_note, protocol_path, source, description, "
+                "self_authored_ratio, anchors "
                 "FROM experiment_ledger ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall()
         keys = ("id", "ts", "agent", "hyp_id", "status", "metric", "measured",
                 "op", "target", "verdict_note", "protocol_path", "source",
-                "description")
+                "description", "self_authored_ratio", "anchors")
         return [dict(zip(keys, r)) for r in rows]
 
     def add_rejected_pattern(self, agent: str, claim: str, mechanism: str,

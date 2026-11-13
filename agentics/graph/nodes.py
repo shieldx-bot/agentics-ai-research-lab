@@ -1126,18 +1126,34 @@ async def _harvest_insights(ctx: AgentContext, parent_id: int,
         branch_mode = bool(
             novelty is not None and is_disc and novelty >= novelty_min)
         if branch_mode:
-            await asyncio.to_thread(
-                ctx.memory.mark_discovery, parent_id, novelty)
-            await asyncio.to_thread(
-                ctx.memory.journal, ctx.agent_id, "discovery_detected",
-                {"hyp": parent_id, "novelty": round(float(novelty), 1),
-                 "reason": reason[:200], "verdict": verdict,
-                 "branches_planned": len(children)})
-            await asyncio.to_thread(
-                ctx.memory.world_add, ctx.agent_id, "finding",
-                f"DISCOVERY(novelty={round(float(novelty))}): {claim[:150]} "
-                f"-> {verdict}; digging in: {reason[:120]}",
-                source=f"h#{parent_id}")
+            # double-judge + citation gate: the FIRST judge (this ideator)
+            # already said discovery; the gate demands an INDEPENDENT second
+            # opinion from another account AND an external citation URL —
+            # without them the discovery would rest entirely on inputs the
+            # authoring agent authored (self-graded surprise).
+            gate_ok, gate_why = await _discovery_gate(
+                ctx, claim, verdict, measured, novelty_min)
+            if gate_ok:
+                await asyncio.to_thread(
+                    ctx.memory.mark_discovery, parent_id, novelty)
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "discovery_detected",
+                    {"hyp": parent_id, "novelty": round(float(novelty), 1),
+                     "reason": reason[:200], "verdict": verdict,
+                     "branches_planned": len(children),
+                     "gate": "double_judge+citation"})
+                await asyncio.to_thread(
+                    ctx.memory.world_add, ctx.agent_id, "finding",
+                    f"DISCOVERY(novelty={round(float(novelty))}): {claim[:150]} "
+                    f"-> {verdict}; digging in: {reason[:120]}",
+                    source=f"h#{parent_id}")
+            else:
+                branch_mode = False
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "discovery_gate_denied",
+                    {"hyp": parent_id,
+                     "novelty": round(float(novelty), 1),
+                     "why": gate_why[:220]})
         if not children:
             await asyncio.to_thread(
                 ctx.memory.journal, ctx.agent_id, "insight_harvest_empty",
@@ -1214,6 +1230,113 @@ async def _branch_feedback(ctx: AgentContext, hyp_id: int, status: str) -> None:
                  "why": "branch settled refuted — this attack angle failed"})
     except Exception as exc:  # noqa: BLE001 — feedback must never break a settle
         log.warning("[%s] branch feedback failed: %s", ctx.agent_id, exc)
+
+
+# ------------------------------------------------- settle anchor law
+def _settle_law(ctx: AgentContext, hyp_id: int, claim: str, status: str,
+                ev, code: str, citations: int = 0):
+    """Apply the settle anchor law to one machine verdict (node paths).
+
+    The epistemic rule: `supported` requires self_authored_ratio < 1 — at
+    least one verdict input the agent did NOT author. Anchor sources at the
+    node level: external citation URLs from the ask that produced the
+    protocol, a pinned-hash dataset the protocol declares (verified against
+    the actual workspace file), an already-confirmed P24 replication, and
+    owner approval. An anchorless supported is downgraded to the new
+    `unanchored` status + journaled `settle_unanchored`; the caller records
+    the provenance (ratio + anchors) in the ledger row either way.
+    Returns (status_after, provenance). Never raises."""
+    from agentics.verify.anchors import (
+        apply_settle_law, detect_pinned_data, provenance_for_settle)
+    require = bool(getattr(ctx.settings, "settle_require_anchor", True))
+    try:
+        flags = ctx.memory.settle_anchor_state(hyp_id)
+    except Exception:  # noqa: BLE001 — provenance must never break a settle
+        flags = {"replicated": False, "owner_approved": False}
+    try:
+        pinned = detect_pinned_data(ctx.workspace, code)
+    except Exception:  # noqa: BLE001
+        pinned = False
+    prov = provenance_for_settle(
+        citations=citations, replicated=bool(flags.get("replicated")),
+        owner_approved=bool(flags.get("owner_approved")), pinned_data=pinned)
+    status, _downgraded = apply_settle_law(status, prov, require)
+    if _downgraded:
+        try:
+            ctx.memory.journal(ctx.agent_id, "settle_unanchored", {
+                "hyp": hyp_id, "claim": claim[:160],
+                "self_authored_ratio": prov.ratio,
+                "why": "verdict passed the criterion but every deciding "
+                       "input was agent-authored — supported withheld "
+                       "until independent replication / owner approval"})
+        except Exception:  # noqa: BLE001 — the law must never break a settle
+            pass
+    return status, prov
+
+
+def _world_kind(status: str) -> str:
+    """World-model kind for a settled status. `unanchored` is NOT verified
+    knowledge — it is a measured finding waiting for an external anchor, so
+    it enters the world model as a provisional `finding`, never as
+    `verified` (common ground only grows from anchored verdicts)."""
+    return ("verified" if status == "supported"
+            else "refuted" if status == "refuted"
+            else "finding" if status == "unanchored" else "gap")
+
+
+async def _discovery_gate(ctx: AgentContext, claim: str, verdict: str,
+                          measured: str,
+                          novelty_min: int) -> tuple[bool, str]:
+    """The discovery double-judge + external-citation gate.
+
+    mark_discovery fires only when TWO independent inputs agree the result
+    is surprising: (a) the ideator's own grading (checked by the caller)
+    and (b) a SECOND opinion from an INDEPENDENT account — a sibling view
+    of the session host pinned to the NEXT account, so the judge cannot be
+    the author's own cookie identity re-answering itself. The peer's
+    answer must also carry at least one external citation URL (Perplexity
+    academic mode returns citations natively): the URL is a verdict input
+    the authoring agent did not author.
+
+    Returns (ok, why). A failed gate never breaks the harvest — the result
+    simply keeps the plain follow-up behavior instead of branching."""
+    if not bool(getattr(ctx.settings, "discovery_second_judge", True)):
+        return True, "second judge disabled by config (DISCOVERY_SECOND_JUDGE=0)"
+    host = ctx.llm
+    try:
+        pool = len(host) if host is not None else 0
+    except Exception:  # noqa: BLE001 — non-pool hosts (fakes) have no peers
+        pool = 0
+    if host is None or pool < 2:
+        return False, (f"no independent judge account available "
+                       f"(pool={pool}; discovery needs a second identity)")
+    try:
+        peer_idx = ((int(getattr(host, "prefer_index", 0) or 0) + 1) % pool)
+        peer = host.view(peer_idx)
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        resp = await peer.ask(
+            idea.NOVELTY_JUDGE_PROMPT.format(
+                claim=claim[:1200], verdict=verdict,
+                measured=(measured or "none recorded")[:300],
+                world=world[:1500] or "(empty)", novelty_min=novelty_min),
+            mode="academic", purpose="research")
+        nov2, disc2, why2 = idea.parse_novelty_judgement(
+            getattr(resp, "answer", ""))
+        cites = list(getattr(resp, "citations", None) or [])
+        if nov2 is None:
+            return False, "second judge reply unparsable (no novelty contract)"
+        if not disc2 or nov2 < novelty_min:
+            return False, (f"second judge graded novelty "
+                           f"{round(float(nov2), 1)} (agreement requires "
+                           f">= {novelty_min}): {why2[:120]}")
+        if not cites:
+            return False, ("second judge returned no external citation URL "
+                           "— no input outside the author's reach")
+        return True, (f"peer judge novelty {round(float(nov2), 1)} + "
+                      f"{len(cites)} external citation(s)")
+    except Exception as exc:  # noqa: BLE001 — a failed gate never breaks the harvest
+        return False, f"second judge unavailable: {exc}"[:200]
 
 
 async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
@@ -1401,7 +1524,7 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         '"assumptions": "...", "effect": "..."}}]} '
         "with EXACTLY ONE entry."
     )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
     parsed = parse_json_block(answer)
     specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)]
     if not specs:
@@ -1500,6 +1623,14 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
     status = VERIFY_STATUS[ev.verdict]
     note = str(ev.meta.get("note", ""))
+    # Settle anchor law: `supported` needs at least one verdict input the
+    # agent did not author. The protocol-generation ask's citation URLs are
+    # that external input when Perplexity returns them.
+    status, prov = _settle_law(ctx, hyp_id, claim, status, ev, code,
+                               citations=len(ask_citations))
+    if status == "unanchored" and ev.verdict == "confirmed":
+        note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                f"no external anchor]")[:600]
     await asyncio.to_thread(
         ctx.memory.update_hypothesis, hyp_id, status,
         evidence_id=ev_id, note=note, protocol_path=path)
@@ -1507,30 +1638,34 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
         {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
          "note": note[:200], "evidence": ev_id,
-         "criterion": criterion.as_dict(), "source": "registry_deep_dive"},
+         "criterion": criterion.as_dict(), "source": "registry_deep_dive",
+         "self_authored_ratio": prov.ratio},
     )
     measured = ev.meta.get("metrics", {})
     # autoresearch ledger: this settle is now part of the keep/discard
     # history (supported=keep, everything else=discard) — the loop's memory
-    # of what was TRIED, failures included.
+    # of what was TRIED, failures included. The row carries the verdict's
+    # PROVENANCE (ratio + anchors) next to the verdict.
     await asyncio.to_thread(
         ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
         metric=criterion.metric,
         measured=measured.get(criterion.metric), op=criterion.op,
         target=criterion.target, verdict_note=note[:200],
-        protocol_path=path, source="deep_dive", description=claim[:200])
+        protocol_path=path, source="deep_dive", description=claim[:200],
+        self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
     # Kosmos world model: the settled registry claim becomes shared state.
-    wkind = ("verified" if status == "supported"
-             else "refuted" if status == "refuted" else "gap")
     await asyncio.to_thread(
-        ctx.memory.world_add, ctx.agent_id, wkind,
+        ctx.memory.world_add, ctx.agent_id, _world_kind(status),
         f"{claim[:180]} -> {status}"
         + (f" ({note[:120]})" if note else ""),
         source=f"h#{hyp_id}")
-    if status in ("supported", "refuted"):
+    if status in ("supported", "refuted", "unanchored"):
         # bandit-lite feedback FIRST: a branch settle credits/debits its
         # discovery root before the ideation round re-reads the registry.
-        await _branch_feedback(ctx, hyp_id, status)
+        # (An `unanchored` verdict never reinforces a discovery — its
+        # supported-grade is withheld precisely because it is untrusted.)
+        if status != "unanchored":
+            await _branch_feedback(ctx, hyp_id, status)
         # Kosmos closed loop: the settled result proposes its follow-ups.
         measured_txt = (f"{criterion.metric}={measured.get(criterion.metric)}"
                         if measured else note[:200])
@@ -1829,7 +1964,7 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "The signature quintuple is the idea's compact identity for the "
         "swarm's Quality-Diversity archive — keep each field under 25 words."
     )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
     parsed = parse_json_block(answer)
     specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:3]
     if not specs:
@@ -1933,6 +2068,17 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
         status = VERIFY_STATUS[ev.verdict]
         note = str(ev.meta.get("note", ""))
+        # Settle anchor law: `supported` needs at least one verdict input
+        # the agent did not author. External inputs here: citation URLs
+        # from the verify ask + the research citations the finding was
+        # grounded in (state), a pinned-hash dataset, P24 replication,
+        # owner approval.
+        status, prov = _settle_law(
+            ctx, hyp_id, claim, status, ev, protocol_code,
+            citations=len(ask_citations) + len(state.get("citations") or []))
+        if status == "unanchored" and ev.verdict == "confirmed":
+            note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                    f"no external anchor]")[:600]
         await asyncio.to_thread(
             ctx.memory.update_hypothesis, hyp_id, status,
             evidence_id=ev_id, note=note, protocol_path=path)
@@ -1940,40 +2086,47 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
             {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
              "note": note[:200], "evidence": ev_id,
-             "criterion": criterion.as_dict()},
+             "criterion": criterion.as_dict(),
+             "self_authored_ratio": prov.ratio},
         )
         # Kosmos world model: the settled fact becomes shared state with
-        # provenance — every next cycle's prompts read it back.
-        wkind = ("verified" if status == "supported"
-                 else "refuted" if status == "refuted" else "gap")
+        # provenance — every next cycle's prompts read it back. An
+        # `unanchored` verdict enters as a provisional `finding`, never as
+        # `verified` (common ground only grows from anchored verdicts).
         await asyncio.to_thread(
-            ctx.memory.world_add, ctx.agent_id, wkind,
+            ctx.memory.world_add, ctx.agent_id, _world_kind(status),
             f"{claim[:180]} -> {status}"
             + (f" ({note[:120]})" if note else ""),
             source=f"h#{hyp_id}")
         results.append({"claim": claim, "status": status, "note": note,
                         "hypothesis_id": hyp_id, "evidence_id": ev_id,
+                        "self_authored_ratio": prov.ratio,
                         "replication": False})
         # autoresearch ledger + discovery feedback + Kosmos harvest: the
         # MAIN verify path used to settle claims silently — no ledger row,
         # no novelty judgment, no branching. Every settle now feeds the
         # loop the same way the deep-dive path does (one harvest per cycle:
-        # prefer the first supported settle, else the first refuted).
-        if status in ("supported", "refuted"):
+        # prefer the first supported settle, then an unanchored one, else
+        # the first refuted). The ledger row carries the verdict's
+        # PROVENANCE (ratio + anchors) next to the verdict.
+        if status in ("supported", "refuted", "unanchored"):
             measured = ev.meta.get("metrics", {})
             await asyncio.to_thread(
                 ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
                 metric=criterion.metric,
                 measured=measured.get(criterion.metric), op=criterion.op,
                 target=criterion.target, verdict_note=note[:200],
-                protocol_path=path, source="verify", description=claim[:200])
-            await _branch_feedback(ctx, hyp_id, status)
+                protocol_path=path, source="verify", description=claim[:200],
+                self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
+            if status != "unanchored":
+                await _branch_feedback(ctx, hyp_id, status)
             measured_txt = (f"{criterion.metric}="
                             f"{measured.get(criterion.metric)}"
                             if measured else note[:200])
-            if harvest_target is None or (
-                    status == "supported"
-                    and harvest_target[2] != "supported"):
+            rank = {"supported": 2, "unanchored": 1}.get(status, 0)
+            if harvest_target is None or rank > {
+                    "supported": 2, "unanchored": 1}.get(
+                        harvest_target[2], 0):
                 harvest_target = (hyp_id, claim, status, measured_txt)
     if harvest_target is not None:
         await _harvest_insights(ctx, *harvest_target)
@@ -2697,7 +2850,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 what=f"implement:{hyp.hypothesis_id}", hyp_id=hyp_id)
             await asyncio.to_thread(
                 settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
-                method="hypothesis_contract")
+                method="hypothesis_contract",
+                require_anchor=bool(getattr(ctx.settings,
+                                            "settle_require_anchor", True)))
             # the protocol file rides the branch — the MR record must list it,
             # or the reviewer sees a diff file the record does not explain
             # (the protocol IS the evidence's source code)

@@ -175,6 +175,29 @@ INSIGHT_PROMPT = (
     '"assumptions": "...", "effect": "..."}}}}]}}'
 )
 
+# Second-opinion novelty judge (the discovery double-judge gate): an
+# INDEPENDENT account re-grades the same settled result WITHOUT seeing the
+# first judge's answer. mark_discovery fires only when BOTH judges agree
+# the result is surprising AND the peer's answer carries at least one
+# external citation URL (an input the authoring agent did not author).
+NOVELTY_JUDGE_PROMPT = (
+    "ROLE: independent novelty judge. A swarm experiment just SETTLED and "
+    "you are the SECOND opinion: grade how surprising this result is "
+    "against the world model below. Do not assume it is novel — many "
+    "results are routine confirmations.\n\n"
+    "Settled claim: {claim}\n"
+    "Verdict: {verdict}\n"
+    "Measured: {measured}\n\n"
+    "Swarm world model:\n{world}\n\n"
+    "novelty 0-100: 0-40 = routine confirmation of a known fact; 40-70 = "
+    "an expected-but-unmeasured extension; 70-100 = a SURPRISE the world "
+    "model cannot already explain. is_discovery = true only when "
+    "novelty >= {novelty_min}. Ground your judgment in real external "
+    "sources where possible.\n"
+    'Reply ONLY JSON: {{"novelty": 0, "is_discovery": false, "reason": '
+    '"one sentence"}}'
+)
+
 GAP_PROMPT = (
     "ROLE: gap-proposer. The literature topic is saturated and the "
     "hypothesis registry is EMPTY — the loop must not idle. Read the "
@@ -221,6 +244,30 @@ def parse_discovery(answer: str, max_children: int = 2):
     is_disc = bool(raw.get("is_discovery"))
     reason = str(raw.get("reason") or "")[:300]
     return novelty, is_disc, reason, children
+
+
+def parse_novelty_judgement(answer: str) -> tuple[float | None, bool, str]:
+    """Parse a second-opinion judge reply into (novelty, is_discovery, reason).
+
+    Same contract as parse_discovery's TASK 1 without the children; a
+    malformed or predating reply returns (None, False, "") — callers must
+    treat None as disagreement (never guess a discovery through)."""
+    try:
+        start = answer.find("{")
+        end = answer.rfind("}")
+        if start < 0 or end <= start:
+            return None, False, ""
+        raw = json.loads(answer[start:end + 1])
+    except (ValueError, TypeError):
+        return None, False, ""
+    if not isinstance(raw, dict):
+        return None, False, ""
+    nov = raw.get("novelty")
+    if not isinstance(nov, (int, float)) or isinstance(nov, bool):
+        return None, False, ""
+    return (max(0.0, min(100.0, float(nov))),
+            bool(raw.get("is_discovery")),
+            str(raw.get("reason") or "")[:300])
 
 
 def parse_children(answer: str, max_children: int = 2) -> list[dict]:
@@ -345,7 +392,8 @@ def parse_repair(answer: str) -> dict | None:
 
 __all__ = [
     "DEFAULT_REPAIR_MARGIN", "DEFAULT_TAU", "DISCOVERY_ANGLES", "GAP_PROMPT",
-    "INSIGHT_PROMPT", "JUDGE_PROMPT", "Judgement", "REPAIR_PROMPT",
-    "normalize_child", "qualification", "parse_children", "parse_discovery",
-    "parse_repair", "parse_scores",
+    "INSIGHT_PROMPT", "JUDGE_PROMPT", "Judgement", "NOVELTY_JUDGE_PROMPT",
+    "REPAIR_PROMPT", "normalize_child", "qualification", "parse_children",
+    "parse_discovery", "parse_novelty_judgement", "parse_repair",
+    "parse_scores",
 ]

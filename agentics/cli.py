@@ -1151,6 +1151,37 @@ def hypotheses(
         mem.close()
 
 
+@app.command()
+def approve(
+    hyp_id: int = typer.Argument(..., help="id của hypothesis cần chấp thuận"),
+    note: str = typer.Option("", "--note", "-n", help="lý do chấp thuận (ghi vào audit trail)"),
+) -> None:
+    """Owner: chấp thuận một claim (neo ngoài tầm với của agent).
+
+    Settle anchor law: một verdict chỉ được ghi `supported` khi có ít nhất
+    một đầu vào mà agent KHÔNG chấp bút. Chấp thuận của owner là đầu vào đó
+    trong local-only mode: self_authored_ratio giảm xuống dưới 1 và claim
+    unanchored được mở đường thành tri thức chung. Mọi quyết định được ghi
+    journal (event `owner_approved`) để audit."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        row = mem.get_hypothesis(hyp_id)
+        if row is None:
+            console.print(f"[red]Không tìm thấy hypothesis #{hyp_id}[/]")
+            raise typer.Exit(1)
+        if mem.owner_approve(hyp_id, note=note):
+            console.print(f"[green]Đã chấp thuận h#{hyp_id}[/] — {row['claim'][:120]}")
+            console.print(f"  anchors hiện có: {mem.settle_anchor_state(hyp_id)}")
+        else:
+            console.print("[yellow]Claim này đã được chấp thuận trước đó.[/]")
+    finally:
+        mem.close()
+
+
 @app.command("verify-all")
 def verify_all(
     limit: int = typer.Option(20, "--limit", "-l", help="số claim mới nhất được chạy lại"),

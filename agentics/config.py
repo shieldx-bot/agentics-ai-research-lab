@@ -243,6 +243,24 @@ class Settings:
         default_factory=lambda: _env_int("DISCOVERY_NOVELTY_MIN", 70))
     branch_max_depth: int = field(
         default_factory=lambda: _env_int("BRANCH_MAX_DEPTH", 4))
+    # Discovery double-judge gate: mark_discovery fires only when a SECOND,
+    # INDEPENDENT account re-grades the result as surprising AND its answer
+    # carries at least one external citation URL (an input the authoring
+    # agent did not author). Single-account setups therefore never mark
+    # discoveries — that is the honest behavior, not a bug (set 0 to
+    # restore the single-judge behavior).
+    discovery_second_judge: bool = field(
+        default_factory=lambda: _env_bool("DISCOVERY_SECOND_JUDGE", True))
+    # Settle anchor law (verdict provenance): a verdict may be recorded
+    # `supported` ONLY when self_authored_ratio < 1 — at least one input of
+    # the verdict (external citation, independent replication, owner
+    # approval, pinned-hash data) must be something the agent did NOT
+    # author. An anchorless supported is downgraded to `unanchored` and
+    # waits for independent replication (P24 promotes it when a peer's
+    # re-run agrees). The law guards OPTIMISM, not pessimism: refuted and
+    # inconclusive verdicts pass unchanged.
+    settle_require_anchor: bool = field(
+        default_factory=lambda: _env_bool("SETTLE_REQUIRE_ANCHOR", True))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(

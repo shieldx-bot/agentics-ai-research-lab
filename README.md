@@ -16,6 +16,25 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
 
 ## Có gì mới (2026-11)
 
+- **Luật neo verdict — `self_authored_ratio`** (2026-11-14, vòng "verdict
+  provenance"): trục kiểm duyệt KHÔNG phải "thuật toán vs AI" — mà là *ai cầm
+  bút viết thang điểm, và thang điểm có neo vào thứ nằm ngoài tầm với của
+  agent hay không*. Mỗi settle giờ đo **tỉ lệ đầu vào do agent chấp bút**
+  (protocol / target / data) và ghi vào ledger NGAY CẠNH verdict
+  (`self_authored_ratio` + danh sách anchor). **Luật settle:** verdict chỉ
+  được ghi `supported` khi ratio < 1 — tức phải có ít nhất một đầu vào ngoài
+  tầm với: citation URL từ nguồn ngoài (`citation`), replicate độc lập bởi
+  account khác (`replication` — P24), chấp thuận của owner trong local-only
+  mode (`python -m agentics.cli approve <id>`), dataset khóa hash mà protocol
+  khai báo (`# AGENTICS_ANCHOR: pinned_data <file> <sha256>`), hoặc CI
+  (`ci_verdict`, dành chỗ). Verdict "supported" thiếu neo bị hạ xuống trạng
+  thái mới **`unanchored`** (đã đo, đạt chuẩn, nhưng chưa tin được) — chỉ
+  replicate xác nhận / owner chấp thuận mới nâng lên `supported`
+  (`replication_promoted`). Cổng discovery nâng cấp tương ứng:
+  `mark_discovery` chỉ khi **hai judge độc lập đồng thuận** (tài khoản thứ
+  hai, không phải identity của tác giả) VÀ câu trả lời của judge thứ hai có
+  ít nhất một citation URL ngoài. `SETTLE_REQUIRE_ANCHOR=0` /
+  `DISCOVERY_SECOND_JUDGE=0` tắt (legacy).
 - **Vòng nghiên cứu QD closed-loop** (dựa trên Kosmos / IDEAgent / autoresearch,
   2026-11-14): world model dùng chung (`world_notes` — verified / refuted / gap),
   cổng ý tưởng IDEAgent (judge + repair một vòng + lưu mẫu bị từ chối), insight

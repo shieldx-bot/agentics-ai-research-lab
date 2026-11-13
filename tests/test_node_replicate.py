@@ -82,7 +82,7 @@ def _ctx(mem: SharedMemory, tmp_path: Path, role: Role,
     return SimpleNamespace(
         agent_id=agent_id, role=role, memory=mem, llm=llm,
         workspace=RunWS(ws_root), cycle=1,
-        settings=SimpleNamespace(research_topic="NFV",
+        settings=SimpleNamespace(research_topic="NFV", settle_require_anchor=False,
                                  replication_limit=replication_limit),
         heartbeat=lambda *a, **k: None, report=lambda **kw: None,
         meta={"personal": SimpleNamespace(add_lesson=lambda *a, **k: None)},

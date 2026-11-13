@@ -83,7 +83,7 @@ def _verify_ctx(mem, ws, agent_id="agent-b"):
         agent_id=agent_id, role=Role.RESEARCHER, memory=mem,
         workspace=ws, cycle=2, meta={},
         llm=SimpleNamespace(),        # truthy: the extraction call is faked below
-        settings=SimpleNamespace(research_topic="NFV"),
+        settings=SimpleNamespace(research_topic="NFV", settle_require_anchor=False),
         heartbeat=lambda status="working": None,
         report=lambda **kw: None,
     )

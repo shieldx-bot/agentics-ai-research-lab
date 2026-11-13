@@ -100,6 +100,9 @@ class _S:
     verify_protocol_repair_rounds = 0
     discovery_novelty_min = 70
     branch_max_depth = 4
+    # legacy mode: the anchor law + double-judge gate have their own suite
+    settle_require_anchor = False
+    discovery_second_judge = False
 
 
 def _ctx(mem, tmp_path, llm):
