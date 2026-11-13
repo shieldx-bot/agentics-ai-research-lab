@@ -290,7 +290,7 @@ class FakeWorkspace:
     def read_file(self, p):
         return ""
 
-    def write_file(self, p, c):
+    def write_file(self, p, c, allow=False):
         if self.guard is not None and self.guard.is_protected(p):
             raise ValueError(f"P10 protected path: '{p}' is lab code")
         (self.path / p).parent.mkdir(parents=True, exist_ok=True)

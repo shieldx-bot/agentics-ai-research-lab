@@ -28,6 +28,7 @@ from agentics.evolution.traces import (
 )
 from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
+from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
@@ -744,7 +745,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
             try:
-                await asyncio.to_thread(ctx.workspace.write_file, path, content)
+                # owner-exempt task ('agentics allow-protected'): the write
+                # gate opens for the task's agent-code files — credentials
+                # (.env, STOP, accounts/, configs/secrets.yaml) stay blocked.
+                # The diff gate (layer 2) re-verifies the whole set after.
+                allow = (bool(state.get("task_exempt"))
+                         and not is_credential_path(path))
+                await asyncio.to_thread(ctx.workspace.write_file, path, content, allow)
             except ValueError as exc:      # P10 layer 1: protected path / traversal
                 return await _yield(ctx, state, str(exc))
 
@@ -1102,6 +1109,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # recorded as evidence with method="reviewer_rerun" (hypothesis 3).
     rerun_digest = rerun_note = ""
     rerun_refuted = False
+    refuted_cmds: list[str] = []                 # original rows to re-verdict
     rerun_rows = cmds_from_evidence(ev_rows, max_cmds=3, exclude_agent=ctx.agent_id)
     rerun_ws = getattr(ctx, "workspace", None)
     if rerun_rows and candidate.get("branch") and hasattr(rerun_ws, "run_checks_on_branch"):
@@ -1114,6 +1122,8 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 ev_verdict = verdict_for(code)
                 rerun_counts[ev_verdict] = rerun_counts.get(ev_verdict, 0) + 1
                 rerun_refuted = rerun_refuted or ev_verdict == "refuted"
+                if ev_verdict == "refuted":
+                    refuted_cmds.append(cmd_str)
                 await asyncio.to_thread(
                     ctx.memory.record_evidence, ctx.agent_id, candidate.get("task_id"),
                     cmd_str, code, ev_verdict,
@@ -1132,6 +1142,61 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                     method="reviewer_rerun", output=str(exc))
             except Exception:  # noqa: BLE001
                 pass
+
+    # P17 — protocol reproduction: an exit-code re-run cannot judge a
+    # quantitative claim (a protocol always exits 0; the criterion is the
+    # verdict). For the author's CONFIRMED protocol rows the reviewer re-runs
+    # the full two-run adjudication against the ledger's frozen criterion, on
+    # the MR branch. A refuted reproduction re-verdicts the original row,
+    # downgrades the hypothesis and blocks the approval — self-reported
+    # evidence is never the last word.
+    proto_rows = [
+        e for e in ev_rows
+        if e["agent"] == candidate.get("author") and e["verdict"] == "confirmed"
+        and e.get("method") == "protocol" and e.get("hypothesis_id")
+    ][-2:]
+    if proto_rows and candidate.get("branch") and hasattr(rerun_ws, "run_protocols_on_branch"):
+        protocols = []
+        for row in proto_rows:
+            hyp = ctx.memory.get_hypothesis(row["hypothesis_id"])
+            if hyp and hyp.get("protocol_path"):
+                try:
+                    protocols.append(
+                        (row, hyp, Criterion.from_dict(hyp.get("criterion") or {})))
+                except ValueError:
+                    continue
+        if protocols:
+            try:
+                repros = await asyncio.to_thread(
+                    rerun_ws.run_protocols_on_branch, candidate["branch"],
+                    [(hyp["protocol_path"], crit) for _row, hyp, crit in protocols])
+            except Exception as exc:  # noqa: BLE001 — reproduction must never kill the review
+                repros = None
+                rerun_note += f" [P17 protocol reproduction unavailable: {exc}]"
+            if repros is not None:
+                for (row, hyp, crit), ev in zip(protocols, repros):
+                    note = str((ev.meta or {}).get("note", ""))[:200]
+                    rerun_refuted = rerun_refuted or ev.verdict == "refuted"
+                    await asyncio.to_thread(
+                        ctx.memory.record_evidence, ctx.agent_id,
+                        candidate.get("task_id"),
+                        f"protocol rerun of evidence #{row['id']} ({crit.describe()})",
+                        ev.exit_code, ev.verdict,
+                        hypothesis=row.get("hypothesis", "")[:200],
+                        method="reviewer_rerun", output=note or ev.output[-200:],
+                        duration_s=ev.duration_s, artifact=hyp["protocol_path"])
+                    if ev.verdict == "refuted":
+                        await asyncio.to_thread(
+                            ctx.memory.set_evidence_verdict, row["id"], "refuted",
+                            note=f"reviewer reproduction failed: {note}",
+                            by=ctx.agent_id)
+                        await asyncio.to_thread(
+                            ctx.memory.update_hypothesis, row["hypothesis_id"],
+                            "refuted",
+                            note=f"reviewer reproduction failed: {note}")
+                rerun_note += (f" [P17 protocol reproduction: {len(repros)} "
+                               f"claim(s) re-adjudicated on branch "
+                               f"{candidate['branch']}]")
     rerun_digest = rerun_note
 
     # P10 layers 3+4: protected paths never reach main via any MR — rejected
@@ -1207,12 +1272,31 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
 
 
-    if rerun_refuted and verdict == "approve":
-        # Evidence overrides model opinion: an independent re-run that refutes
-        # the author's check can never be approved, whatever the LLM says.
-        verdict = "request_changes"
-        comment = (f"{rerun_digest} the author's check FAILED in the reviewer's "
-                   f"own workspace — evidence overrides model opinion. {comment}")
+    if rerun_refuted:
+        # The author's confirmed rows that failed the independent re-run are
+        # re-verdicted (with a verdict_by trail), so the shared feed stops
+        # presenting them as confirmed and every agent learns the refutation.
+        for cmd_str in refuted_cmds:
+            for e in ev_rows:
+                if e["cmd"] == cmd_str and e["agent"] == candidate.get("author") \
+                        and e["verdict"] == "confirmed":
+                    await asyncio.to_thread(
+                        ctx.memory.set_evidence_verdict, e["id"], "refuted",
+                        note="reviewer re-run failed on the MR branch",
+                        by=ctx.agent_id)
+        ctx.memory.journal(ctx.agent_id, "reviewer_rerun_refuted", {
+            "mr": mr_id, "task": candidate.get("task_id"),
+            "branch": candidate.get("branch")})
+        if verdict == "approve":
+            # Evidence overrides model opinion: an independent re-run that refutes
+            # the author's check can never be approved, whatever the LLM says.
+            verdict = "request_changes"
+            comment = (f"{rerun_digest} the author's check FAILED in the reviewer's "
+                       f"own workspace — evidence overrides model opinion. {comment}")
+    elif rerun_note:
+        # the MR record shows what the reviewer independently re-ran (owner
+        # visibility: a green MR now says WHICH checks were reproduced)
+        comment = f"{comment} {rerun_note}"
 
     if verdict == "approve":
         await asyncio.to_thread(

@@ -81,7 +81,19 @@ agentics/   configs/   accounts/   scripts/   .github/
 The ONLY exemptions are owner-granted: per task
 (`python -m agentics.cli allow-protected <task_id>`, revoke with `--revoke`)
 or run-wide (`ALLOW_PROTECTED_PATHS=1`). Credentials (`accounts/`,
-`configs/secrets.yaml`) are **never** exemptable.
+`configs/secrets.yaml`, `.env`, `STOP`) are **never** exemptable.
+
+**Supervised evolution lane (follow-up fix).** Before this patch the owner
+exemption was dead on arrival: `allow_protected` unblocked only the PUSH
+(layer 4), while the write gate (layer 1) refused to even create an
+`agentics/` file — an exempt self-evolution task could never produce a
+change. The write gate now opens for the agent-code files of an exempt task
+(`write_file(allow=...)`, credentials never), while the pre-existing
+evolution allowlist still confines WHAT the exempt task may change. Two
+credential holes closed in the same pass: `.env` and `STOP` joined
+`accounts/` + `configs/secrets.yaml` in `ALWAYS_PROTECTED` (they could ride
+an exempt push before), and the `lstrip("./")` normalization bug that made
+`_always_protected(".env")` miss was fixed.
 
 **Git layer — pre-receive hook on the origin (`LocalRepo.ensure_guard`,
 `origin_hook_script`).** The gates above only see traffic that flows through

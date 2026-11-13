@@ -55,21 +55,26 @@ class BridgeWorkspace:
         self._changed = list(changed)
         self.script_result = script_result
         self.pushed, self.cmds = [], []
+        self._written: list[str] = []        # files written via write_file
         for f in self._changed:
             (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
             (tmp_path / f).write_text("x = 1\n")
 
     def sync_main(self): ...
     def checkout_new_branch(self, b): ...
-    def changed_files(self): return list(self._changed)
+    def changed_files(self):
+        # real workspaces report git status: pre-existing + written files
+        return list(dict.fromkeys([*self._changed, *self._written]))
     def read_file(self, p):
         f = self.path / p
         return f.read_text() if f.exists() else None
 
-    def write_file(self, p, c):
+    def write_file(self, p, c, allow=False):
         f = self.path / p
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(c, encoding="utf-8")
+        if p not in self._written:
+            self._written.append(p)
 
     def run_command(self, cmd, timeout=120):
         self.cmds.append(cmd)
