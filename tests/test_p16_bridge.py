@@ -130,6 +130,21 @@ def test_confirmed_hypothesis_reaches_the_shared_ledger(tmp_path):
     assert any(m["kind"] == "evidence" for m in mem.recent_messages())
 
 
+def test_settlement_supported_claim_becomes_common_ground(tmp_path):
+    """H3 closed loop: pre-register -> run -> settle with evidence_id -> the
+    claim shows up in verified_knowledge() that every agent's prompt carries."""
+    mem = SharedMemory(tmp_path / "m.db")
+    ws = BridgeWorkspace(tmp_path)
+    asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws), _impl_state(hypotheses=[_VALID_RAW])))
+    knowledge = mem.verified_knowledge()
+    assert len(knowledge) == 1
+    k = knowledge[0]
+    assert k["status"] == "supported" and "scan cache" in k["claim"]
+    assert k["evidence_id"] == mem.evidence_for_task(1)[0]["id"]
+    assert k["criterion"]["metric"] == "hit_rate" and k["criterion"]["target"] == 0.5
+
+
 def test_refuted_hypothesis_blocks_the_push(tmp_path):
     mem = SharedMemory(tmp_path / "m.db")
     ws = BridgeWorkspace(tmp_path)

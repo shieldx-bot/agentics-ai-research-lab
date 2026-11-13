@@ -852,9 +852,19 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 ctx.memory.journal(ctx.agent_id, "p16_hypothesis_invalid",
                                    {"task": hyp_task, "reason": reason[:200]})
                 continue
+            # pre-registration: the hypothesis enters the settlement table
+            # BEFORE the run, acceptance criterion frozen — the goalposts
+            # cannot move after the measurement is in.
+            hyp_id = ctx.memory.add_hypothesis(
+                ctx.agent_id, hyp.claim,
+                criterion={"metric": hyp.metric, "op": hyp.comparison,
+                           "target": hyp.threshold},
+                task_id=hyp_task, finding_id=hyp.source_finding,
+            )
+            ctx.memory.update_hypothesis(hyp_id, "testing")
             vr = await asyncio.to_thread(runner.run, hyp)
             rec = vr.to_record()
-            await asyncio.to_thread(
+            ev_id = await asyncio.to_thread(
                 ctx.memory.record_evidence, ctx.agent_id, hyp_task,
                 f"{hyp.script_path} -> {hyp.metric} {hyp.comparison} {hyp.threshold}",
                 rec["exit_code"] if rec["exit_code"] is not None else -1,
@@ -863,6 +873,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 method="hypothesis_contract",
                 output=rec["reason"] or rec["evidence"][:300],
                 duration_s=vr.duration_s, artifact=hyp.result_path)
+            # settlement: supported claims become reusable common ground,
+            # refuted claims stop being repeated (verified_knowledge -> prompts)
+            settled = {"confirmed": "supported", "refuted": "refuted",
+                       "inconclusive": "inconclusive"}[vr.verdict]
+            await asyncio.to_thread(
+                ctx.memory.update_hypothesis, hyp_id, settled,
+                evidence_id=ev_id, note=rec["reason"][:600])
             if vr.verdict == "refuted":
                 return await _yield(
                     ctx, state,
