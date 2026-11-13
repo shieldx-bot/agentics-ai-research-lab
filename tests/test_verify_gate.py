@@ -82,13 +82,20 @@ def test_plan_string_reaches_confirmed_through_the_production_flow(lab):
     assert row["verdict"] == "confirmed"
 
 
-def test_raw_plan_string_without_normalizer_would_be_blocked(lab):
-    """Documents the bug the normalizer fixes: the un-normalized string goes
-    through /bin/sh and is refused by the guard (126 -> inconclusive)."""
+def test_raw_plan_string_runs_without_a_shell_and_non_python_is_blocked(lab):
+    """Updated for the runner-level coercion contract (5f2105c): a plan-JSON
+    string like "python check_ok.py" is parsed to argv and really runs (no
+    shell involved), while a NON-python string is refused BEFORE any shell
+    exists (126 -> inconclusive) — a declared check either really runs or is
+    recorded as inconclusive with the reason, never faked as success."""
     ws, mem = lab
     (ws.path / "check_ok.py").write_text("print(40 + 2)\n", encoding="utf-8")
     evs = run_experiments(ws, ["python check_ok.py"], timeout=240)
-    assert evs[0].exit_code == 126 and evs[0].verdict == "inconclusive"
+    assert evs[0].exit_code == 0 and evs[0].verdict == "confirmed"
+    assert evs[0].cmd.startswith(sys.executable)      # shell never involved
+
+    evil = run_experiments(ws, ["rm -rf /"], timeout=240)
+    assert evil[0].exit_code == 126 and evil[0].verdict == "inconclusive"
 
 
 def test_refuted_check_is_recorded_for_everyone_to_see(lab):

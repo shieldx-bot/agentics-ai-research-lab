@@ -114,9 +114,10 @@ def run_experiment(workspace, cmd: list[str] | str, timeout: int = 300) -> Evide
                 path; the agent must re-plan, never "believes" success)
       * else -> refuted (the hypothesis did not hold under test)
 
-    String commands are parsed to argv (see coerce_cmd) — a shell is never
-    involved, so a declared check either really runs or is recorded as
-    inconclusive with the reason."""
+    Plan-JSON strings are coerced to argv (see coerce_cmd) — a shell is
+    never involved, so a declared check either really runs or is recorded
+    as inconclusive with the reason. node_implement additionally normalizes
+    the plan's list via normalize_verify_cmds (active interpreter only)."""
     argv, reason = coerce_cmd(cmd)
     if argv is None:
         return Evidence(
