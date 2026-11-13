@@ -188,6 +188,14 @@ class Settings:
         default_factory=lambda: _env_int("REPLAY_SWEEP_SIZE", 2))
     replay_every_n_cycles: int = field(
         default_factory=lambda: _env_int("REPLAY_EVERY_N_CYCLES", 3))
+    # P23 flood control: a claim replayed again within cooldown_s (or beyond
+    # replay_max_per_hyp total replays) adds no information — the sweep skips
+    # it. Live 2026-11-14: two replayable claims were re-run every sweep by
+    # both supervisors -> hundreds of duplicate evidence rows.
+    replay_cooldown_s: int = field(
+        default_factory=lambda: _env_int("REPLAY_COOLDOWN_S", 1800))
+    replay_max_per_hyp: int = field(
+        default_factory=lambda: _env_int("REPLAY_MAX_PER_HYP", 10))
     # P24bis — independent replication: reviewers re-run settled claims from
     # their stored protocols in their own workspaces. replication_limit caps
     # how many claims ONE reviewer cycle replicates (0 = off). No LLM is

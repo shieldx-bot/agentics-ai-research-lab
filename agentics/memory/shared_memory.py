@@ -1354,15 +1354,50 @@ class SharedMemory:
                 for r in rows]
 
     def settled_hypotheses(self, limit: int = 20,
-                           require_code: bool = False) -> list[dict]:
+                           require_code: bool = False,
+                           cooldown_s: float = 0,
+                           max_replays: int = 0) -> list[dict]:
         """Settled (supported|refuted) hypotheses, newest first — the replay
         sweep's input. `require_code` keeps only claims whose protocol source
-        is stored (replayable), so P21-pruned legacy claims are skipped."""
-        sql = (f"SELECT {self.HYP_COLS} FROM hypotheses "
-               "WHERE status IN ('supported','refuted')")
+        is stored (replayable), so P21-pruned legacy claims are skipped.
+
+        Flood control (live 2026-11-14: with only two replayable claims the
+        supervisors re-ran the SAME two protocols every sweep, flooding the
+        evidence ledger with hundreds of duplicate rows):
+        - cooldown_s: skip claims whose LAST replay evidence is younger than
+          this many seconds (0 = no cooldown);
+        - max_replays: skip claims already replayed this many times (0 = cap
+          off) — a claim confirmed K times adds no information on run K+1."""
+        sql = [f"SELECT {self.HYP_COLS} FROM hypotheses h",
+               "WHERE h.status IN ('supported','refuted')"]
         if require_code:
-            sql += " AND protocol_code != ''"
-        sql += " ORDER BY id DESC LIMIT ?"
+            sql.append(" AND h.protocol_code != ''")
+        if max_replays > 0:
+            sql.append(" AND (SELECT COUNT(*) FROM evidence e "
+                       "WHERE e.hypothesis_id = h.id AND e.method = 'replay') < ?")
+        if cooldown_s > 0:
+            sql.append(" AND (SELECT COALESCE(MAX(e.ts), 0) FROM evidence e "
+                       "WHERE e.hypothesis_id = h.id AND e.method = 'replay') < ?")
+        sql.append(" ORDER BY h.id DESC LIMIT ?")
+        args: list = []
+        if max_replays > 0:
+            args.append(max_replays)
+        if cooldown_s > 0:
+            args.append(time.time() - cooldown_s)
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute("\n".join(sql), args).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
+
+    def proposed_hypotheses(self, limit: int = 3) -> list[dict]:
+        """P16bis registry backlog: `proposed` claims with NO protocol yet,
+        OLDEST first. These are the hypotheses the swarm pre-registered (or
+        the tournament evolution bred) but nothing ever turned into a
+        runnable experiment — the deep-dive backlog node_research works
+        through when the literature topic is already saturated."""
+        sql = (f"SELECT {self.HYP_COLS} FROM hypotheses "
+               "WHERE status = 'proposed' AND protocol_code = '' "
+               "ORDER BY id ASC LIMIT ?")
         with self._lock:
             rows = self._conn.execute(sql, (limit,)).fetchall()
         return [self._hypothesis_row(r) for r in rows]

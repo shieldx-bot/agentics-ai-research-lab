@@ -365,7 +365,9 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         if sweep_size > 0 and every_n > 0 and ctx.cycle % every_n == 0 and workspace is not None:
             from agentics.verify.replay import replay_settled
             replay_report = replay_settled(
-                ctx.memory, workspace, limit=sweep_size, agent=ctx.agent_id)
+                ctx.memory, workspace, limit=sweep_size, agent=ctx.agent_id,
+                cooldown_s=getattr(ctx.settings, "replay_cooldown_s", 0),
+                max_replays=getattr(ctx.settings, "replay_max_per_hyp", 0))
     except Exception:  # noqa: BLE001 — replication must never break the scan
         replay_report = []
     replayed_n = sum(1 for r in replay_report if r.get("replayed"))
@@ -888,6 +890,151 @@ async def _dedup_known(ctx: AgentContext, topic: str) -> list[dict]:
     return known
 
 
+def _close_saturated_task(ctx: AgentContext, state: ResearchState) -> None:
+    """Stop re-awarding a task whose research target is fully covered.
+
+    The claim/release cycle below is what produced the live 400+-cycle idle
+    loop: contract-net re-awards the task, the researcher skips it as
+    covered, releases it, and the next cycle repeats. Closing the task (the
+    local board in local-only mode; a no-op on unknown ids in GitHub mode)
+    removes it from the open pool permanently."""
+    task_id = state.get("issue_number")
+    if not task_id:
+        return
+    try:
+        ctx.memory.set_task_status(task_id, "closed")
+        ctx.memory.journal(ctx.agent_id, "task_closed_saturated",
+                           {"task": task_id,
+                            "why": "topic covered, all angles researched"})
+    except Exception as exc:  # noqa: BLE001 — closure must never break research
+        log.warning("could not close saturated task %s: %s", task_id, exc)
+
+
+async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
+    """Deep-dive path: turn ONE registry `proposed` hypothesis into a real
+    experiment and adjudicate it with the same machine gate as node_verify.
+
+    Returns True when a hypothesis was picked up and run (or irreversibly
+    marked), False when the registry has nothing testable this cycle.
+    The hypothesis's OWN row is updated (status testing -> settled) so the
+    registry stays the single source of truth — no duplicate claim rows."""
+    if ctx.llm is None:
+        return False
+    try:
+        backlog = await asyncio.to_thread(ctx.memory.proposed_hypotheses, 1)
+    except Exception:  # noqa: BLE001
+        backlog = []
+    if not backlog:
+        return False
+    hyp = backlog[0]
+    try:
+        crit = json.loads(hyp.get("criterion") or "{}")
+    except Exception:  # noqa: BLE001
+        crit = {}
+    criterion_desc = (
+        f"metric={crit.get('metric')} op={crit.get('op')} target={crit.get('target')}"
+        + (f" tolerance={crit.get('tolerance')}" if crit.get("tolerance") else "")
+    )
+    prompt = (
+        "A research hypothesis was pre-registered by the swarm but never "
+        "tested. Write its self-contained python protocol.\n\n"
+        f"Hypothesis claim:\n{hyp['claim'][:1500]}\n\n"
+        f"Machine criterion (the protocol MUST print AGENTICS_RESULT with "
+        f"exactly this metric): {criterion_desc}\n\n"
+        f"{PROTOCOL_CONTRACT}\n"
+        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]} '
+        "with EXACTLY ONE entry."
+    )
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    parsed = parse_json_block(answer)
+    specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)]
+    if not specs:
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
+            {"hyp": hyp["id"], "why": "LLM returned no parsable protocol"})
+        return False
+    spec = specs[0]
+    code = str(spec.get("protocol", ""))
+    if not code.strip():
+        return False
+    try:
+        criterion = Criterion.from_dict(spec)
+    except ValueError as exc:
+        # Frozen registry criterion wins when the LLM disagrees with it.
+        try:
+            criterion = Criterion.from_dict(crit)
+        except ValueError:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
+                {"hyp": hyp["id"], "why": f"criterion unusable: {exc}"})
+            return False
+    hyp_id = hyp["id"]
+    claim = hyp["claim"]
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis, hyp_id, "testing")
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis_protocol_code, hyp_id, code[:20000])
+    await asyncio.to_thread(ctx.workspace.sync_main)   # workspace must exist
+    path = f"experiments/verify_h{hyp_id}.py"
+    try:
+        await asyncio.to_thread(ctx.workspace.write_file, path, code)
+    except ValueError as exc:            # P10 layer 1: protected / traversal
+        await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                "inconclusive", note=str(exc)[:300])
+        state["summary"] = f"deep-dive h#{hyp_id} blocked by guard: {exc}"
+        state["done"] = True
+        return True
+    try:
+        ev = await asyncio.to_thread(run_protocol, ctx.workspace, path, criterion)
+    except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the cycle
+        await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                "inconclusive", note=f"runner error: {exc}"[:300])
+        state["summary"] = f"deep-dive h#{hyp_id} runner error: {exc}"
+        state["done"] = True
+        return True
+
+    def _rerun(fixed_code: str):
+        try:
+            ctx.workspace.write_file(path, fixed_code)
+        except ValueError as exc:
+            return Evidence(
+                cmd=path, exit_code=126, verdict="inconclusive",
+                method="protocol", output=f"repair write refused: {exc}",
+                meta={"note": f"repair write refused: {exc}",
+                      "metrics": {}, "runs": []})
+        return run_protocol(ctx.workspace, path, criterion)
+
+    ev, _fixed = await _repair_protocol_rounds(
+        ctx, state, claim=claim, criterion=criterion, code=code,
+        ev=ev, rerun=_rerun, what=f"registry:h{hyp_id}", hyp_id=hyp_id)
+    ev_id = await asyncio.to_thread(
+        ctx.memory.record_evidence, ctx.agent_id, hyp.get("task_id"),
+        ev.cmd, ev.exit_code, ev.verdict,
+        hypothesis=claim, method=ev.method, output=ev.output,
+        duration_s=ev.duration_s, artifact=path)
+    await asyncio.to_thread(
+        ctx.memory.attach_protocol_outcome, ev_id,
+        ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
+    status = VERIFY_STATUS[ev.verdict]
+    note = str(ev.meta.get("note", ""))
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis, hyp_id, status,
+        evidence_id=ev_id, note=note, protocol_path=path)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
+        {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
+         "note": note[:200], "evidence": ev_id,
+         "criterion": criterion.as_dict(), "source": "registry_deep_dive"},
+    )
+    measured = ev.meta.get("metrics", {})
+    state["summary"] = (
+        f"deep-dive: tested registry h#{hyp_id} -> {status} "
+        f"(measured {measured or note[:80]})")
+    state["done"] = True
+    return True
+
+
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings.
 
@@ -936,7 +1083,17 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
                     rotated = True
                     break
         if not rotated:
+            # Saturation is NOT the end of the cycle — it is the moment to go
+            # DEEPER: the registry holds `proposed` hypotheses (pre-registered
+            # or tournament-bred) that nothing ever turned into a runnable
+            # experiment. Live 2026-11-14: with 5 findings covering the topic
+            # the researchers skipped for 400+ cycles while 4 proposed
+            # hypotheses sat untested and the evidence ledger grew only
+            # duplicate replays. Work the backlog instead of idling.
+            if await _test_proposed_hypothesis(ctx, state):
+                return state
             state["summary"] = f"topic already covered by {len(known)} findings; skipping"
+            _close_saturated_task(ctx, state)
             state["done"] = True
             return state
     # Breadth steering: the swarm's already-cited domains feed back into the
