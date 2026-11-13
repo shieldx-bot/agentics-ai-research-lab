@@ -158,6 +158,26 @@ def test_run_match_debate_updates_elo_zero_sum():
     assert "better idea" in match["rationale"]
 
 
+def test_run_match_b_win_raises_b_and_lowers_a():
+    """Live-found regression (Nov-2026 pre-prod eval): a jury verdict for the
+    SECOND hypothesis used to move Elo the wrong way — winner lost, loser
+    gained — because the a/b-space update was swapped on the b branch."""
+    mem = _memory()
+    ids = _hyps(mem, ["Alpha hypothesis about queueing", "Beta hypothesis about routing"])
+    pool = mem.tournament_pool()
+    llm = FakeLLM(["Turn 1... Turn 2...\nbetter idea: 2"])
+    ctx = _ctx(mem, llm)
+    res = asyncio.run(tour.run_match(ctx, pool[1], pool[0], "goal"))
+    assert res["winner"] == "b" and res["applied"] is True
+    ha, hb = mem.get_hypothesis(ids[0]), mem.get_hypothesis(ids[1])
+    assert hb["elo"] > 1200.0 and ha["elo"] < 1200.0       # the winner GAINS
+    assert abs((ha["elo"] + hb["elo"]) - 2400.0) < 1e-9    # still zero-sum
+    match = mem.recent_tournament_matches(1)[0]
+    assert match["winner"] == "b"
+    assert match["elo_b_after"] > match["elo_b_before"]    # ledger agrees
+    assert match["elo_a_after"] < match["elo_a_before"]
+
+
 def test_run_match_unparseable_verdict_records_invalid_and_no_elo():
     mem = _memory()
     ids = _hyps(mem, ["Alpha claims this", "Beta claims that"])

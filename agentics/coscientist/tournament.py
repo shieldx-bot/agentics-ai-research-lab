@@ -144,8 +144,14 @@ async def run_match(ctx, hyp_a: dict, hyp_b: dict, goal: str) -> dict:
     upd = update_elo(elo_a, elo_b, winner,
                      matches_played_min=min(int(a.get("matches_played") or 0),
                                             int(b.get("matches_played") or 0)))
-    elo_a_after = upd.elo_a_after if winner == "a" else upd.elo_b_after
-    elo_b_after = upd.elo_b_after if winner == "a" else upd.elo_a_after
+    # update_elo already works in (a, b) space: a_after is a's new rating and
+    # b_after is b's new rating no matter who won. An earlier version swapped
+    # the two on the b branch (porting artefact, found live in the Nov-2026
+    # pre-production eval): every b-win then moved Elo the WRONG way — the
+    # winner lost points and the loser gained — corrupting half of the
+    # tournament's quality signal. Keep the direct assignment.
+    elo_a_after = upd.elo_a_after
+    elo_b_after = upd.elo_b_after
     applied = ctx.memory.record_tournament_match(
         mid, ctx.agent_id, a["id"], b["id"], mode, winner,
         elo_a, elo_b, elo_a_after, elo_b_after, rationale=answer[:1200])
