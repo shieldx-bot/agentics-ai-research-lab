@@ -55,6 +55,27 @@ cookie nhỏ; bật retention (mặc định đã bật).
 4. **Lý lịch MR**: merge/reject/exempt/reverdict đều có dòng audit bất biến
    — đối chiếu sau sự cố không phụ thuộc journal đã trim (P21).
 
+## 4b. Backup — một lệnh, chạy khi lab vẫn đang sống
+
+```bash
+python scripts/backup_lab.py --dest backups --keep 7        # cron / systemd timer
+```
+
+Snapshot CÙNG LÚC: `shared_memory.db` (SQLite **online backup** — nhất quán
+kể cả khi các thread agent đang ghi) + `lab.git` (bundle, khôi phục bằng
+`git clone backups/backup-<ts>/lab.git.bundle`). `manifest.json` ghi kích
+thước + sha256 + số dòng audit/evidence/task/hypothesis — kiểm tra tính
+đầy đủ **không cần mở** backup. Backup không có bare repo (lab chưa chạy)
+vẫn snapshot DB và khai thật trong manifest; chỉ DB snapshot thất bại mới
+trả exit code 1.
+
+## 4c. Health probe — cho uptime monitor / systemd / k8s
+
+`GET /health` trên dashboard: `status`, `db`, `active_agents`,
+`last_heartbeat_age_s`, `last_event_age_s`. Rẻ (2 truy vấn COUNT), probe
+thường xuyên an toàn; DB đọc không được → **503 degraded** với lỗi, không
+bao giờ giả 200.
+
 ## 5. Checklist trước khi go-live
 
 - [ ] `python -m pytest -q` — full suite xanh trên máy đích.
@@ -66,5 +87,7 @@ cookie nhỏ; bật retention (mặc định đã bật).
       cookie thật (người dùng thử đã nói quota hữu hạn).
 - [ ] Chạy `scripts/local_mode_demo.py` trong sandbox riêng để thấy trọn
       vòng claim → verify → panel → merge trước khi chạy thật.
-- [ ] Đặt lịch sao lưu `data/` (SQLite + bare repo) — audit trail là thứ
-      KHÔNG thể tạo lại từ anywhere.
+- [ ] Đặt cron/systemd timer cho `scripts/backup_lab.py` (mỗi giờ là hợp lý)
+      — audit trail là thứ KHÔNG thể tạo lại từ anywhere.
+- [ ] Trỏ uptime monitor vào `http://<host>:<port>/health` (page khi
+      `status != ok` hoặc `last_heartbeat_age_s` vượt ngưỡng).
