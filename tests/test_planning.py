@@ -451,3 +451,74 @@ def test_plan_state_json_oversize_hypothesis_protocols_stay_parseable():
     assert "memory_record" not in loaded
     assert len(loaded["hypotheses"]) == 2
     assert loaded["hypotheses"][0]["code"].startswith("print(1)")
+
+
+# ------------------------------------------------- plan parse resilience
+def test_plan_retries_once_when_the_model_answers_in_prose(mem, monkeypatch):
+    """Live-run resilience: prose answers happen; one strict reminder turns
+    most of them into the JSON contract. A recovered retry is journalled."""
+    from agentics.graph import nodes
+
+    good = json.dumps({
+        "approach": "Chunk then parse.",
+        "files": [{"path": "experiments/p.py", "change": "new"}],
+        "steps": ["chunk"], "commit_message": "feat: chunked parser",
+        "verify_cmds": ["python experiments/p.py"],
+    })
+    asks: list[str] = []
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        asks.append(prompt)
+        if len(asks) == 1:
+            return "Here is my plan, hope you like it!", []
+        return good, []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    state = asyncio.run(nodes.node_plan(
+        ctx, {"issue_number": 1, "issue_title": "t", "category": "code",
+              "papers": [{"answer": ""}]}))
+    assert len(asks) == 2                        # exactly ONE retry
+    assert "not one JSON object" in asks[1]      # strict reminder appended
+    assert json.loads(state["plan"])["approach"] == "Chunk then parse."
+    assert not state.get("error")
+    events = [e["event"] for e in mem.recent_journal(limit=10)]
+    assert "plan_retry_recovered" in events
+
+
+def test_plan_after_a_failed_retry_still_ends_the_cycle(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    asks: list[str] = []
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        asks.append(prompt)
+        return "still not json", []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    state = asyncio.run(nodes.node_plan(
+        ctx, {"issue_number": 1, "issue_title": "t", "category": "code",
+              "papers": [{"answer": ""}]}))
+    assert len(asks) == 2
+    assert state["error"] == "plan parsing failed" and state["done"]
+
+
+def test_plan_provider_failure_does_not_retry(mem, monkeypatch):
+    """A provider error recorded in state must not burn a second ask."""
+    from agentics.graph import nodes
+
+    asks: list[str] = []
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        asks.append(prompt)
+        state["error"] = "llm plan call failed: cookie cooling down"
+        return "", []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    state = asyncio.run(nodes.node_plan(
+        ctx, {"issue_number": 1, "issue_title": "t", "category": "code",
+              "papers": [{"answer": ""}]}))
+    assert len(asks) == 1                        # no retry on provider failure
+    assert state["error"].startswith("llm plan call failed")

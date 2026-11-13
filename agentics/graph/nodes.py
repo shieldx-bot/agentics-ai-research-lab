@@ -1152,6 +1152,24 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
+    if not parsed and not state.get("error"):
+        # One strict retry: the live model occasionally answers in prose or
+        # wraps the object in commentary (a real live run lost its plan this
+        # way). Provider-level failures (state error set) do NOT retry — a
+        # cooling-down cookie needs time, not another immediate ask.
+        retry_answer, _ = await _llm_ask(
+            ctx,
+            prompt + "\n\nIMPORTANT: your previous reply was not one JSON "
+            "object. Reply AGAIN with ONLY the JSON object — no prose, no "
+            "markdown fence, nothing else.",
+            mode="concise", purpose="plan", state=state)
+        parsed = parse_json_block(retry_answer)
+        if parsed:
+            try:
+                ctx.memory.journal(ctx.agent_id, "plan_retry_recovered",
+                                   {"task": state.get("issue_number")})
+            except Exception:  # noqa: BLE001 — telemetry must never gate
+                pass
     if not parsed:
         state["error"] = state.get("error") or "plan parsing failed"
         state["done"] = True
