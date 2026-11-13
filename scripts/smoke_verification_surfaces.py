@@ -55,7 +55,7 @@ def main() -> None:
     env = {**dict(__import__("os").environ), "PYTHONPATH": str(REPO)}
     proc = subprocess.run(
         [sys.executable, "-m", "agentics.cli", "hypotheses"],
-        cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=60, check=False)
     # the CLI reads the repo's default data dir; a fresh clone has an empty DB,
     # so the command must succeed regardless and print a header or table
     assert proc.returncode == 0, proc.stderr[-400:]
