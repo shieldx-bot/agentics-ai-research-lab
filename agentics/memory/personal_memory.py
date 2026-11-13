@@ -15,6 +15,18 @@ v2 hardening (same ideas, closed loops — nothing new is invented):
   (checked every N inserts, keep the newest M rows by last_seen).
 - **Migration**: v1 (pre-dedup) databases are upgraded in place — new
   columns, hash backfill, duplicate consolidation — on first open.
+
+v3 (same dedup/recall ideas, one notch stronger):
+
+- **Number-blind identity**: recurring failures embed varying numbers
+  ("budget cap reached (57/50)", "PR #12", cycle ids). The identity hash now
+  collapses digit runs, so the SAME failure with different counts resolves
+  to one row and shows up as ``(xN)`` instead of N near-identical rows. The
+  stored text stays verbatim — only identity is number-blind.
+- **Issue-aware recall**: ``relevant_lessons`` boosts lessons recorded on the
+  same issue — the ``issue`` column was written since v1 but never read back.
+- **Migration**: v2 databases re-normalize their hashes in place (one sweep,
+  idempotent) and the duplicates that only now collapse are consolidated.
 """
 from __future__ import annotations
 
@@ -57,14 +69,23 @@ _LESSONS_TRIM_EVERY = 50
 _LESSONS_KEEP_ROWS = 500
 
 _WORD_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
+_DIGITS_RE = re.compile(r"\d+")
+
+# Identity-hash normalization version. v2 hashed the whitespace/case-normalized
+# text only; v3 additionally collapses digit runs (recurring failures embed
+# varying counts/ids). Bump this whenever normalization changes so old DBs
+# re-normalize + re-consolidate exactly once on open.
+_HASH_NORM_VERSION = "3"
 
 
 def lesson_hash(lesson: str) -> str:
-    """Stable identity of a lesson: case/whitespace-normalized text.
-
-    The same normalization the shared memory's ``claim_hash`` applies to
-    hypotheses, so a reworded repeat still resolves to the same row."""
-    normalized = " ".join((lesson or "").lower().split())
+    """Stable identity of a lesson: case/whitespace-normalized text with
+    digit runs collapsed — "budget cap reached (57/50)" and "(63/50)" are the
+    SAME recurring failure, not two lessons. The same normalization idea the
+    shared memory's ``claim_hash`` applies to hypotheses; digits are identity-
+    blind because they carry counts and ids that vary per cycle, while the
+    verbatim text stays stored for display."""
+    normalized = _DIGITS_RE.sub("#", " ".join((lesson or "").lower().split()))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
 
 
@@ -90,6 +111,7 @@ class PersonalMemory:
                 except sqlite3.OperationalError:
                     pass      # column already exists
             self._migrate_v1_rows()
+            self._renormalize_hashes_if_needed()
             self._conn.executescript(_SCHEMA_INDEXES)   # index AFTER the columns exist
 
     # ------------------------------------------------------------ migration
@@ -104,6 +126,36 @@ class PersonalMemory:
                 "UPDATE lessons SET lesson_hash=?, last_seen=? WHERE id=?",
                 (lesson_hash(text), ts, rid),
             )
+        self._consolidate_duplicate_lessons()
+
+    def _renormalize_hashes_if_needed(self) -> None:
+        """v3: digit-blind identity. A DB written by v2 carries digit-sensitive
+        hashes; recompute every row's hash under the new normalization and
+        consolidate the duplicates that only now collapse (hits roll up).
+        Guarded by a state key so the sweep runs exactly once per DB.
+
+        Runs inside __init__'s lock, so it talks to the connection directly —
+        get_state/set_state would re-acquire the (non-reentrant) lock."""
+        row = self._conn.execute(
+            "SELECT value FROM state WHERE key='lesson_hash_norm'").fetchone()
+        if row is not None and row[0] == _HASH_NORM_VERSION:
+            return
+        for rid, text in self._conn.execute(
+                "SELECT id, lesson FROM lessons").fetchall():
+            self._conn.execute(
+                "UPDATE lessons SET lesson_hash=? WHERE id=?",
+                (lesson_hash(text), rid),
+            )
+        self._consolidate_duplicate_lessons()
+        self._conn.execute(
+            "INSERT INTO state (key, value, updated_at) VALUES ('lesson_hash_norm',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=?, updated_at=?",
+            (_HASH_NORM_VERSION, time.time(), _HASH_NORM_VERSION, time.time()),
+        )
+
+    def _consolidate_duplicate_lessons(self) -> None:
+        """Collapse rows sharing a lesson_hash into the newest one, with the
+        group's hits summed — the same consolidation the v1 migration uses."""
         by_hash: dict[str, list[tuple[int, int]]] = {}
         for rid, lh, hits in self._conn.execute(
                 "SELECT id, lesson_hash, hits FROM lessons").fetchall():
@@ -168,21 +220,31 @@ class PersonalMemory:
             ).fetchall()
         return [f"{r[0]} (x{r[1]})" if r[1] > 1 else r[0] for r in rows]
 
-    def relevant_lessons(self, query: str, limit: int = 5) -> list[str]:
+    def relevant_lessons(
+        self, query: str, limit: int = 5, issue: int | None = None,
+    ) -> list[str]:
         """Lessons ranked by keyword overlap with the current task, then by
         how often they recurred (``hits``), then recency — the ranking the
         shared memory's tool/skill lookups already use. The agent's own
-        failures on similar work surface first."""
+        failures on similar work surface first.
+
+        v3: lessons recorded on the SAME issue get a fixed boost — the
+        ``issue`` column was written since v1 but never read back, so a
+        rework/retry of issue N now finds this agent's earlier cycles on N
+        even when the wording shares no keywords."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT lesson, hits, last_seen FROM lessons "
+                "SELECT lesson, hits, last_seen, issue FROM lessons "
                 "ORDER BY last_seen DESC, id DESC LIMIT 200",
             ).fetchall()
         words = set(_WORD_RE.findall((query or "").lower()))
         scored = []
-        for text, hits, last_seen in rows:
+        for text, hits, last_seen, row_issue in rows:
             hay = set(_WORD_RE.findall(text.lower()))
-            scored.append((len(words & hay), hits, last_seen, text))
+            overlap = len(words & hay)
+            if issue is not None and row_issue is not None and int(row_issue) == int(issue):
+                overlap += 3      # same-issue history outweighs a couple of keywords
+            scored.append((overlap, hits, last_seen, text))
         scored.sort(key=lambda t: (-t[0], -t[1], -t[2]))
         return [
             f"{t} (x{h})" if h > 1 else t

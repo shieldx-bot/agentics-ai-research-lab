@@ -20,11 +20,16 @@ Tables:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# Keyword tokeniser shared by the SQLite fallback lookups (finding_search) —
+# the same word shape the tool/skill/lesson rankings tokenize on.
+_WORD_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -42,7 +47,8 @@ CREATE TABLE IF NOT EXISTS findings (
     issue INTEGER,
     title TEXT NOT NULL,
     content TEXT NOT NULL,
-    citations TEXT NOT NULL DEFAULT '[]'
+    citations TEXT NOT NULL DEFAULT '[]',
+    vector_doc_id TEXT NOT NULL DEFAULT ''   -- v3 sync-trim: ChromaDB doc of this row
 );
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +324,11 @@ class SharedMemory:
         self._message_inserts = 0      # v2: bus/knowledge trims follow the
         self._finding_inserts = 0      # same every-N-inserts policy as the
         self._decision_inserts = 0     # journal/evidence feeds above
+        # v3 sync-trim: invoked (outside the SQLite lock) with the vector doc
+        # ids of findings rows the trim just deleted, so the vector tier can
+        # drop its copies. Wired by the orchestrator to VectorStore.delete_many;
+        # the memory layer itself never imports the vector store.
+        self._vector_trim_hook = None
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
             for column in (
@@ -335,6 +346,8 @@ class SharedMemory:
                 # P23 replay: keep the protocol source so settled claims can be
                 # re-run even after P21 pruned the workspaces that held them
                 "ALTER TABLE hypotheses ADD COLUMN protocol_code TEXT NOT NULL DEFAULT ''",
+                # v3 sync-trim: link each finding row to its vector document
+                "ALTER TABLE findings ADD COLUMN vector_doc_id TEXT NOT NULL DEFAULT ''",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -475,10 +488,29 @@ class SharedMemory:
         ]
 
     # ------------------------------------------------------------ findings
+    def set_vector_trim_hook(self, hook) -> None:
+        """Register `hook(doc_ids: list[str])` — called after a findings trim
+        deleted rows, with the vector doc ids of exactly those rows, so the
+        vector tier can drop its copies (v3 sync-trim). The hook runs OUTSIDE
+        the SQLite lock and its failures are swallowed: a vector hiccup must
+        never break the finding insert that triggered the trim."""
+        self._vector_trim_hook = hook
+
+    def set_finding_vector_doc(self, finding_id: int, doc_id: str) -> None:
+        """Link a finding row to the ChromaDB document that indexes it. Written
+        right after `vector.add` returns the doc id; empty/failed doc ids are
+        ignored so the trim hook simply never sees them."""
+        if not doc_id:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE findings SET vector_doc_id=? WHERE id=?", (doc_id, finding_id))
+
     def add_finding(
         self, agent: str, title: str, content: str,
         citations: list[str] | None = None, issue: int | None = None,
     ) -> int:
+        trimmed_docs: list[str] = []
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO findings (ts, agent, issue, title, content, citations) "
@@ -487,12 +519,47 @@ class SharedMemory:
             )
             self._finding_inserts += 1
             if self._finding_inserts % _FINDINGS_TRIM_EVERY == 0:
+                # v3 sync-trim: collect the vector docs of the rows about to
+                # die BEFORE the DELETE, then notify the hook outside the lock.
+                trimmed_docs = [
+                    r[0] for r in self._conn.execute(
+                        "SELECT vector_doc_id FROM findings WHERE id NOT IN "
+                        "(SELECT id FROM findings ORDER BY id DESC LIMIT ?)",
+                        (_FINDINGS_KEEP_ROWS,),
+                    ).fetchall() if r[0]
+                ]
                 self._conn.execute(
                     "DELETE FROM findings WHERE id NOT IN "
                     "(SELECT id FROM findings ORDER BY id DESC LIMIT ?)",
                     (_FINDINGS_KEEP_ROWS,),
                 )
-            return int(cur.lastrowid or 0)
+        if trimmed_docs and self._vector_trim_hook is not None:
+            try:
+                self._vector_trim_hook(trimmed_docs)
+            except Exception:  # noqa: BLE001 — sync-trim is best-effort
+                pass
+        return int(cur.lastrowid or 0)
+
+    def finding_search(self, term: str, limit: int = 5) -> list[dict]:
+        """Keyword search over stored findings — the SAME SQLite fallback the
+        policies layer uses when chromadb is absent, applied here to the
+        research dedup gate (P7): without a vector index the swarm still skips
+        topics it already researched instead of re-researching them blind."""
+        words = {w for w in _WORD_RE.findall((term or "").lower()) if len(w) > 2}
+        if not words:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, title FROM findings ORDER BY id DESC LIMIT 500",
+            ).fetchall()
+        scored = []
+        for fid, title in rows:
+            hay = set(_WORD_RE.findall((title or "").lower()))
+            hits = len(words & hay)
+            if hits:
+                scored.append((hits, fid, title))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        return [{"id": f, "title": t, "hits": h} for h, f, t in scored[:limit]]
 
     def get_finding(self, finding_id: int) -> dict | None:
         """One finding by id. The recall path (vector hits carry ``finding_id``
@@ -500,23 +567,25 @@ class SharedMemory:
         finding never leaks back into a prompt as a ghost row."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, ts, agent, issue, title, content, citations "
+                "SELECT id, ts, agent, issue, title, content, citations, vector_doc_id "
                 "FROM findings WHERE id=?", (finding_id,),
             ).fetchone()
         if row is None:
             return None
         return {"id": row[0], "ts": row[1], "agent": row[2], "issue": row[3],
-                "title": row[4], "content": row[5], "citations": json.loads(row[6])}
+                "title": row[4], "content": row[5], "citations": json.loads(row[6]),
+                "vector_doc_id": row[7]}
 
     def list_findings(self, limit: int = 100) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, ts, agent, issue, title, content, citations "
+                "SELECT id, ts, agent, issue, title, content, citations, vector_doc_id "
                 "FROM findings ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [
             {"id": r[0], "ts": r[1], "agent": r[2], "issue": r[3],
-             "title": r[4], "content": r[5], "citations": json.loads(r[6])}
+             "title": r[4], "content": r[5], "citations": json.loads(r[6]),
+             "vector_doc_id": r[7]}
             for r in reversed(rows)
         ]
 

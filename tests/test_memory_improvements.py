@@ -71,15 +71,17 @@ def test_lesson_trim_keeps_newest(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(pm_mod, "_LESSONS_TRIM_EVERY", 1)
     monkeypatch.setattr(pm_mod, "_LESSONS_KEEP_ROWS", 3)
     pm = PersonalMemory("a01", tmp_path)
-    for i in range(7):          # 7 distinct lessons → trim on every insert
-        pm.add_lesson(f"lesson number {i}")
+    # v3 note: identities are number-blind, so the lessons must differ in
+    # WORDS — "lesson number 0..6" is one recurring pattern now, not seven.
+    for i, ch in enumerate("abcdefg"):   # 7 distinct lessons → trim on every insert
+        pm.add_lesson(f"lesson variant {ch}")
         time.sleep(0.002)
     st = pm.lesson_stats()
     assert st["lessons"] == 3
     kept = pm.recent_lessons(limit=10)
-    assert kept and "lesson number 6" in kept[0]      # newest survived
+    assert kept and "lesson variant g" in kept[0]      # newest survived
     # a deduped lesson never counts as a new insert → no extra trim pressure
-    pm.add_lesson("lesson number 6")
+    pm.add_lesson("lesson variant g")
     assert pm.lesson_stats()["lessons"] == 3
     pm.close()
 

@@ -416,6 +416,16 @@ def memory_stats() -> None:
         f"[bold]Decisions:[/] {st['decisions']}   [bold]Evidence:[/] {st['evidence']}   "
         f"[bold]Hypotheses:[/] {st['hypotheses']}"
     )
+    # v3 sync-trim health: vector docs should track the findings count — a
+    # persistently larger number means the tier drifted (ghosts accumulating).
+    from agentics.memory.vector_store import VectorStore
+
+    vector = VectorStore(settings.chroma_path)
+    if vector.available:
+        drift = vector.count() - st["findings"]
+        note = "in sync" if drift == 0 else f"drift {drift:+d} (ghosts trimmed lazily)"
+        console.print(f"[bold]Vector docs:[/] {vector.count()} ({note})")
+    memory.close()
     if st["top_skills"]:
         table = Table(title="Most-reused skills")
         for col in ("uses", "category", "skill"):
@@ -423,7 +433,6 @@ def memory_stats() -> None:
         for s in st["top_skills"]:
             table.add_row(str(s["uses"]), s["category"], s["text"])
         console.print(table)
-    memory.close()
 
     # v2: personal memory health — deduped lessons per agent (the same DB
     # the graph opens at data/personal/<agent>.db, read-only here)

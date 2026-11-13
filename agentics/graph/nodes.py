@@ -70,18 +70,23 @@ def _panel_engine(ctx: AgentContext) -> PeerPanel:
 
 
 # ---------------------------------------------------------------- helpers
-def _lessons_text(ctx: AgentContext, query: str = "", limit: int = 5) -> str:
+def _lessons_text(ctx: AgentContext, query: str = "", limit: int = 5,
+                  issue: int | None = None) -> str:
     """The agent's OWN lessons from past cycles — the personal memory was
     write-only until now; this closes the loop so an agent stops repeating
     its own failures. With a ``query`` the lessons are ranked by relevance
-    to the current task; without one, by recency. Defensive: contexts (or
-    test doubles) without the recall methods degrade to "" — never a crash."""
+    to the current task (plus a same-issue boost, v3); without one, by
+    recency. Defensive: contexts (or test doubles) without the recall
+    methods degrade to "" — never a crash."""
     personal = (getattr(ctx, "meta", None) or {}).get("personal")
     if personal is None:
         return ""
     try:
         if query and hasattr(personal, "relevant_lessons"):
-            lessons = personal.relevant_lessons(query, limit)
+            try:      # v3 signature (query, limit, issue); v2 fakes lack `issue`
+                lessons = personal.relevant_lessons(query, limit, issue=issue)
+            except TypeError:
+                lessons = personal.relevant_lessons(query, limit)
         elif hasattr(personal, "recent_lessons"):
             lessons = personal.recent_lessons(limit)
         else:
@@ -633,10 +638,20 @@ async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
         ctx.memory.add_finding,
         ctx.agent_id, title, content, list(citations), state.get("issue_number"),
     )
-    await asyncio.to_thread(
+    # v3 sync-trim: remember WHICH vector doc indexes this row, so the day the
+    # findings trim evicts it the vector tier deletes the same doc (the ghost
+    # rows the recall path used to skip at read time never accumulate).
+    doc_id = await asyncio.to_thread(
         ctx.vector.add, content,
         {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
     )
+    if doc_id:
+        linker = getattr(ctx.memory, "set_finding_vector_doc", None)
+        if linker is not None:
+            try:
+                await asyncio.to_thread(linker, fid, doc_id)
+            except Exception:  # noqa: BLE001 — linking is best-effort
+                pass
     await asyncio.to_thread(
         ctx.memory.post_message,
         ctx.agent_id, "broadcast",
@@ -703,8 +718,19 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         "Focus on methods, benchmarks, reproducible results."
         + (f"\n\n{knowledge}" if knowledge else "")
     )
-    # P7: dedup — skip if the swarm already covered this
+    # P7: dedup — skip if the swarm already covered this. When the vector
+    # store is offline (chromadb absent / init failed) the SAME gate falls
+    # back to keyword search over the findings table — the SQLite fallback
+    # the policies layer already uses — so dedup survives without embeddings
+    # instead of re-researching every topic blind.
     known = await papers_mod.dedup_query(ctx.vector, topic)
+    if not getattr(ctx.vector, "available", False):
+        fallback = getattr(ctx.memory, "finding_search", None)
+        if fallback is not None:
+            try:
+                known = [m for m in fallback(topic, limit=5) if m.get("hits", 0) >= 2]
+            except Exception:  # noqa: BLE001 — dedup fallback must never break research
+                known = []
     if len(known) >= 3:
         state["summary"] = f"topic already covered by {len(known)} findings; skipping"
         state["done"] = True
@@ -913,9 +939,10 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}")
     # v2 memory loops: the planner sees its OWN relevant lessons (personal
     # memory) and the swarm's RELATED stored findings (vector recall) — both
-    # bounded, both defensive, both empty at cold start.
+    # bounded, both defensive, both empty at cold start. v3: lessons recorded
+    # on this very issue rank first (the retry/rework finds its own history).
     _query = f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}"
-    lessons_txt = _lessons_text(ctx, _query)
+    lessons_txt = _lessons_text(ctx, _query, issue=state.get("issue_number"))
     recall_txt = finding_recall_text(ctx, _query)
     personal_rule = (
         f"\nYour own lessons from past cycles (personal memory — never repeat "

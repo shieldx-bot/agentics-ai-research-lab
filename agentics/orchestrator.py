@@ -85,6 +85,10 @@ class Orchestrator:
         issue_ops.set_scan_cache_ttl(getattr(self.settings, "gh_scan_cache_ttl", 60))
         self.memory = SharedMemory(self.settings.db_path)
         self.vector = VectorStore(self.settings.chroma_path)
+        # v3 sync-trim: when the findings table evicts its oldest rows, the
+        # matching ChromaDB docs die with them — the vector tier stays the
+        # same size as the SQLite tier instead of accumulating ghosts.
+        self.memory.set_vector_trim_hook(self.vector.delete_many)
         self.host = BrowserSessionHost.from_settings(self.settings)
         self.local = LocalOps(self.memory, self.settings)
         self.local.setup()          # seed data/lab.git + the starter backlog
