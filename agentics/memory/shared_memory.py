@@ -212,6 +212,24 @@ CREATE TABLE IF NOT EXISTS hypotheses (
     replication_attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
+-- P23 — independent replication: a claim is "replicated" when ANOTHER agent
+-- re-runs the shareable protocol in its own workspace and the machine verdict
+-- agrees. One row per (evidence, replicator); the first peer to record wins
+-- the slot (claim-by-insert, no lock machinery).
+CREATE TABLE IF NOT EXISTS replications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    evidence_id INTEGER NOT NULL,
+    hypothesis_id INTEGER NOT NULL,
+    replicator TEXT NOT NULL,
+    verdict TEXT NOT NULL,                  -- confirmed | refuted | inconclusive
+    measured TEXT NOT NULL DEFAULT '{}',    -- JSON metrics the replicator measured
+    runs TEXT NOT NULL DEFAULT '[]',        -- JSON per-run detail (reproducibility)
+    note TEXT DEFAULT '',
+    duration_s REAL NOT NULL DEFAULT 0,
+    UNIQUE(evidence_id, replicator)
+);
+CREATE INDEX IF NOT EXISTS idx_replications_hyp ON replications(hypothesis_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 CREATE INDEX IF NOT EXISTS idx_findings_issue ON findings(issue);
 CREATE INDEX IF NOT EXISTS idx_journal_agent ON journal(agent);
@@ -1055,15 +1073,22 @@ class SharedMemory:
         """The swarm's verified knowledge (H3): settled hypotheses newest first.
 
         Injected into EVERY agent's memory context — refuted claims stop
-        being repeated, supported claims become reusable common ground."""
+        being repeated, supported claims become reusable common ground.
+        P23: each row carries `replicated` — True when an INDEPENDENT agent
+        (not the author) re-ran the protocol and the machine verdict agreed.
+        A prompt can then weigh "author-confirmed" against "independently
+        replicated" instead of treating both the same."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, claim, status, verdict_note, criterion, evidence_id "
+                "SELECT id, claim, status, verdict_note, criterion, evidence_id, "
+                "(SELECT COUNT(*) FROM replications r WHERE r.hypothesis_id="
+                "hypotheses.id AND r.verdict='confirmed') "
                 "FROM hypotheses WHERE status IN ('supported','refuted') "
                 "ORDER BY id DESC LIMIT ?", (limit,),
             ).fetchall()
         return [{"id": r[0], "claim": r[1], "status": r[2], "note": r[3],
-                 "criterion": json.loads(r[4] or "{}"), "evidence_id": r[5]}
+                 "criterion": json.loads(r[4] or "{}"), "evidence_id": r[5],
+                 "replicated": bool(r[6])}
                 for r in rows]
 
     def settled_hypotheses(self, limit: int = 20,
@@ -1080,6 +1105,118 @@ class SharedMemory:
             rows = self._conn.execute(sql, (limit,)).fetchall()
         return [self._hypothesis_row(r) for r in rows]
 
+    # ------------------------------------- independent replication (P23bis)
+    # The replay sweep re-runs claims over TIME (same ledger, drift events);
+    # this layer adds the INDEPENDENCE dimension (H3's social side): a claim
+    # is "replicated" when a DIFFERENT agent re-runs the shareable protocol
+    # in its own workspace and the machine verdict agrees. The two compose:
+    # replay answers "does it still hold?", replication answers "could
+    # anyone else produce it?".
+    def pending_replications(self, agent: str, limit: int = 5) -> list[dict]:
+        """Supported hypotheses whose evidence no peer has replicated yet.
+
+        Rules encoded here:
+          * status='supported' with a CONFIRMED evidence row — only agreed
+            measurements are worth the swarm's compute;
+          * protocol_code non-empty — only shareable evidence is replicable;
+          * author != agent — never replicate my own claim (independence is
+            the whole point, mirrors P5's no-self-review);
+          * no replication row exists for the evidence yet — the first peer
+            to record wins the slot (claim-by-insert, race-free)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT h.id, h.claim, h.criterion, h.protocol_code, "
+                "h.protocol_path, h.agent AS author, h.evidence_id "
+                "FROM hypotheses h JOIN evidence e ON e.id = h.evidence_id "
+                "WHERE h.status='supported' AND e.verdict='confirmed' "
+                "AND COALESCE(h.protocol_code,'') != '' "
+                "AND h.agent != ? "
+                "AND NOT EXISTS (SELECT 1 FROM replications r "
+                "                WHERE r.evidence_id = h.evidence_id) "
+                "ORDER BY h.id DESC LIMIT ?", (agent, limit),
+            ).fetchall()
+        return [{"hypothesis_id": r[0], "claim": r[1],
+                 "criterion": json.loads(r[2] or "{}"),
+                 "protocol_code": r[3], "protocol_path": r[4],
+                 "author": r[5], "evidence_id": r[6]}
+                for r in rows]
+
+    def record_replication(
+        self, evidence_id: int, hypothesis_id: int, replicator: str,
+        verdict: str, measured: dict, runs: list,
+        note: str = "", duration_s: float = 0.0,
+    ) -> bool:
+        """Record MY independent replication of one evidence row (P23).
+
+        False means the slot is gone — another agent already replicated this
+        evidence (single-replication-per-evidence, checked AND enforced here
+        so the guarantee does not depend on the node). The caller simply
+        moves on, no lock machinery needed. Also broadcasts (H3): every
+        agent sees the replication result on the message bus."""
+        with self._lock:
+            taken = self._conn.execute(
+                "SELECT 1 FROM replications WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchone()
+        if taken:
+            return False
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT INTO replications (ts, evidence_id, hypothesis_id, "
+                    "replicator, verdict, measured, runs, note, duration_s) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (time.time(), evidence_id, hypothesis_id, replicator[:64],
+                     verdict, json.dumps(measured, ensure_ascii=False),
+                     json.dumps(runs, ensure_ascii=False), note[:600],
+                     float(duration_s)),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        self.post_message(
+            replicator, "replication",
+            f"[{verdict.upper()}] replicated evidence #{evidence_id} of h#{hypothesis_id}"
+            + (f" — {note[:140]}" if note else ""),
+        )
+        self.journal(replicator, "replication", {
+            "evidence": evidence_id, "hypothesis": hypothesis_id,
+            "verdict": verdict, "measured": measured,
+        })
+        return True
+
+    def replication_for_evidence(self, evidence_id: int) -> dict | None:
+        """The recorded independent replication of one evidence row, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, evidence_id, hypothesis_id, replicator, verdict, "
+                "measured, runs, note, duration_s FROM replications "
+                "WHERE evidence_id=? ORDER BY id DESC LIMIT 1", (evidence_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "ts": row[1], "evidence_id": row[2],
+                "hypothesis_id": row[3], "replicator": row[4],
+                "verdict": row[5], "measured": json.loads(row[6] or "{}"),
+                "runs": json.loads(row[7] or "[]"), "note": row[8],
+                "duration_s": row[9]}
+
+    def replication_counts(self) -> dict[str, int]:
+        """Swarm-wide replication stats for the dashboard/CLI."""
+        with self._lock:
+            n_replicated = self._conn.execute(
+                "SELECT COUNT(DISTINCT hypothesis_id) FROM replications "
+                "WHERE verdict='confirmed'").fetchone()[0]
+            n_refuted = self._conn.execute(
+                "SELECT COUNT(*) FROM replications WHERE verdict='refuted'"
+            ).fetchone()[0]
+            n_pending = self._conn.execute(
+                "SELECT COUNT(*) FROM hypotheses h JOIN evidence e "
+                "ON e.id=h.evidence_id WHERE h.status='supported' "
+                "AND e.verdict='confirmed' AND COALESCE(h.protocol_code,'')!='' "
+                "AND NOT EXISTS (SELECT 1 FROM replications r "
+                "WHERE r.evidence_id=h.evidence_id)").fetchone()[0]
+        return {"replicated": n_replicated, "refuted": n_refuted,
+                "pending": n_pending}
 
     # ------------------------------------------------------------ decisions
     def add_decision(self, agent: str, decision: str, reason: str = "") -> None:
