@@ -56,7 +56,9 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
         "alerts": [
             e for e in memory.recent_journal(limit=120)
             if e.get("event") in ("integrity_drift", "scope_violation",
-                                  "lock_conflict")
+                                  "lock_conflict", "task_repair",
+                                  "merge_failed", "p16_inconclusive",
+                                  "p16_hypothesis_invalid")
         ][:12],
         "memory": memory.memory_stats(),
         "activity": memory.recent_journal(limit=40),
@@ -151,7 +153,7 @@ _HTML = """<!doctype html>
   <div class="card" style="grid-column:1/-1"><h2>Giả thuyết đã đăng ký (P16bis — tiêu chí chốt TRƯỚC khi chạy, máy chấm sau khi đo)</h2>
     <div class="kv" id="hypcounts"></div>
     <table id="hypotheses" style="margin-top:8px"><thead><tr><th>ID</th><th>Trạng thái</th><th>Giả thuyết</th><th>Tiêu chí</th><th>Đo được</th></tr></thead><tbody></tbody></table></div>
-  <div class="card"><h2>Cảnh báo guard / intent (P10/P13/P14)</h2>
+  <div class="card"><h2>Cảnh báo hệ thống (guard P10/P13/P14 · sửa chữa task · P16 nghi ngờ)</h2>
     <div class="acts" id="alerts"></div></div>
   <div class="card"><h2>Bộ nhớ (trí nhớ chung)</h2>
     <div class="kv" id="memory"></div></div>
