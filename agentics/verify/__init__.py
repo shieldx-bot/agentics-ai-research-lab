@@ -1,41 +1,49 @@
-"""P16 — Empirical verification: agents judge ideas by running code, not by
-trusting an LLM's prose.
+"""P16 (research side) — empirical verification for RESEARCH claims.
 
-    hypothesis.py — the contract: claim + prediction + measurable criterion +
-                    the experiment source (what the agent proposes to run)
-    runner.py     — the executor: runs the experiment inside the agent's
-                    workspace through the existing P2-guarded run_command,
-                    then computes the verdict FROM THE EVIDENCE (exit code +
-                    result JSON re-evaluated here), never from what the
-                    script (or an LLM) claims about itself.
+Composes the predecessor's stack instead of duplicating it:
 
-Verdicts: confirmed | refuted | inconclusive. Every run lands in the shared
-`verifications` ledger (shared memory) so ALL agents can read, quote and
-re-run each other's experiments — the swarm-level equivalent of publishing
-results instead of opinions.
+    verify_ops      — the Coder path: plan-declared verify_cmds run for real,
+                      verdicts from exit codes, evidence recorded (P16)
+    verify_metrics  — pre-registered Criterion + AGENTICS_RESULT protocol
+                      contract + 2-run reproducibility + machine adjudication
+    shared memory   — `evidence` table (broadcast verdicts, H3) and
+                      `hypotheses` table (pre-registration lifecycle:
+                      proposed -> testing -> supported|refuted|inconclusive)
+
+This package adds the piece that was missing from the live cycle: the
+RESEARCHER path. node_research used to end in LLM prose; with
+hypothesis.py + experiment.py the researcher states a falsifiable claim,
+pre-registers it, runs a protocol in its own workspace, and settles the
+claim into shared verified knowledge every agent's prompt can see.
 """
+from agentics.verify.experiment import (
+    register_hypothesis,
+    run_hypothesis,
+    settle_hypothesis,
+)
 from agentics.verify.hypothesis import (
-    COMPARISONS,
+    ALLOWED_OPS,
+    EXPERIMENT_DIR,
     HYPOTHESIS_PROMPT_CONTRACT,
+    PROTOCOL_CONTRACT,
     Hypothesis,
     hypothesis_from_json,
     parse_hypothesis,
-)
-from agentics.verify.runner import (
-    RESULT_DIR,
-    ExperimentRunner,
-    VerificationResult,
-    evaluate_criteria,
+    slugify,
+    stable_id,
 )
 
 __all__ = [
-    "COMPARISONS",
+    "ALLOWED_OPS",
+    "EXPERIMENT_DIR",
     "HYPOTHESIS_PROMPT_CONTRACT",
+    "PROTOCOL_CONTRACT",
     "Hypothesis",
     "hypothesis_from_json",
     "parse_hypothesis",
-    "RESULT_DIR",
-    "ExperimentRunner",
-    "VerificationResult",
-    "evaluate_criteria",
+    "slugify",
+    "stable_id",
+    "register_hypothesis",
+    "run_hypothesis",
+    "settle_hypothesis",
 ]
