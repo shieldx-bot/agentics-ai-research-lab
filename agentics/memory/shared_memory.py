@@ -95,6 +95,40 @@ CREATE TABLE IF NOT EXISTS world_notes (
     text TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT ''
 );
+-- autoresearch (karpathy/autoresearch) experiment ledger: EVERY settle --
+-- deep-dive, coder protocol, replication attempt -- lands here with
+-- keep/discard semantics (supported=keep, everything else=discard). The
+-- ledger is the loop's memory of what was TRIED, including failures: the
+-- near-miss retry pool and the diversity audit read it, the dashboard
+-- renders it. Bounded to the newest 500 rows.
+CREATE TABLE IF NOT EXISTS experiment_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    hyp_id INTEGER,
+    status TEXT NOT NULL,
+    metric TEXT DEFAULT '',
+    measured REAL,
+    op TEXT DEFAULT '',
+    target REAL,
+    verdict_note TEXT DEFAULT '',
+    protocol_path TEXT DEFAULT '',
+    source TEXT DEFAULT '',
+    description TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_hyp ON experiment_ledger(hyp_id);
+-- IDEAgent rejected-pattern archive (R): COMPACT summaries of rejected
+-- ideas -- mechanism + one-line reason, never the full idea -- fed back
+-- into ideation seed prompts so the loop pivots away from failing
+-- mechanisms instead of re-proposing them. Bounded to 100 rows.
+CREATE TABLE IF NOT EXISTS rejected_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    claim TEXT NOT NULL,
+    mechanism TEXT DEFAULT '',
+    reason TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -1490,6 +1524,103 @@ class SharedMemory:
         lines = [f"- [{mark.get(i['kind'], i['kind'].upper())}] {i['text'][:200]}"
                  f" ({i['source']})" for i in items]
         return "\n".join(lines)
+
+    # --------------------------------- ideation closed loop (QD pipeline)
+    # autoresearch ledger: keep/discard history of EVERY settle; IDEAgent
+    # rejected-pattern archive: compact failure memory for seed prompts;
+    # testable_hypotheses: the deep-dive retry pool (near-misses first).
+    def record_experiment(
+        self, agent: str, hyp_id: int | None, status: str, metric: str = "",
+        measured: float | None = None, op: str = "", target: float | None = None,
+        verdict_note: str = "", protocol_path: str = "", source: str = "",
+        description: str = "",
+    ) -> int:
+        """Append one settle to the experiment ledger (autoresearch's
+        results.tsv: commit -> hyp_id, metric -> measured, status ->
+        supported|refuted|inconclusive, description -> verdict note)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO experiment_ledger (ts, agent, hyp_id, status, "
+                "metric, measured, op, target, verdict_note, protocol_path, "
+                "source, description) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), agent, hyp_id, status, (metric or "")[:120],
+                 measured, (op or "")[:4], target, (verdict_note or "")[:400],
+                 (protocol_path or "")[:300], (source or "")[:40],
+                 (description or "")[:400]))
+            self._conn.execute(
+                "DELETE FROM experiment_ledger WHERE id NOT IN "
+                "(SELECT id FROM experiment_ledger ORDER BY id DESC LIMIT 500)")
+        return int(cur.lastrowid or 0)
+
+    def ledger_recent(self, limit: int = 50) -> list[dict]:
+        """Newest ledger rows, newest first (dashboard + audits)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, agent, hyp_id, status, metric, measured, op, "
+                "target, verdict_note, protocol_path, source, description "
+                "FROM experiment_ledger ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        keys = ("id", "ts", "agent", "hyp_id", "status", "metric", "measured",
+                "op", "target", "verdict_note", "protocol_path", "source",
+                "description")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def add_rejected_pattern(self, agent: str, claim: str, mechanism: str,
+                             reason: str) -> int:
+        """Archive one REJECTED idea as a compact pattern (IDEAgent R store:
+        failure patterns, not full ideas, to keep seed prompts bounded)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO rejected_patterns (ts, agent, claim, mechanism, "
+                "reason) VALUES (?,?,?,?,?)",
+                (time.time(), agent, (claim or "")[:400],
+                 (mechanism or "")[:200], (reason or "")[:200]))
+            self._conn.execute(
+                "DELETE FROM rejected_patterns WHERE id NOT IN "
+                "(SELECT id FROM rejected_patterns ORDER BY id DESC LIMIT 100)")
+        return int(cur.lastrowid or 0)
+
+    def rejected_render(self, limit: int = 8) -> str:
+        """Compact rejected-pattern list for ideation seed prompts."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mechanism, claim, reason FROM rejected_patterns "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        lines = []
+        for mech, claim, reason in rows:
+            head = mech or "unknown"
+            lines.append(f"- {head[:60]}: {(claim or '')[:100]}"
+                         + (f" (rejected: {reason[:80]})" if reason else ""))
+        return "\n".join(lines)
+
+    def testable_hypotheses(self, limit: int = 6,
+                            max_attempts: int = 2) -> list[dict]:
+        """Deep-dive backlog v2: fresh `proposed` claims PLUS bounded
+        near-miss RETRIES.
+
+        Retry pool (autoresearch): `inconclusive` hypotheses whose protocol
+        run measured nothing usable get another attempt — with the previous
+        failure note in the prompt — until `max_attempts` is exhausted, so
+        one bad protocol draft does not permanently bury a claim. Retries
+        come first (closest to knowledge), fresh claims keep registry age
+        order. `attempts` is incremented by every update_hypothesis call,
+        which bounds the loop by construction."""
+        sql = ("SELECT id, ts, agent, task_id, finding_id, claim, criterion, "
+               "protocol_path, status, verdict_note, evidence_id, attempts, "
+               "protocol_code, replication, replication_attempts "
+               "FROM hypotheses "
+               "WHERE (status='proposed' AND protocol_code='') "
+               "OR (status='inconclusive' AND attempts < ?) "
+               "ORDER BY CASE WHEN status='inconclusive' THEN 0 ELSE 1 END, "
+               "id ASC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, (max_attempts, limit)).fetchall()
+        out = []
+        for r in rows:
+            row = self._hypothesis_row(r)
+            row["signature"] = {}
+            out.append(row)
+        return out
 
     # ------------------------------------- independent replication (P24bis)
     # The P24 ledger above (hypotheses.replication + selection) is the

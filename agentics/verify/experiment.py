@@ -159,6 +159,19 @@ def settle_hypothesis(memory, agent: str, hyp_id: int, h: Hypothesis,
     status = _STATUS_BY_VERDICT.get(evidence.verdict, "inconclusive")
     note = (evidence.meta or {}).get("note", "") or evidence.output[:200]
     memory.update_hypothesis(hyp_id, status, evidence_id=ev_id, note=note)
+    # autoresearch ledger (keep/discard history of every settle) — the
+    # coder-path twin of the deep-dive's record_experiment call.
+    try:
+        metrics = (evidence.meta or {}).get("metrics", {}) or {}
+        crit = h.criterion.as_dict()
+        memory.record_experiment(
+            agent, hyp_id, status, metric=str(crit.get("metric", "")),
+            measured=metrics.get(str(crit.get("metric", ""))),
+            op=str(crit.get("op", "")), target=crit.get("target"),
+            verdict_note=str(note)[:200], protocol_path=h.script_path,
+            source=method or evidence.method, description=h.claim[:200])
+    except Exception:  # noqa: BLE001 — ledger must never break a settle
+        pass
     return ev_id
 
 

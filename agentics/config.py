@@ -215,6 +215,24 @@ class Settings:
     # involved: the criterion is frozen data and the verdict is machine-made.
     replication_limit: int = field(
         default_factory=lambda: _env_int("REPLICATION_LIMIT", 1))
+    # QD ideation closed loop (IDEAgent gate + Kosmos harvest, 2026-11-14):
+    # AGENTICS_IDEATION=0 turns the whole loop off (no ideation LLM calls);
+    # idea_min_score is the IDEAgent qualification gate tau (0-100);
+    # idea_repair_margin routes near-misses into ONE repair round;
+    # idea_max_children bounds how many follow-up hypotheses one settled
+    # experiment may spawn; idea_max_attempts bounds deep-dive RETRIES of
+    # inconclusive protocols (autoresearch: fix-and-rerun, then move on).
+    ideation_enabled: bool = field(
+        default_factory=lambda: _env("AGENTICS_IDEATION", "1")
+        .strip().lower() not in ("0", "false", "no", "off"))
+    idea_min_score: int = field(
+        default_factory=lambda: _env_int("IDEA_MIN_SCORE", 60))
+    idea_repair_margin: int = field(
+        default_factory=lambda: _env_int("IDEA_REPAIR_MARGIN", 20))
+    idea_max_children: int = field(
+        default_factory=lambda: _env_int("IDEA_MAX_CHILDREN", 2))
+    idea_max_attempts: int = field(
+        default_factory=lambda: _env_int("IDEA_MAX_ATTEMPTS", 2))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(

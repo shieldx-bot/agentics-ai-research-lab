@@ -50,6 +50,7 @@ from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
 from agentics.research import diversity as research_diversity
 from agentics.research import free_tools
+from agentics.research import ideation as idea
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
 from agentics import diversity as qd
@@ -957,6 +958,222 @@ async def _dedup_known(ctx: AgentContext, topic: str) -> list[dict]:
     return known
 
 
+# ------------------------------------ QD ideation closed loop (2026-11-14)
+# IDEAgent qualification gate + Kosmos insight harvest / gap proposal. All
+# LLM calls run with purpose="ideation" (routed to the general pool), are
+# budget-gated through _llm_ask, and degrade to "no ideation" on failure —
+# the deep-dive experiment itself never depends on the ideation round.
+
+async def _ideation_allowed(ctx: AgentContext) -> bool:
+    settings = getattr(ctx, "settings", None)
+    if not getattr(settings, "ideation_enabled", False):
+        return False
+    return ctx.llm is not None
+
+
+async def _reject_candidate(ctx: AgentContext, claim: str, reason: str,
+                            why: str) -> None:
+    """Archive a rejected candidate as a COMPACT pattern (IDEAgent R store)
+    and journal it. Full claims would bloat every future seed prompt."""
+    mech = ""
+    try:
+        mech = qd.classify(claim)
+    except Exception:  # noqa: BLE001 — taxonomy is advisory only
+        pass
+    await asyncio.to_thread(
+        ctx.memory.add_rejected_pattern, ctx.agent_id, claim, mech, reason)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "idea_rejected",
+        {"claim": claim[:160], "reason": reason, "mechanism": mech,
+         "why": why[:160]})
+
+
+async def _gate_and_register(ctx: AgentContext, child: dict,
+                             parents: list[int],
+                             recent: list[dict]) -> int | None:
+    """IDEAgent pipeline for ONE candidate: PEM near-dup gate -> judge ->
+    qualification (accept / one repair / reject) -> registry insert.
+
+    Returns the new hypothesis id, or None when the candidate is rejected
+    or the judge is unavailable. `parents` keeps the Kosmos lineage (the
+    settled experiment row this idea grew from)."""
+    child = idea.normalize_child(child)
+    if child is None:                    # contract violation — nothing to judge
+        return None
+    claim = child["claim"]
+    crit = child["criterion"]
+    # Cheap mechanical gate first: a near-clone of ANY recent hypothesis
+    # (any status) is archived as a rejected pattern without an LLM call.
+    threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+    dup = qd.near_duplicate(claim, recent, threshold)
+    if dup is not None:
+        await _reject_candidate(
+            ctx, claim,
+            f"near-duplicate of h#{dup[1].get('id')} "
+            f"(jaccard={dup[0]:.2f})", "PEM: re-proposed an existing idea")
+        return None
+    # IDEAgent judge: one call, scores on the four axes.
+    answer, _ = await _llm_ask(
+        ctx,
+        idea.JUDGE_PROMPT.format(claim=claim[:1200],
+                                 criterion=json.dumps(crit, ensure_ascii=False)),
+        purpose="ideation")
+    j = idea.parse_scores(answer)
+    if j is None:
+        return None                      # judge unavailable — no registration
+    tau = float(getattr(ctx.settings, "idea_min_score", 60))
+    margin = float(getattr(ctx.settings, "idea_repair_margin", 20))
+    route = idea.qualification(j, tau=tau, repair_margin=margin)
+    if route == "reject":
+        await _reject_candidate(
+            ctx, claim, f"gate rejected (Q={j.quality():.0f}, "
+            f"weak={j.worst_margin(tau):+.0f})",
+            j.notes[:120] or "IDEAgent gate")
+        return None
+    if route == "repair":
+        # ONE repair round: fix the weak axes WITHOUT changing the
+        # mechanism (IDEAgent Stage II), then re-judge the child.
+        weak = (f"non_obviousness={j.non_obviousness:.0f}, "
+                f"clarity={j.clarity:.0f}, soundness={j.soundness:.1f}")
+        r_answer, _ = await _llm_ask(
+            ctx,
+            idea.REPAIR_PROMPT.format(claim=claim[:1000],
+                                      criterion=json.dumps(crit,
+                                                           ensure_ascii=False),
+                                      feedback=j.notes[:300] or "see weak scores",
+                                      weak=weak),
+            purpose="ideation")
+        fixed = idea.parse_repair(r_answer)
+        if fixed is None:
+            await _reject_candidate(
+                ctx, claim, "repair round produced nothing usable",
+                "IDEAgent repair")
+            return None
+        j2 = None
+        r2, _ = await _llm_ask(
+            ctx,
+            idea.JUDGE_PROMPT.format(claim=fixed["claim"][:1200],
+                                     criterion=json.dumps(fixed["criterion"],
+                                                          ensure_ascii=False)),
+            purpose="ideation")
+        j2 = idea.parse_scores(r2)
+        if j2 is None or idea.qualification(
+                j2, tau=tau, repair_margin=0.0) != "accept":
+            await _reject_candidate(
+                ctx, claim, "repaired child still below the gate",
+                "IDEAgent repair")
+            return None
+        child, claim, crit = fixed, fixed["claim"], fixed["criterion"]
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "idea_repaired",
+            {"final_claim": claim[:160], "Q_before": round(j.quality(), 1),
+             "Q_after": round(j2.quality(), 1)})
+    hyp_id = await asyncio.to_thread(
+        ctx.memory.add_hypothesis, ctx.agent_id, claim, crit,
+        parents=parents)
+    sig = child.get("signature")
+    if isinstance(sig, dict) and sig:
+        await asyncio.to_thread(
+            ctx.memory.set_hypothesis_signature, hyp_id, sig)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "idea_registered",
+        {"hyp": hyp_id, "claim": claim[:160], "parents": parents,
+         "Q": round(j.quality(), 1), "route": route})
+    return hyp_id
+
+
+async def _harvest_insights(ctx: AgentContext, parent_id: int,
+                            claim: str, verdict: str, measured: str) -> int:
+    """Kosmos closed loop: a settled experiment proposes its FOLLOW-UPS.
+
+    One ideation call -> up to idea_max_children children -> each gated
+    through _gate_and_register (PEM + judge + repair). Returns how many
+    children were registered; never raises."""
+    if not await _ideation_allowed(ctx):
+        return 0
+    try:
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        rejected = ctx.memory.rejected_render()
+        recent = ctx.memory.recent_hypotheses(12)
+        n_children = max(1, int(getattr(ctx.settings, "idea_max_children", 2)))
+        answer, _ = await _llm_ask(
+            ctx,
+            idea.INSIGHT_PROMPT.format(
+                n_children=n_children, claim=claim[:1200],
+                verdict=verdict, measured=measured[:300] or "none recorded",
+                world=world[:1800] or "(empty)", rejected=rejected[:800] or "(none)"),
+            purpose="ideation")
+        children = idea.parse_children(answer, max_children=n_children)
+        if not children:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "insight_harvest_empty",
+                {"parent_hyp": parent_id, "verdict": verdict})
+            return 0
+        registered = 0
+        for child in children:
+            # refresh the archive before EACH child: a child registered
+            # moments ago must already block its own clones (IDEAgent: the
+            # active archive grows as candidates are admitted).
+            recent_now = ctx.memory.recent_hypotheses(12)
+            hyp_id = await _gate_and_register(ctx, child, [parent_id],
+                                              recent_now)
+            if hyp_id is not None:
+                registered += 1
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "insight_harvest",
+            {"parent_hyp": parent_id, "verdict": verdict,
+             "proposed": len(children), "registered": registered})
+        return registered
+    except Exception as exc:  # noqa: BLE001 — harvest must never break a settle
+        log.warning("[%s] insight harvest failed: %s", ctx.agent_id, exc)
+        return 0
+
+
+async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
+    """Kosmos world model as TASK PROPOSER: topic saturated + registry
+    empty -> the agent reads the world model and registers ONE gap-closing
+    hypothesis instead of idling (autoresearch NEVER-STOP clause).
+
+    Returns True when a hypothesis was registered (the deep-dive can pick
+    it up in the same or next cycle)."""
+    if not await _ideation_allowed(ctx):
+        return False
+    try:
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        rejected = ctx.memory.rejected_render()
+        recent = ctx.memory.recent_hypotheses(12)
+        recent_claims = [r["claim"] for r in recent]
+        answer, _ = await _llm_ask(
+            ctx,
+            idea.GAP_PROMPT.format(
+                world=world[:1800] or "(empty)",
+                recent="\n".join(f"- {c[:140]}" for c in recent_claims[:10])
+                or "(none)",
+                rejected=rejected[:800] or "(none)"),
+            purpose="ideation")
+        children = idea.parse_children(answer, max_children=1)
+        if not children:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "gap_proposal_empty",
+                {"why": "no parsable gap hypothesis"})
+            return False
+        hyp_id = await _gate_and_register(ctx, children[0], [], recent)
+        if hyp_id is None:
+            return False
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "gap_hypothesis_registered",
+            {"hyp": hyp_id, "claim": children[0]["claim"][:160],
+             "source": "world_model_gap"})
+        state["summary"] = (f"saturation pivot: registered gap hypothesis "
+                            f"h#{hyp_id} from the world model")
+        return True
+    except Exception as exc:  # noqa: BLE001 — proposal must never crash research
+        log.warning("[%s] gap proposal failed: %s", ctx.agent_id, exc)
+        return False
+
+
 def _close_saturated_task(ctx: AgentContext, state: ResearchState) -> None:
     """Stop re-awarding a task whose research target is fully covered.
 
@@ -988,23 +1205,43 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
     if ctx.llm is None:
         return False
     try:
-        backlog = await asyncio.to_thread(ctx.memory.proposed_hypotheses, 6)
+        max_attempts = int(getattr(ctx.settings, "idea_max_attempts", 2))
+        backlog = await asyncio.to_thread(
+            ctx.memory.testable_hypotheses, 6, max_attempts)
     except Exception:  # noqa: BLE001
         backlog = []
     if not backlog:
         return False
-    # DAPS CCR: pick the candidate whose MECHANISM category is rarest in the
-    # recent hypothesis stream (ties -> oldest), not blindly the oldest —
-    # acceptance pressure otherwise amplifies the proposer's skewed prior.
+    # Deep-dive backlog v2 (autoresearch): `inconclusive` near-misses whose
+    # protocol measured nothing usable come FIRST (retry with the failure
+    # note in the prompt, bounded by idea_max_attempts), then fresh
+    # `proposed` claims.
+    retries = [h for h in backlog if h.get("attempts", 0) > 0]
+    fresh = [h for h in backlog if h.get("attempts", 0) == 0]
+    # DAPS CCR: pick the FRESH candidate whose MECHANISM category is rarest
+    # in the recent hypothesis stream (ties -> oldest), not blindly the
+    # oldest — acceptance pressure otherwise amplifies the proposer's prior.
     try:
         recent = await asyncio.to_thread(ctx.memory.recent_hypotheses, 10)
         backlog_ids = {h["id"] for h in backlog}
         recent_claims = [r["claim"] for r in recent
                          if r.get("id") not in backlog_ids]
-        backlog = qd.coverage_order(backlog, recent_claims)
+        fresh = qd.coverage_order(fresh, recent_claims)
     except Exception:  # noqa: BLE001 — CCR must never block the deep dive
+        recent = []
         pass
+    backlog = retries + fresh
     hyp = backlog[0]
+    is_retry = hyp.get("attempts", 0) > 0
+    retry_note = ""
+    if is_retry:
+        retry_note = (
+            f"\n\nIMPORTANT: previous attempt #{hyp.get('attempts')} of this "
+            f"protocol failed to measure anything usable: "
+            f"{str(hyp.get('verdict_note') or 'unknown failure')[:400]}. "
+            "Write a CORRECTED protocol — if the failure was trivial (a bug, "
+            "a missing import) fix it; if the measurement approach itself "
+            "was broken, change it. Keep it simple.\n")
     # DAPS PEM inherit: a registry proposal that is a near-clone of an
     # already-SETTLED claim inherits that verdict instead of burning a
     # protocol run on a re-wording (same convention as node_verify's reuse).
@@ -1045,7 +1282,8 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         "tested. Write its self-contained python protocol.\n\n"
         f"Hypothesis claim:\n{hyp['claim'][:1500]}\n\n"
         f"Machine criterion (the protocol MUST print AGENTICS_RESULT with "
-        f"exactly this metric): {criterion_desc}\n\n"
+        f"exactly this metric): {criterion_desc}\n"
+        f"{retry_note}\n"
         f"{PROTOCOL_CONTRACT}\n"
         'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
         '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
@@ -1057,6 +1295,19 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
     parsed = parse_json_block(answer)
     specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)]
     if not specs:
+        if is_retry:
+            # autoresearch: after a failed fix attempt, retire the claim —
+            # the idea (not the protocol) is fundamentally broken.
+            await asyncio.to_thread(
+                ctx.memory.update_hypothesis, hyp["id"], "refuted",
+                note="retired after failed retry: protocol unfixable")
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_retired",
+                {"hyp": hyp["id"], "why": "retry produced no usable protocol"})
+            state["summary"] = (f"deep-dive: retired h#{hyp['id']} after a "
+                                f"failed retry (protocol unfixable)")
+            state["done"] = True
+            return True
         await asyncio.to_thread(
             ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
             {"hyp": hyp["id"], "why": "LLM returned no parsable protocol"})
@@ -1093,6 +1344,11 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
     except ValueError as exc:            # P10 layer 1: protected / traversal
         await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
                                 "inconclusive", note=str(exc)[:300])
+        await asyncio.to_thread(
+            ctx.memory.record_experiment, ctx.agent_id, hyp_id,
+            "inconclusive", metric=criterion.metric, op=criterion.op,
+            target=criterion.target, verdict_note=str(exc)[:200],
+            protocol_path=path, source="deep_dive", description=claim[:200])
         state["summary"] = f"deep-dive h#{hyp_id} blocked by guard: {exc}"
         state["done"] = True
         return True
@@ -1101,6 +1357,11 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
     except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the cycle
         await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
                                 "inconclusive", note=f"runner error: {exc}"[:300])
+        await asyncio.to_thread(
+            ctx.memory.record_experiment, ctx.agent_id, hyp_id,
+            "inconclusive", metric=criterion.metric, op=criterion.op,
+            target=criterion.target, verdict_note=f"runner error: {exc}"[:200],
+            protocol_path=path, source="deep_dive", description=claim[:200])
         state["summary"] = f"deep-dive h#{hyp_id} runner error: {exc}"
         state["done"] = True
         return True
@@ -1138,6 +1399,16 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
          "note": note[:200], "evidence": ev_id,
          "criterion": criterion.as_dict(), "source": "registry_deep_dive"},
     )
+    measured = ev.meta.get("metrics", {})
+    # autoresearch ledger: this settle is now part of the keep/discard
+    # history (supported=keep, everything else=discard) — the loop's memory
+    # of what was TRIED, failures included.
+    await asyncio.to_thread(
+        ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
+        metric=criterion.metric,
+        measured=measured.get(criterion.metric), op=criterion.op,
+        target=criterion.target, verdict_note=note[:200],
+        protocol_path=path, source="deep_dive", description=claim[:200])
     # Kosmos world model: the settled registry claim becomes shared state.
     wkind = ("verified" if status == "supported"
              else "refuted" if status == "refuted" else "gap")
@@ -1146,7 +1417,11 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         f"{claim[:180]} -> {status}"
         + (f" ({note[:120]})" if note else ""),
         source=f"h#{hyp_id}")
-    measured = ev.meta.get("metrics", {})
+    if status in ("supported", "refuted"):
+        # Kosmos closed loop: the settled result proposes its follow-ups.
+        measured_txt = (f"{criterion.metric}={measured.get(criterion.metric)}"
+                        if measured else note[:200])
+        await _harvest_insights(ctx, hyp_id, claim, status, measured_txt)
     state["summary"] = (
         f"deep-dive: tested registry h#{hyp_id} -> {status} "
         f"(measured {measured or note[:80]})")
@@ -1210,6 +1485,16 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
             # hypotheses sat untested and the evidence ledger grew only
             # duplicate replays. Work the backlog instead of idling.
             if await _test_proposed_hypothesis(ctx, state):
+                return state
+            # Registry exhausted too — Kosmos: the world model is a TASK
+            # PROPOSER, not just context. One gap-closing hypothesis gets
+            # registered from the open gaps/questions (gated: PEM + IDEAgent
+            # judge) and the deep-dive works it in the same or next cycle.
+            # Only when even the pivot fails does the lab honestly rest.
+            if await _propose_gap_hypothesis(ctx, state):
+                if await _test_proposed_hypothesis(ctx, state):
+                    return state
+                state["done"] = True
                 return state
             state["summary"] = f"topic already covered by {len(known)} findings; skipping"
             _close_saturated_task(ctx, state)
