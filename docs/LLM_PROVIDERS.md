@@ -209,6 +209,13 @@ Research fan-out (P18b, `research_fanout` in `configs/lab.yaml` or
   records bounded page metadata (URL/title/body excerpt), distinguishes an
   expired login from a provider verification/challenge page, and tears down
   the failed session.
+* One in-place recovery precedes the escalation: a missing composer triggers
+  a home reload + one more wait before any circuit opens, so a slow SPA
+  hydration no longer opens the shared circuit breaker that used to stall
+  every agent for minutes (the 25 s-timeout incident class, 2026-11-12).
+* A submit that silently produces NO answer text after the full answer wait
+  window raises a UI outage (same no-cooldown treatment) instead of returning
+  an empty answer — downstream nodes used to crash parsing `""` as JSON.
 * A verification page opens a process-wide circuit breaker (10 minutes); a
   generic composer/frontend failure opens it for 3 minutes. While open, agents
   fail fast instead of creating sessions for every account.

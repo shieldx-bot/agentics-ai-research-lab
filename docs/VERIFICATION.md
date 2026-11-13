@@ -203,3 +203,40 @@ Pinned by `tests/test_peer_review.py`, `tests/test_peer_review_memory.py`,
 the defense paths in `tests/test_nodes_integration.py` /
 `tests/test_layer4_guard.py` / `tests/test_experiment_runner.py`, and the
 owner surfaces in `tests/test_dashboard_api.py`.
+
+## 12. P23 replay — replication runs inside the live cycle (H2 + H3 closed)
+
+A settled verdict is a measurement, and measurements go stale: dependencies
+move, protocols drift, an early run may simply have been wrong. The replay
+engine (`agentics/verify/replay.py`) re-runs a SETTLED claim from its stored
+protocol source (registered with `protocol_code` since the P23 precondition
+commit) and re-settles it from fresh measurements:
+
+| outcome | event | effect |
+| --- | --- | --- |
+| same verdict | `claim_reconfirmed` | the claim survives scrutiny, `attempts` grows |
+| supported → refuted | `claim_falsified` | verified_knowledge corrected automatically |
+| refuted → supported | `claim_overturned` | the original refutation was wrong |
+| settled → inconclusive | `claim_unstable` | the protocol no longer runs deterministically |
+
+Every replay lands in the SAME shared evidence table (`method="replay"`)
+with the measured metrics attached, so the whole swarm sees replication
+results — H3 at its strongest: verdicts are shared WITH their reproducible
+artifacts, and a second agent can re-check the first agent's word.
+
+**Live wiring (this commit):**
+
+* the supervisor's `node_scan` runs a bounded sweep on schedule —
+  `REPLAY_SWEEP_SIZE` claims (default 2, `0` disables) every
+  `REPLAY_EVERY_N_CYCLES` cycles (default 3) — following the exact
+  P13/P19/P22 maintenance-sweep pattern: replication must never break the
+  scan, and the scan summary line carries the drift events to the dashboard;
+* the owner can run the sweep on demand: `agentics replay [--limit N]`
+  or a single claim with `agentics replay --id X`;
+* contradictions between same-criterion hypotheses stay owner-visible via
+  the `claim_contradiction` journal alert (P23 memory layer).
+
+Pinned by `tests/test_replay.py` (engine), `tests/test_protocol_code.py`
+(storage precondition) and `tests/test_replay_wiring.py` (live-cycle wiring:
+on-schedule sweep, off-schedule skip, zero-off, drift falsification
+correcting verified_knowledge, and a broken protocol never breaking the scan).
