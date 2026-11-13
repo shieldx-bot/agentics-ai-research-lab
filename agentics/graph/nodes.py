@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
 import sys
 import time
@@ -224,6 +225,23 @@ async def _llm_ask(
         if budget is not None:
             budget.record(ctx.agent_id, purpose, True, time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
+        from agentics.llm.errors import is_llm_refusal
+
+        if is_llm_refusal(exc):
+            # A refusal never touched the provider (empty pool, backend
+            # circuit open) — recording it as a failure would inflate the
+            # P20 fail-streak with the breaker's own refusals and turn a
+            # dead window into a dead hour (live 2026-11-13). Journal and
+            # degrade; the fail-streak stays truthful.
+            log.warning("[%s] %s llm refused: %s", ctx.agent_id, purpose, exc)
+            if state is not None and not state.get("error"):
+                state["error"] = f"llm refused: {exc}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "llm_refused",
+                                   {"purpose": purpose, "why": str(exc)[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return "", []
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
         if budget is not None:
             budget.record(ctx.agent_id, purpose, False, time.monotonic() - started)
@@ -706,6 +724,60 @@ async def _free_tools_fallback(ctx: AgentContext, state: ResearchState,
     return await _finish_research(ctx, state, topic, fb.answer, fb.citations, "free-tools")
 
 
+# P7 saturation rotation: when the configured topic is already covered, the
+# researcher tries fresh ANGLES of the same domain instead of idling. Labels
+# reuse the fan-out vocabulary (one consistent way to slice a domain).
+_ROTATION_ANGLES = (
+    "benchmarks & datasets",
+    "limitations & open problems",
+    "deployment & case studies",
+    "recent advances (last 12 months)",
+)
+
+_ANGLE_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _angle_researched(ctx: AgentContext, label: str) -> bool:
+    """True when a stored finding's title already carries this angle's own
+    vocabulary — i.e. the ANGLE itself was researched before.
+
+    Why not the vector gate: a broad survey finding sits at distance ~0.4
+    of EVERY query in its domain (live calibration 2026-11-13 — the three
+    NFV survey findings measure 0.41-0.44 from the base topic AND from every
+    angle phrasing, while fresh-domain queries measure 1.4-2.0), so no
+    distance threshold can separate 'same broad topic' from 'new angle'.
+    Angle freshness is therefore judged on finding TITLES, where the angle
+    label lives (finding titles are f"Findings: {topic}" and a rotated
+    topic embeds its label). The ratchet: researching an angle stores a
+    title containing its label, so the next saturation rotates further."""
+    search = getattr(ctx.memory, "finding_search", None)
+    if search is None:
+        return False
+    label_words = {w for w in _ANGLE_WORD_RE.findall(label.lower()) if len(w) > 2}
+    if not label_words:
+        return False
+    try:
+        return any(m.get("hits", 0) >= 1 for m in search(label, limit=10))
+    except Exception:  # noqa: BLE001 — dedup must never break research
+        return False
+
+
+async def _dedup_known(ctx: AgentContext, topic: str) -> list[dict]:
+    """P7 dedup gate for ONE candidate topic — vector hits within the
+    distance threshold, or the SQLite keyword fallback when the vector
+    store is offline. Shared by the primary topic and by rotation angles,
+    so rotation can never weaken the skip guard."""
+    known = await papers_mod.dedup_query(ctx.vector, topic)
+    if not getattr(ctx.vector, "available", False):
+        fallback = getattr(ctx.memory, "finding_search", None)
+        if fallback is not None:
+            try:
+                known = [m for m in fallback(topic, limit=5) if m.get("hits", 0) >= 2]
+            except Exception:  # noqa: BLE001 — dedup fallback must never break research
+                known = []
+    return known
+
+
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings.
 
@@ -725,29 +797,44 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     # constraints live. Dedup still keys on the title-based topic, so this
     # cannot weaken the P7 skip guard.
     body = (state.get("issue_body") or "").strip()
+    # P7: dedup — skip if the swarm already covered this. When the vector
+    # store is offline (chromadb absent / init failed) the SAME gate falls
+    # back to keyword search over the findings table — the SQLite fallback
+    # the policies layer already uses — so dedup survives without embeddings
+    # instead of re-researching every topic blind.
+    known = await _dedup_known(ctx, topic)
+    if len(known) >= 3:
+        # P7 saturation: the topic itself is covered. A lab that only ever
+        # prints "skipping" looks dead from the outside (live 2026-11-13: a
+        # lone researcher idled forever once earlier findings covered the
+        # configured topic). With the vector store online, rotate through
+        # fresh ANGLES of the same domain — an angle already researched
+        # (its label appears in a stored finding title) is skipped, so the
+        # ratchet advances; when every angle is spent the lab honestly
+        # rests. The OFFLINE keyword fallback keeps the plain skip: that
+        # gate is the coarse safety net and must stay conservative.
+        rotated = False
+        if getattr(ctx.vector, "available", False):
+            for label in _ROTATION_ANGLES:
+                if not _angle_researched(ctx, label):
+                    angle_topic = f"{topic} ({label})"
+                    log.info("[%s] topic covered — rotating to angle '%s'",
+                             ctx.agent_id, label)
+                    ctx.memory.journal(ctx.agent_id, "research_topic_rotated",
+                                       {"from": topic[:160], "angle": label})
+                    topic = angle_topic
+                    rotated = True
+                    break
+        if not rotated:
+            state["summary"] = f"topic already covered by {len(known)} findings; skipping"
+            state["done"] = True
+            return state
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
         + (f"\n\nProblem statement from the issue:\n{body[:400]}" if body else "")
         + (f"\n\n{knowledge}" if knowledge else "")
     )
-    # P7: dedup — skip if the swarm already covered this. When the vector
-    # store is offline (chromadb absent / init failed) the SAME gate falls
-    # back to keyword search over the findings table — the SQLite fallback
-    # the policies layer already uses — so dedup survives without embeddings
-    # instead of re-researching every topic blind.
-    known = await papers_mod.dedup_query(ctx.vector, topic)
-    if not getattr(ctx.vector, "available", False):
-        fallback = getattr(ctx.memory, "finding_search", None)
-        if fallback is not None:
-            try:
-                known = [m for m in fallback(topic, limit=5) if m.get("hits", 0) >= 2]
-            except Exception:  # noqa: BLE001 — dedup fallback must never break research
-                known = []
-    if len(known) >= 3:
-        state["summary"] = f"topic already covered by {len(known)} findings; skipping"
-        state["done"] = True
-        return state
 
     if ctx.llm is None:
         return await _free_tools_fallback(ctx, state, topic,
@@ -775,10 +862,22 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     try:
         resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
+        from agentics.llm.errors import is_llm_refusal
+
         log.warning("[%s] research llm call failed: %s", ctx.agent_id, exc)
-        if budget is not None:
-            budget.record(ctx.agent_id, "research", False, _time.monotonic() - _t0)
-        llm_error = f"research llm call failed: {exc}"
+        if is_llm_refusal(exc):
+            # never reached the provider — telemetry only, no fail-streak
+            llm_error = f"research llm refused: {exc}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "llm_refused",
+                                   {"purpose": "research", "why": str(exc)[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+        else:
+            if budget is not None:
+                budget.record(ctx.agent_id, "research", False,
+                              _time.monotonic() - _t0)
+            llm_error = f"research llm call failed: {exc}"
     if budget is not None and resp is not None and resp.ok:
         budget.record(ctx.agent_id, "research", True, _time.monotonic() - _t0)
     if resp is None or not resp.ok:

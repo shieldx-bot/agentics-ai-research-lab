@@ -73,6 +73,7 @@ class BrowserSessionHost:
         pplx_pool: AccountPool | None = None,
         qwen_pool: AccountPool | None = None,
         prefer_index: int | None = None,
+        clients: dict[tuple[str, str], Any] | None = None,
     ) -> None:
         self.settings = settings
         self.qwen_enabled = (settings.llm_provider or "perplexity").lower() == "qwen"
@@ -87,7 +88,13 @@ class BrowserSessionHost:
         self.prefer_index = prefer_index
         # client cache: one live client per (provider, account) so Qwen keeps
         # its refreshed access token and Perplexity keeps socket state.
-        self._clients: dict[tuple[str, str], Any] = {}
+        # SHARED with every view() of this host: agents run on views, so a
+        # root-level close_all() must reach the clients the views created —
+        # a per-view cache leaked every live cloud session at shutdown
+        # (live 2026-11-13: each CLI run left an active Hyperbrowser session
+        # behind, which is what kept tripping the 1-session cap next run).
+        self._clients: dict[tuple[str, str], Any] = (
+            clients if clients is not None else {})
         self._last: tuple[str, CookieAccount | QwenAccount] | None = None
 
     # ------------------------------------------------------------ factory
@@ -97,10 +104,11 @@ class BrowserSessionHost:
         return cls(settings, *_build_pools(settings))
 
     def view(self, prefer_index: int | None = None) -> "BrowserSessionHost":
-        """Per-agent view sharing the pools (1 thread = 1 pinned identity)."""
+        """Per-agent view sharing the pools AND the client cache (1 thread =
+        1 pinned identity; teardown stays centralised on the root host)."""
         return BrowserSessionHost(
             self.settings, self.pools["perplexity"], self.pools["qwen"],
-            prefer_index=prefer_index,
+            prefer_index=prefer_index, clients=self._clients,
         )
 
     # ------------------------------------------------------------ routing
@@ -119,7 +127,11 @@ class BrowserSessionHost:
         return self.pools[provider]
 
     def _client_for(self, provider: str, account: CookieAccount | QwenAccount):
-        key = (provider, account.name)
+        # The cache is shared across views (centralised teardown), so the
+        # pinned Hyperbrowser token MUST be part of the key: two views on
+        # the same cookie account but different tokens are genuinely
+        # different cloud sessions (the whole point of the token pool).
+        key = (provider, account.name, self._pinned_hb_key() or "")
         if key not in self._clients:
             if (
                 provider == "perplexity"
@@ -169,7 +181,12 @@ class BrowserSessionHost:
         """One routed call. Raises RuntimeError when no account is usable."""
         provider, client = self._lease(purpose)
         if client is None:
-            raise RuntimeError(
+            # LLMRefused, not a generic RuntimeError: an empty/cooling pool
+            # never reached the provider, so the P20 fail-streak must not
+            # count it (a refusal is not a provider failure).
+            from agentics.llm.errors import LLMRefused
+
+            raise LLMRefused(
                 f"no usable browser-session account for purpose '{purpose}' "
                 f"(mode: {'hybrid' if self.qwen_enabled else 'perplexity-only'}; "
                 "check accounts/ and account cooldowns)")

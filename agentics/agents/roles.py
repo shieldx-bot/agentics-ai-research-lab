@@ -126,6 +126,20 @@ class RoleAssignment:
 def assign_roles(n_agents: int, role_map: dict[int, str] | None) -> list[Role]:
     """role_map keys are 1-based account indices; missing entries round-robin."""
     role_map = role_map or {}
+    # A LONE agent cannot coordinate anything: supervisor duties (arbitration,
+    # backlog feeding for OTHER agents) are moot, the supervisor node never
+    # touches the LLM, and a single-token lab pinned to supervisor would scan
+    # the backlog forever without producing a single finding (live 2026-11-13
+    # CLI run). The core loop is research — so one agent researches. An
+    # explicit role_map {1: ...} wins even against the supervisor guarantee:
+    # with no swarm left to arbitrate, the owner's pick IS the right answer.
+    if n_agents == 1:
+        if 1 in role_map:
+            try:
+                return [Role(str(role_map[1]).lower())]
+            except ValueError:
+                pass                      # bad entry: use the default below
+        return [Role.RESEARCHER]
     roles: list[Role] = []
     for i in range(1, n_agents + 1):
         raw = role_map.get(i, "")
@@ -133,9 +147,13 @@ def assign_roles(n_agents: int, role_map: dict[int, str] | None) -> list[Role]:
             roles.append(Role(str(raw).lower()))
         except ValueError:
             roles.append(ALL_ROLES[(i - 1) % len(ALL_ROLES)])
-    # guarantee at least one supervisor and one integrator for the machinery
+    # guarantee at least one supervisor and one integrator for the machinery.
+    # The integrator guarantee needs a swarm big enough to PRODUCE work: at
+    # n=2 an integrator has no coder and no MR to drain, and flipping the
+    # second agent to integrator would leave the lab with no researcher at
+    # all (same degenerate outcome as the lone-supervisor bug above).
     if Role.SUPERVISOR not in roles and n_agents > 0:
         roles[0] = Role.SUPERVISOR
-    if Role.INTEGRATOR not in roles and n_agents > 1:
+    if Role.INTEGRATOR not in roles and n_agents > 2:
         roles[-1] = Role.INTEGRATOR
     return roles
