@@ -137,6 +137,75 @@ def repair() -> None:
         memory.close()
 
 
+@app.command("reset-memory")
+def reset_memory_cmd(
+    yes: bool = typer.Option(False, "--yes", "-y",
+                             help="bỏ qua câu hỏi xác nhận"),
+    force: bool = typer.Option(False, "--force",
+                               help="cho phép reset dù còn agent có heartbeat mới"),
+    keep_repo: bool = typer.Option(False, "--keep-repo",
+                                   help="giữ data/lab.git (branch/MR của topic cũ)"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="chỉ liệt kê thứ sẽ bị xoá, không xoá thật"),
+) -> None:
+    """Owner: xoá TOÀN BỘ memory của lab khi đổi research topic mới.
+
+    Xoá: shared memory DB (tasks/findings/panels/journal/role prompts),
+    vector memory (recall finding), personal memory (bài học mỗi agent),
+    workspace các agent và data/lab.git (branch/MR cũ) — trừ khi --keep-repo.
+    Giữ nguyên: code lab, baseline integrity, accounts/, configs/, .env, logs.
+    Lab khởi động lại sẽ tự seed lab.git và tạo schema mới."""
+    setup_logging("ERROR")
+    from agentics.memory.reset import ResetBlocked, reset_memory, running_agents
+
+    settings = _settings()
+    try:
+        preview = reset_memory(settings, keep_repo=keep_repo, dry_run=True)
+    except ResetBlocked as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    if preview.removed:
+        table = Table(title="Memory sẽ được xoá (đổi topic mới)" +
+                          (" — DRY RUN" if dry_run else ""))
+        for col in ("thành phần", "dung lượng"):
+            table.add_column(col)
+        for label, size in preview.removed:
+            human = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B"
+            table.add_row(label, human)
+        console.print(table)
+    else:
+        console.print("[yellow]Không có memory nào để xoá (lab còn nguyên).[/]")
+
+    if dry_run:
+        console.print("[dim]dry-run: chưa xoá gì. Bỏ --dry-run để xoá thật.[/]")
+        return
+
+    live = running_agents(settings)
+    if live and not force:
+        names = ", ".join(f"{a['agent']}({a['role']})" for a in live)
+        console.print(f"[red]Có {len(live)} agent đang chạy ({names}) — "
+                      f"chạy `agentics stop` trước, hoặc dùng --force.[/]")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm("Xoá toàn bộ memory ở trên?"):
+        console.print("[dim]Đã huỷ, không xoá gì.[/]")
+        return
+
+    try:
+        report = reset_memory(settings, keep_repo=keep_repo)
+    except ResetBlocked as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    for label, _size in report.removed:
+        console.print(f"  [red]xoá[/] {label}")
+    for kept in report.kept:
+        console.print(f"  [green]giữ[/] {kept}")
+    console.print(f"[bold green]Memory đã reset[/] — giải phóng "
+                  f"{report.freed_human}. Đổi RESEARCH_TOPIC trong .env/"
+                  f"configs/lab.yaml rồi chạy lại `python -m agentics.cli run` "
+                  f"— lab tự seed lại lab.git và schema mới.")
+
+
 @app.command("dashboard")
 def dashboard(
     port: int = typer.Option(None, "--port", help="HTTP port (default DASHBOARD_PORT or 8080)"),

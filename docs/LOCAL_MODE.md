@@ -161,11 +161,37 @@ python -m agentics.cli task "Improve the benchmark runner" \
 python -m agentics.cli status            # CLI snapshot
 python -m agentics.cli verify            # runtime-tree integrity check
 python -m agentics.cli stop              # graceful stop (STOP file)
+python -m agentics.cli reset-memory --dry-run   # preview a topic reset
 ```
 
 Merge behaviour: with `AUTO_MERGE` on (default) the Integrator merges
 approved MRs serially after tier-2 passes; with `AUTO_MERGE` off the queue
 only records readiness and the owner merges by hand.
+
+### 4b. Switching research topic — `agentics reset-memory`
+
+Every memory surface is topic-bound, so a new topic needs a clean slate —
+old findings would be recalled into the new research, old lessons would
+steer new plans, old workspaces and origin branches would shadow fresh
+clones. `agentics reset-memory` (added after `repair`) wipes exactly that
+set and nothing else:
+
+- **wiped** — `data/shared_memory.db` (+`-wal`/`-shm`: tasks, findings,
+  panels, journal, cached role prompts), `data/chroma` (vector recall),
+  `data/personal/` (per-agent lessons), `data/workspaces/` (old checkouts),
+  `data/lab.git` (old-topic branches/MRs — re-seeded from the checkout at
+  the next boot by `LocalRepo.ensure`);
+- **kept** — lab code, the integrity baseline (`data/integrity`),
+  `accounts/`, `configs/`, `.env`, `logs/`.
+
+Flags: `--dry-run` (list what would go, delete nothing), `--yes` (skip the
+confirm prompt), `--keep-repo` (preserve `data/lab.git`), `--force`
+(override the running-agent guard). The guard refuses to run while any
+agent heartbeat is fresher than 120 s and not marked `stopped` — a reset
+under a live swarm would corrupt sessions; stop the lab first
+(`agentics stop`). After the reset, change `research_topic`
+(`configs/lab.yaml` wins over `RESEARCH_TOPIC` in `.env`) and start the lab
+again — schema, bare origin and vector store are rebuilt empty.
 
 ---
 
@@ -186,6 +212,9 @@ only records readiness and the owner merges by hand.
 - `tests/test_scan_cache_stability.py` — legacy `github_ops` scan cache keyed
   on stable identity only (CPython `id()` reuse could resurrect a stale list).
 - `tests/test_journal_cap.py` — journal trim keeps the feed bounded.
+- `tests/test_reset_memory.py` — topic reset: dry-run deletes nothing,
+  running-agent guard, complete wipe (DB/WAL/chroma/personal/workspaces/
+  origin), `--keep-repo`, cold lab, CLI paths.
 
 ---
 
