@@ -225,6 +225,16 @@ class Settings:
     # visible before failing an ask with a diagnostic error (challenge page,
     # logged-out wall, or a UI markup change).
     hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
+    # --- Second-judge provider (dual-model de-correlation) -------------------
+    # When "chatgpt", tournament debate asks run a SECOND, independent model
+    # family (ChatGPT via its own cookie session on the same Hyperbrowser
+    # edge) alongside the primary Perplexity jury. Both verdicts must agree
+    # before Elo moves; disagreement records a `contested` match (no Elo
+    # movement) for the owner. "" keeps the single-jury behaviour.
+    judge_second_provider: str = field(
+        default_factory=lambda: _env("JUDGE_SECOND_PROVIDER", ""))
+    chatgpt_cookie_path: str = field(
+        default_factory=lambda: _env("CHATGPT_COOKIE_PATH", ""))
     # Free-plan Hyperbrowser sessions carry a hard duration cap (~10 min;
     # live 2026-11-13: six sessions aged 9m37s-10m06s all died mid-ask inside
     # one 30-second window, wrecking every in-flight call). Recycle each

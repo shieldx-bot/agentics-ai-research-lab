@@ -10,10 +10,19 @@ Ported from the Apache-2.0 Kaimen-Inc/Co-Scientist re-implementation
   contract (deterministic match_id -> INSERT OR IGNORE -> only the row
   owner applies the delta) behave exactly like the reference;
 * refuted hypotheses never enter the pool: a claim the lab FALSIFIED by
-  running code is a dead idea, no matter how elegant the debate finds it.
+  running code is a dead idea, no matter how elegant the debate finds it;
+* DUAL-JUDGE (anti "one model judges everything"): when the context
+  carries a ``judge_llm`` (an independent model family, e.g. ChatGPT —
+  see agentics/llm/chatgpt_client.py), every match is judged by BOTH
+  juries CONCURRENTLY. Agreement -> Elo moves. Disagreement -> the match
+  is recorded as ``contested`` with NO Elo movement and a journal event
+  for the owner — the honest handling of a correlated-error-prone signal.
+  A judge that fails or answers unparseably degrades to the primary
+  verdict with an explicit note in the rationale, never silently.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -63,14 +72,19 @@ def feedback_block(memory) -> str:
             f"{fb['text'].strip()[:800]}\n\n")
 
 
-async def _jury_ask(ctx, prompt: str) -> tuple[str, bool, bool]:
+async def _jury_ask(ctx, prompt: str, llm=None,
+                    purpose: str = "tournament") -> tuple[str, bool, bool]:
     """One budget-gated jury ask. Returns (answer, ok, blocked_or_failed).
 
     ``blocked_or_failed`` marks asks that never produced a jury opinion —
     a P20 budget block or a provider failure. Those must not be recorded
     as matches (nothing happened) and must END a batch: retrying the same
-    ask within the same seconds only hammers a dead/budgeted session."""
-    if ctx.llm is None:
+    ask within the same seconds only hammers a dead/budgeted session.
+    ``llm`` overrides the context's client (the second judge uses the SAME
+    P20 budget gate — it spends the lab's shared session slots too)."""
+    if llm is None:
+        llm = getattr(ctx, "llm", None)
+    if llm is None:
         return "", False, True
     budget = getattr(ctx, "budget", None)
     started = time.monotonic()
@@ -86,8 +100,8 @@ async def _jury_ask(ctx, prompt: str) -> tuple[str, bool, bool]:
                 pass
             return "", False, True
     try:
-        resp = await ctx.llm.ask(prompt, mode="concise", purpose="tournament",
-                                 system=_JURY_SYSTEM)
+        resp = await llm.ask(prompt, mode="concise", purpose=purpose,
+                             system=_JURY_SYSTEM)
         ok = bool(resp and resp.ok)
         answer = (resp.answer or "") if resp else ""
     except Exception as exc:  # noqa: BLE001 — one match must not kill a cycle
@@ -96,8 +110,45 @@ async def _jury_ask(ctx, prompt: str) -> tuple[str, bool, bool]:
     else:
         blocked_or_failed = not ok
     if budget is not None:
-        budget.record(ctx.agent_id, "tournament", ok, time.monotonic() - started)
+        budget.record(ctx.agent_id, purpose, ok, time.monotonic() - started)
     return answer, ok, blocked_or_failed
+
+
+async def _dual_jury(ctx, prompt: str) -> tuple[str, bool, bool, str, bool]:
+    """Judge one match with the primary jury AND the independent judge.
+
+    Two model families looking at the same prompt at the same time is the
+    whole point — so the asks run CONCURRENTLY when the Hyperbrowser pool
+    can host both cloud sessions (>= 2 tokens; the judge client is built
+    on its own token by get_judge_client). On the ONE-token lab the
+    single session slot cannot hold both sessions — racing them would
+    make each client sweep the other off the slot mid-ask — so the two
+    asks run back-to-back instead. The second ask never raises: a judge
+    outage degrades to the primary verdict (ok2=False), it never blocks
+    a match by itself."""
+    judge2 = getattr(ctx, "judge_llm", None)
+    if judge2 is None:
+        answer, ok, stopped = await _jury_ask(ctx, prompt)
+        return answer, ok, stopped, "", False
+    primary_key = getattr(getattr(ctx, "llm", None), "api_key", "") or ""
+    judge_key = getattr(judge2, "api_key", "") or ""
+    if not primary_key or not judge_key or primary_key == judge_key:
+        # one session slot for two juries: serialize honestly
+        answer, ok, stopped = await _jury_ask(ctx, prompt)
+        if stopped:
+            return answer, ok, stopped, "", False
+        answer2, ok2, _ = await _jury_ask(
+            ctx, prompt, llm=judge2, purpose="tournament_judge2")
+        return answer, ok, stopped, answer2, ok2
+    second = asyncio.ensure_future(
+        _jury_ask(ctx, prompt, llm=judge2, purpose="tournament_judge2"))
+    answer, ok, stopped = await _jury_ask(ctx, prompt)
+    try:
+        answer2, ok2, _stopped2 = await second
+    except Exception as exc:  # noqa: BLE001 — judge outage must not kill the match
+        log.warning("[%s] second judge crashed: %s", ctx.agent_id, exc)
+        answer2, ok2 = "", False
+    return answer, ok, stopped, answer2, ok2
 
 
 async def run_match(ctx, hyp_a: dict, hyp_b: dict, goal: str) -> dict:
@@ -120,7 +171,7 @@ async def run_match(ctx, hyp_a: dict, hyp_b: dict, goal: str) -> dict:
         id2=f"h{b['id']}", text2=(b.get("claim") or "")[:1200],
         feedback_block=feedback_block(ctx.memory),
     )
-    answer, ok, stopped = await _jury_ask(ctx, prompt)
+    answer, ok, stopped, answer2, ok2 = await _dual_jury(ctx, prompt)
     mid = match_id_for(a, b)
     if stopped:
         # nothing happened: no match row, and the batch should not hammer on
@@ -139,8 +190,34 @@ async def run_match(ctx, hyp_a: dict, hyp_b: dict, goal: str) -> dict:
         return {"match_id": mid, "mode": "invalid", "winner": "",
                 "a": a["id"], "b": b["id"]}
 
+    # DUAL-JUDGE arbitration: an independent model family that DISAGREES
+    # with the primary jury means the debate signal is not trustworthy —
+    # record the match as contested with NO Elo movement. A judge that
+    # failed/unparseable degrades to the primary verdict, noted openly.
+    v2 = pairing.parse_better_idea(answer2) if ok2 else None
+    if v2 is not None and v2 != choice:
+        rationale = (f"dual-judge CONTESTED: primary=h{choice}, "
+                     f"second=h{v2}; primary rationale: {answer[:500]}")
+        ctx.memory.record_tournament_match(
+            mid, ctx.agent_id, a["id"], b["id"], "contested", "",
+            elo_a, elo_b, None, None, rationale=rationale[:1200])
+        try:
+            ctx.memory.journal(ctx.agent_id, "tournament_contested", {
+                "match": mid, "a": a["id"], "b": b["id"],
+                "primary": choice, "second": v2,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return {"match_id": mid, "mode": "contested", "winner": "",
+                "a": a["id"], "b": b["id"],
+                "primary": choice, "second": v2}
+
     # "1" == the anchor (a), "2" == the opponent (b)
     winner = "a" if choice == 1 else "b"
+    note = ""
+    if getattr(ctx, "judge_llm", None) is not None:
+        note = ("dual-judge agreed" if (ok2 and v2 == choice)
+                else "judge2 unavailable/unparseable; primary verdict stands")
     upd = update_elo(elo_a, elo_b, winner,
                      matches_played_min=min(int(a.get("matches_played") or 0),
                                             int(b.get("matches_played") or 0)))
@@ -154,7 +231,8 @@ async def run_match(ctx, hyp_a: dict, hyp_b: dict, goal: str) -> dict:
     elo_b_after = upd.elo_b_after
     applied = ctx.memory.record_tournament_match(
         mid, ctx.agent_id, a["id"], b["id"], mode, winner,
-        elo_a, elo_b, elo_a_after, elo_b_after, rationale=answer[:1200])
+        elo_a, elo_b, elo_a_after, elo_b_after,
+        rationale=(f"[{note}] {answer}" if note else answer)[:1200])
     if applied:
         ctx.memory.apply_elo_update(a["id"], b["id"], elo_a_after, elo_b_after)
         try:
@@ -195,6 +273,7 @@ async def run_batch(ctx, n_matches: int, goal: str) -> list[dict]:
                 "matches": len(results),
                 "winners": [r.get("winner") for r in results],
                 "invalid": sum(1 for r in results if r["mode"] == "invalid"),
+                "contested": sum(1 for r in results if r["mode"] == "contested"),
             })
         except Exception:  # noqa: BLE001
             pass

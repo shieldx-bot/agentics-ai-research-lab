@@ -1311,6 +1311,25 @@ async def node_tournament(ctx: AgentContext, state: ResearchState) -> ResearchSt
         from agentics.coscientist import metareview as meta_mod
         from agentics.coscientist import tournament as tour_mod
 
+        # Dual-model jury (anti "one model judges everything"): when
+        # configured, attach the independent ChatGPT judge to the context
+        # so every tournament match is debated by BOTH model families in
+        # parallel. Failure-isolated: a missing cookie file or client
+        # outage degrades to the single-jury behaviour with a journal note.
+        if str(getattr(settings, "judge_second_provider", "") or ""
+               ).strip().lower() == "chatgpt":
+            try:
+                from agentics.llm.chatgpt_client import get_judge_client
+                judge = get_judge_client(settings)
+                if judge is not None:
+                    ctx.judge_llm = judge
+            except Exception as exc:  # noqa: BLE001 — judge is optional
+                try:
+                    ctx.memory.journal(ctx.agent_id, "judge_second_unavailable",
+                                       {"error": str(exc)[:200]})
+                except Exception:  # noqa: BLE001
+                    pass
+
         results: list[dict] = []
         if n_matches > 0:
             results = await tour_mod.run_batch(ctx, n_matches, goal)
@@ -1329,8 +1348,10 @@ async def node_tournament(ctx: AgentContext, state: ResearchState) -> ResearchSt
         if results:
             decided = [r for r in results if r.get("winner")]
             invalid = [r for r in results if r.get("mode") == "invalid"]
+            contested = [r for r in results if r.get("mode") == "contested"]
             parts.append(f"{len(decided)} debate(s)"
-                         + (f", {len(invalid)} unparseable" if invalid else ""))
+                         + (f", {len(invalid)} unparseable" if invalid else "")
+                         + (f", {len(contested)} contested" if contested else ""))
         if evolved:
             parts.append(f"evolved h#{evolved['hypothesis_id']} "
                          f"({evolved['strategy']})")

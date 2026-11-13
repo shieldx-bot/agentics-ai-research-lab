@@ -151,3 +151,18 @@ meta_review_window: 4             # decisive debates before a feedback synthesis
 # rewritten ONCE, and the SAME frozen-criterion adjudication re-runs.
 # 0 = off. The verdict stays 100% machine — repair fixes the script.
 verify_protocol_repair_rounds: 1
+
+# --- Dual-model jury (anti "một model phán mọi thứ") -------------------------
+# When "chatgpt", every tournament debate is judged by TWO independent model
+# families CONCURRENTLY: the primary Perplexity jury and a ChatGPT cookie
+# session on the same Hyperbrowser edge (live-verified 2026-11-13). Both
+# verdicts must AGREE before Elo moves; disagreement records a `contested`
+# match with NO Elo movement + a `tournament_contested` journal event for
+# the owner. A judge outage/unparseable answer degrades to the primary
+# verdict with an explicit rationale note — never silently. The judge ask
+# passes the same P20 budget gate (purpose tournament_judge2).
+judge_second_provider: "chatgpt"
+# Path to the chatgpt.com Cookie-Editor export for the judge account
+# (gitignored). Long-lived session-token cookies carry the login; the
+# short-lived edge cookies are dropped automatically.
+chatgpt_cookie_path: "accounts/chatgpt-01.json"
