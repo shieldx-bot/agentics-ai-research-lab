@@ -475,6 +475,17 @@ class SharedMemory:
                 # assumptions, effect} — compact identity for the QD
                 # diversity gates (near-duplicate PEM, coverage CCR).
                 "ALTER TABLE hypotheses ADD COLUMN signature TEXT NOT NULL DEFAULT '{}'",
+                # Discovery branching (2026-11-14 "branch on discovery" round):
+                # discovery=1 marks a settled result the ideator judged
+                # surprising vs the world model (novelty 0-100); depth keeps
+                # the branch level (children = parent.depth + 1, capped by
+                # branch_max_depth so a discovery tree cannot run away);
+                # branch stores the attack angle (mechanism / generalize /
+                # boundary / amplify) the child digs into.
+                "ALTER TABLE hypotheses ADD COLUMN discovery INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN novelty REAL NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN branch TEXT NOT NULL DEFAULT ''",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -1001,6 +1012,7 @@ class SharedMemory:
         task_id: int | None = None, finding_id: int | None = None,
         protocol_path: str = "", status: str = "proposed",
         protocol_code: str = "", parents: list[int] | None = None,
+        depth: int = 0, branch: str = "",
     ) -> int:
         """Register a hypothesis BEFORE the protocol runs (pre-registration).
 
@@ -1012,20 +1024,36 @@ class SharedMemory:
         `protocol_code` keeps the protocol source INSIDE memory, so a settled
         claim stays replayable even after P21 prunes the workspace.
         `parents` records the Co-Scientist evolution lineage (ids of the
-        hypotheses this one was bred from) — provenance, not verdict."""
+        hypotheses this one was bred from) — provenance, not verdict.
+        `depth`/`branch` keep the discovery-branch position: branch level
+        below the discovery root and the attack angle (mechanism /
+        generalize / boundary / amplify) this child digs into."""
         from agentics.verify.hypothesis import claim_hash as _chash
 
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
                 "criterion, protocol_path, status, claim_hash, protocol_code, "
-                "parents) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "parents, depth, branch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, task_id, finding_id, claim[:500],
                  json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
                  status, _chash(claim), protocol_code[:20_000],
-                 json.dumps([int(p) for p in (parents or [])])),
+                 json.dumps([int(p) for p in (parents or [])]),
+                 max(0, int(depth)), (branch or "")[:40]),
             )
             return int(cur.lastrowid or 0)
+
+    def mark_discovery(self, hyp_id: int, novelty: float) -> bool:
+        """Flag a settled hypothesis as a DISCOVERY (novelty 0-100).
+
+        The ideator judged the measured result surprising against the world
+        model; the deep-dive backlog then prioritizes this subtree
+        (discovery_frontier) instead of rotating generic next ideas."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET discovery=1, novelty=? WHERE id=?",
+                (max(0.0, min(100.0, float(novelty))), hyp_id))
+        return cur.rowcount > 0
 
     def settled_hypothesis_for_claim(self, claim: str) -> dict | None:
         """The swarm's SETTLED verdict for this claim, if anyone already ran it.
@@ -1187,13 +1215,20 @@ class SharedMemory:
                 row["parents"] = json.loads(r[17] or "[]")
             except json.JSONDecodeError:
                 row["parents"] = []
+        # Discovery branching columns (novelty detection round)
+        if len(r) > 21:
+            row["discovery"] = bool(r[18])
+            row["novelty"] = r[19]
+            row["depth"] = r[20]
+            row["branch"] = r[21]
         return row
 
     # canonical column list for get/list — _hypothesis_row reads positionally
     HYP_COLS = ("id, ts, agent, task_id, finding_id, claim, criterion, "
                 "protocol_path, status, verdict_note, evidence_id, attempts, "
                 "protocol_code, replication, replication_attempts, "
-                "elo, matches_played, parents")
+                "elo, matches_played, parents, discovery, novelty, depth, "
+                "branch")
 
     def hypotheses_needing_replication(self, agent: str, limit: int = 2) -> list[dict]:
         """P24 — settled claims whose stored protocol an INDEPENDENT agent
@@ -1451,6 +1486,61 @@ class SharedMemory:
         with self._lock:
             rows = self._conn.execute(sql, (limit,)).fetchall()
         return [self._hypothesis_row(r) for r in rows]
+
+    def discovery_frontier(self, limit: int = 3,
+                           max_depth: int = 4) -> list[dict]:
+        """Discovery-driven branch frontier — the deep-dive backlog's PRIORITY
+        slice (2026-11-14 novelty round, the "recognize a breakthrough and
+        dig into it" mechanism).
+
+        Returns `proposed`, protocol-less hypotheses that descend from ANY
+        discovery (a parent chain reaching a row with discovery=1), bounded
+        to `max_depth` below the registry root (priority decays with branch
+        level so a discovery tree cannot monopolize the backlog forever).
+        Ordering: shallowest first (BFS over the discovery tree), ties by id
+        — the loop digs BREADTH-first into a new finding instead of chasing
+        one branch to exhaustion before the others.
+
+        Non-discovery proposals are deliberately excluded here; they compete
+        through the ordinary CCR coverage order."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                "WHERE status='proposed' AND protocol_code='' AND depth <= ? "
+                "ORDER BY id ASC", (max(0, int(max_depth)),)).fetchall()
+            parents_map = self._conn.execute(
+                "SELECT id, parents, discovery FROM hypotheses").fetchall()
+        pm: dict[int, list[int]] = {}
+        discoveries: set[int] = set()
+        for pid, praw, disc in parents_map:
+            try:
+                pm[pid] = json.loads(praw or "[]")
+            except json.JSONDecodeError:
+                pm[pid] = []
+            if disc:
+                discoveries.add(pid)
+        out = []
+        for r in rows:
+            h = self._hypothesis_row(r)
+            # walk the parent chain (bounded: cycle-safe via visited set)
+            seen: set[int] = set()
+            frontier_ids = list(h.get("parents") or [])
+            is_branch = False
+            while frontier_ids:
+                pid = frontier_ids.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in discoveries:
+                    is_branch = True
+                    break
+                frontier_ids.extend(pm.get(pid, []))
+            if is_branch:
+                out.append(h)
+            if len(out) >= limit:
+                break
+        out.sort(key=lambda h: (h.get("depth", 0), h["id"]))
+        return out[:limit]
 
     def recent_hypotheses(self, limit: int = 12) -> list[dict]:
         """Newest hypotheses across ALL statuses with their QD signature.

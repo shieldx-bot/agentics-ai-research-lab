@@ -20,7 +20,14 @@ Three mechanisms, one per source paper:
   near-misses (within delta=20) through ONE repair round, and archives
   failures as COMPACT rejected patterns that later seed prompts receive
   (the R archive) — full rejected ideas would bloat context.
-- autoresearch (karpathy/autoresearch) supplies the loop DISCIPLINE:
+- autoresearch (karpathy/autoresearch) supplies the loop DISCIPLINE and the
+  QUANTITATIVE novelty judgment (2026-11-14 "branch on discovery" round):
+  every harvest reply first grades the settled result's NOVELTY against the
+  world model (0-100). Above discovery_novelty_min the result is marked a
+  DISCOVERY in the registry and the follow-ups become angled BRANCHES
+  (mechanism / generalize / boundary / amplify) that dig into the finding
+  itself; the deep-dive backlog then prioritizes that subtree (frontier)
+  instead of rotating generic ideas. Plus the original loop discipline:
   every settle lands in an `experiment_ledger` row (keep/discard semantics:
   supported=keep, refuted=inconclusive=discard, crash=inconclusive with
   guard note), near-miss `inconclusive` hypotheses get a bounded RETRY with
@@ -127,11 +134,27 @@ REPAIR_PROMPT = (
     '"effect": "..."}}}}'
 )
 
+# Branch angles (Kosmos evidence-driven expansion): when a settled result
+# is a DISCOVERY, the children must attack it from DIFFERENT angles instead
+# of three re-wordings of the same question.
+DISCOVERY_ANGLES = (
+    "mechanism",    # WHY does the effect hold? isolate the cause
+    "generalize",   # does it transfer to a new domain / scale / setup?
+    "boundary",     # WHEN does it fail? find the breaking condition
+    "amplify",      # can the effect be made stronger / cheaper / faster?
+)
+
 INSIGHT_PROMPT = (
-    "ROLE: ideator. A swarm experiment just SETTLED. Propose up to "
-    "{n_children} follow-up hypotheses that the measured result makes "
-    "worth testing next — the loop must CONTINUE from results, not restart "
-    "from the literature.\n\n"
+    "ROLE: ideator. A swarm experiment just SETTLED. You do TWO things.\n\n"
+    "TASK 1 — judge NOVELTY: compare the measured result against the swarm "
+    "world model. novelty 0-100: 0-40 = routine confirmation of a known "
+    "fact; 40-70 = an expected-but-unmeasured extension; 70-100 = a "
+    "SURPRISE the world model cannot already explain (contradicts a "
+    "verified note, reveals an unexplained effect, or opens a question "
+    "nobody asked). is_discovery = true only when novelty >= 70.\n\n"
+    "TASK 2 — propose up to {n_children} follow-up hypotheses that the "
+    "measured result makes worth testing next — the loop must CONTINUE "
+    "from results, not restart from the literature.\n\n"
     "Settled claim: {claim}\n"
     "Verdict: {verdict}\n"
     "Measured: {measured}\n\n"
@@ -140,11 +163,15 @@ INSIGHT_PROMPT = (
     "Rejected patterns (do NOT re-propose these mechanisms):\n{rejected}\n\n"
     "Rules: each child must be TESTABLE with python + pip only, carry a "
     "machine criterion, and differ from the parent and from every rejected "
-    "pattern. If the result genuinely opens no testable question, reply "
-    "with an empty list.\n"
-    'Reply ONLY JSON: {{"hypotheses": [{{"claim": "...", "metric": "<name>", '
-    '"op": ">=", "target": 0.9, "tolerance": 0.05, "signature": '
-    '{{"problem": "...", "mechanism": "...", "novelty": "...", '
+    "pattern. If is_discovery is true, each child MUST carry an \"angle\" "
+    "field from {angles} and attack the discovery from a DIFFERENT angle "
+    "(mechanism: why it holds; generalize: does it transfer; boundary: "
+    "when it fails; amplify: can it be strengthened). If the result "
+    "genuinely opens no testable question, reply with an empty list.\n"
+    'Reply ONLY JSON: {{"novelty": 0, "is_discovery": false, "reason": '
+    '"one sentence", "hypotheses": [{{"claim": "...", "metric": "<name>", '
+    '"op": ">=", "target": 0.9, "tolerance": 0.05, "angle": "mechanism", '
+    '"signature": {{"problem": "...", "mechanism": "...", "novelty": "...", '
     '"assumptions": "...", "effect": "..."}}}}]}}'
 )
 
@@ -167,6 +194,34 @@ GAP_PROMPT = (
 
 
 # ----------------------------------------------------------------- parsers
+
+def parse_discovery(answer: str, max_children: int = 2):
+    """Parse an ideator reply into (novelty, is_discovery, reason, children).
+
+    novelty is None when the reply predates the novelty contract or omits
+    the field — callers must treat None as NOT a discovery (the loop keeps
+    its pre-discovery behavior instead of guessing). Children reuse the
+    parse_children contract plus the optional branch "angle" field.
+    Never raises."""
+    children = parse_children(answer, max_children=max_children)
+    try:
+        start = answer.find("{")
+        end = answer.rfind("}")
+        if start < 0 or end <= start:
+            return None, False, "", children
+        raw = json.loads(answer[start:end + 1])
+    except (ValueError, TypeError):
+        return None, False, "", children
+    if not isinstance(raw, dict):
+        return None, False, "", children
+    nov = raw.get("novelty")
+    if not isinstance(nov, (int, float)) or isinstance(nov, bool):
+        return None, False, "", children
+    novelty = max(0.0, min(100.0, float(nov)))
+    is_disc = bool(raw.get("is_discovery"))
+    reason = str(raw.get("reason") or "")[:300]
+    return novelty, is_disc, reason, children
+
 
 def parse_children(answer: str, max_children: int = 2) -> list[dict]:
     """Extract valid follow-up hypothesis specs from an ideation reply.
@@ -206,6 +261,9 @@ def _child_from_dict(h) -> dict | None:
     if len(claim) < 12 or crit is None:
         return None
     child = {"claim": claim, "criterion": crit}
+    angle = str(h.get("angle") or "").strip().lower()
+    if angle and angle in DISCOVERY_ANGLES:
+        child["angle"] = angle
     sig = h.get("signature")
     if isinstance(sig, dict) and sig:
         child["signature"] = sig
@@ -286,7 +344,8 @@ def parse_repair(answer: str) -> dict | None:
 
 
 __all__ = [
-    "DEFAULT_REPAIR_MARGIN", "DEFAULT_TAU", "GAP_PROMPT", "INSIGHT_PROMPT",
-    "JUDGE_PROMPT", "Judgement", "REPAIR_PROMPT", "normalize_child",
-    "qualification", "parse_children", "parse_repair", "parse_scores",
+    "DEFAULT_REPAIR_MARGIN", "DEFAULT_TAU", "DISCOVERY_ANGLES", "GAP_PROMPT",
+    "INSIGHT_PROMPT", "JUDGE_PROMPT", "Judgement", "REPAIR_PROMPT",
+    "normalize_child", "qualification", "parse_children", "parse_discovery",
+    "parse_repair", "parse_scores",
 ]

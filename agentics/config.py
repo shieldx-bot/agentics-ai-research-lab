@@ -233,6 +233,16 @@ class Settings:
         default_factory=lambda: _env_int("IDEA_MAX_CHILDREN", 2))
     idea_max_attempts: int = field(
         default_factory=lambda: _env_int("IDEA_MAX_ATTEMPTS", 2))
+    # Discovery branching (2026-11-14 novelty round): when the ideator grades
+    # a settled result's novelty >= discovery_novelty_min (0-100) the result
+    # is marked a DISCOVERY and its follow-ups become angled branches the
+    # deep-dive backlog prioritizes (frontier). branch_max_depth caps the
+    # branch level below the discovery root — past it the harvest stops
+    # spawning children and the frontier stops boosting the subtree.
+    discovery_novelty_min: int = field(
+        default_factory=lambda: _env_int("DISCOVERY_NOVELTY_MIN", 70))
+    branch_max_depth: int = field(
+        default_factory=lambda: _env_int("BRANCH_MAX_DEPTH", 4))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(

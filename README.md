@@ -16,6 +16,20 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
 
 ## Có gì mới (2026-11)
 
+- **Vòng nghiên cứu QD closed-loop** (dựa trên Kosmos / IDEAgent / autoresearch,
+  2026-11-14): world model dùng chung (`world_notes` — verified / refuted / gap),
+  cổng ý tưởng IDEAgent (judge + repair một vòng + lưu mẫu bị từ chối), insight
+  harvest — mỗi kết quả settled tự đề xuất follow-up có dòng dõi (`parents`),
+  experiment ledger keep/discard, và gap proposal khi registry cạn.
+- **Nhận diện PHÁT HIỆN MỚI + chia nhánh đào sâu** (2026-11-14, vòng "branch on
+  discovery"): sau mỗi kết quả settled, ideator chấm **novelty 0-100** so với
+  world model; vượt ngưỡng `DISCOVERY_NOVELTY_MIN` (mặc định 70) kết quả được
+  đánh dấu **discovery** trong registry, world model ghi chú `DISCOVERY(...)`,
+  và các follow-up trở thành **nhánh có góc tấn công** (mechanism / generalize /
+  boundary / amplify) ở `depth+1`. Backlog deep-dive ưu tiên **cây nhánh của
+  discovery** trước (`discovery_frontier`, BFS nông trước sâu) — bầy đàn đào
+  vào chính đột phá của nó thay vì xoay ý tưởng chung chung; `BRANCH_MAX_DEPTH`
+  chặn một phát hiện độc chiếm registry.
 - **Vòng lặp Co-Scientist** (`agentics/coscientist/`) — port hành vi trung thực
   từ vòng tự cải thiện của Co-Scientist (Gottweis et al., Nature 655, 2026; theo
   bản tái hiện Apache-2.0 tại [Kaimen-Inc/Co-Scientist](https://github.com/Kaimen-Inc/Co-Scientist)):

@@ -990,13 +990,16 @@ async def _reject_candidate(ctx: AgentContext, claim: str, reason: str,
 
 async def _gate_and_register(ctx: AgentContext, child: dict,
                              parents: list[int],
-                             recent: list[dict]) -> int | None:
+                             recent: list[dict],
+                             depth: int = 0, branch: str = "") -> int | None:
     """IDEAgent pipeline for ONE candidate: PEM near-dup gate -> judge ->
     qualification (accept / one repair / reject) -> registry insert.
 
     Returns the new hypothesis id, or None when the candidate is rejected
     or the judge is unavailable. `parents` keeps the Kosmos lineage (the
-    settled experiment row this idea grew from)."""
+    settled experiment row this idea grew from). `depth`/`branch` carry the
+    discovery-branch position (branch level below the discovery root + the
+    attack angle) so the deep-dive backlog can prioritize the subtree."""
     child = idea.normalize_child(child)
     if child is None:                    # contract violation — nothing to judge
         return None
@@ -1070,7 +1073,7 @@ async def _gate_and_register(ctx: AgentContext, child: dict,
              "Q_after": round(j2.quality(), 1)})
     hyp_id = await asyncio.to_thread(
         ctx.memory.add_hypothesis, ctx.agent_id, claim, crit,
-        parents=parents)
+        parents=parents, depth=max(0, int(depth)), branch=branch)
     sig = child.get("signature")
     if isinstance(sig, dict) and sig:
         await asyncio.to_thread(
@@ -1078,13 +1081,19 @@ async def _gate_and_register(ctx: AgentContext, child: dict,
     await asyncio.to_thread(
         ctx.memory.journal, ctx.agent_id, "idea_registered",
         {"hyp": hyp_id, "claim": claim[:160], "parents": parents,
-         "Q": round(j.quality(), 1), "route": route})
+         "Q": round(j.quality(), 1), "route": route,
+         "depth": max(0, int(depth)), "branch": branch})
     return hyp_id
 
 
 async def _harvest_insights(ctx: AgentContext, parent_id: int,
                             claim: str, verdict: str, measured: str) -> int:
-    """Kosmos closed loop: a settled experiment proposes its FOLLOW-UPS.
+    """Kosmos closed loop: a settled experiment proposes its FOLLOW-UPS —
+    and, when the ideator grades the result surprising (novelty >=
+    discovery_novelty_min), the result becomes a DISCOVERY: the registry
+    row is flagged, the world model records it, and the follow-ups become
+    ANGLED BRANCHES (mechanism / generalize / boundary / amplify) at
+    depth+1 that the deep-dive backlog prioritizes (discovery_frontier).
 
     One ideation call -> up to idea_max_children children -> each gated
     through _gate_and_register (PEM + judge + repair). Returns how many
@@ -1092,6 +1101,10 @@ async def _harvest_insights(ctx: AgentContext, parent_id: int,
     if not await _ideation_allowed(ctx):
         return 0
     try:
+        parent_row = ctx.memory.get_hypothesis(parent_id) or {}
+        parent_depth = int(parent_row.get("depth") or 0)
+        max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        novelty_min = int(getattr(ctx.settings, "discovery_novelty_min", 70))
         world = ctx.memory.world_render(
             limit=int(getattr(ctx.settings, "world_context_notes", 12)))
         rejected = ctx.memory.rejected_render()
@@ -1102,13 +1115,43 @@ async def _harvest_insights(ctx: AgentContext, parent_id: int,
             idea.INSIGHT_PROMPT.format(
                 n_children=n_children, claim=claim[:1200],
                 verdict=verdict, measured=measured[:300] or "none recorded",
-                world=world[:1800] or "(empty)", rejected=rejected[:800] or "(none)"),
+                world=world[:1800] or "(empty)", rejected=rejected[:800] or "(none)",
+                angles="/".join(idea.DISCOVERY_ANGLES)),
             purpose="ideation")
-        children = idea.parse_children(answer, max_children=n_children)
+        novelty, is_disc, reason, children = idea.parse_discovery(
+            answer, max_children=n_children)
+        # ---- discovery recognition (autoresearch quantitative judgment):
+        # the agent KNOWS it found something new, marks it, and the swarm
+        # pivots its backlog into that finding's subtree.
+        branch_mode = bool(
+            novelty is not None and is_disc and novelty >= novelty_min)
+        if branch_mode:
+            await asyncio.to_thread(
+                ctx.memory.mark_discovery, parent_id, novelty)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "discovery_detected",
+                {"hyp": parent_id, "novelty": round(float(novelty), 1),
+                 "reason": reason[:200], "verdict": verdict,
+                 "branches_planned": len(children)})
+            await asyncio.to_thread(
+                ctx.memory.world_add, ctx.agent_id, "finding",
+                f"DISCOVERY(novelty={round(float(novelty))}): {claim[:150]} "
+                f"-> {verdict}; digging in: {reason[:120]}",
+                source=f"h#{parent_id}")
         if not children:
             await asyncio.to_thread(
                 ctx.memory.journal, ctx.agent_id, "insight_harvest_empty",
-                {"parent_hyp": parent_id, "verdict": verdict})
+                {"parent_hyp": parent_id, "verdict": verdict,
+                 "novelty": None if novelty is None else round(float(novelty), 1),
+                 "is_discovery": branch_mode})
+            return 0
+        if parent_depth >= max_depth:
+            # branch cap: this subtree is deep enough — stop spawning children
+            # so a single discovery cannot monopolize the registry forever.
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "branch_depth_cap",
+                {"parent_hyp": parent_id, "depth": parent_depth,
+                 "max_depth": max_depth})
             return 0
         registered = 0
         for child in children:
@@ -1116,14 +1159,18 @@ async def _harvest_insights(ctx: AgentContext, parent_id: int,
             # moments ago must already block its own clones (IDEAgent: the
             # active archive grows as candidates are admitted).
             recent_now = ctx.memory.recent_hypotheses(12)
-            hyp_id = await _gate_and_register(ctx, child, [parent_id],
-                                              recent_now)
+            hyp_id = await _gate_and_register(
+                ctx, child, [parent_id], recent_now,
+                depth=parent_depth + 1,
+                branch=str(child.get("angle") or "") if branch_mode else "")
             if hyp_id is not None:
                 registered += 1
         await asyncio.to_thread(
             ctx.memory.journal, ctx.agent_id, "insight_harvest",
             {"parent_hyp": parent_id, "verdict": verdict,
-             "proposed": len(children), "registered": registered})
+             "proposed": len(children), "registered": registered,
+             "novelty": None if novelty is None else round(float(novelty), 1),
+             "is_discovery": branch_mode})
         return registered
     except Exception as exc:  # noqa: BLE001 — harvest must never break a settle
         log.warning("[%s] insight harvest failed: %s", ctx.agent_id, exc)
@@ -1229,6 +1276,30 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         fresh = qd.coverage_order(fresh, recent_claims)
     except Exception:  # noqa: BLE001 — CCR must never block the deep dive
         recent = []
+        pass
+    # Discovery frontier (novelty round): when a settled result was marked a
+    # DISCOVERY, its branch children jump the CCR queue — the swarm digs
+    # into its own breakthrough (BFS, shallowest branch level first) instead
+    # of rotating generic ideas while the finding sits unexplored.
+    try:
+        max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        frontier = await asyncio.to_thread(
+            ctx.memory.discovery_frontier, 3, max_depth)
+        if frontier:
+            fids = {h["id"] for h in frontier}
+            fmeta = {h["id"]: h for h in frontier}
+            boosted = [h for h in fresh if h["id"] in fids]
+            if boosted:
+                fresh = boosted + [h for h in fresh if h["id"] not in fids]
+                top = fmeta[boosted[0]["id"]]
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "frontier_priority",
+                    {"hyp": boosted[0]["id"],
+                     "claim": boosted[0]["claim"][:160],
+                     "branch": top.get("branch", ""),
+                     "depth": top.get("depth", 0),
+                     "frontier_size": len(boosted)})
+    except Exception:  # noqa: BLE001 — frontier must never block the deep dive
         pass
     backlog = retries + fresh
     hyp = backlog[0]
