@@ -201,6 +201,36 @@ CREATE TABLE IF NOT EXISTS hypotheses (
     attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
+-- P18 — peer panel review: agents evaluate each OTHER's MRs by vote. The
+-- panel state machine lives here so every thread (and the dashboard) reads
+-- the same truth: who voted, what was objected, what was defended.
+CREATE TABLE IF NOT EXISTS mr_panels (
+    mr_id INTEGER PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'voting',
+        -- voting | defense | approved | rejected
+    round INTEGER NOT NULL DEFAULT 1,
+    opened_ts REAL NOT NULL,
+    due_ts REAL,               -- defense deadline (only when state=defense)
+    defense TEXT DEFAULT '',   -- the author's submitted defense (JSON)
+    updated_ts REAL
+);
+CREATE TABLE IF NOT EXISTS panel_votes (
+    mr_id INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    voter TEXT NOT NULL,
+    vote TEXT NOT NULL,        -- accept | reject
+    reason TEXT DEFAULT '',
+    ts REAL NOT NULL,
+    PRIMARY KEY (mr_id, round, voter)
+);
+CREATE TABLE IF NOT EXISTS panel_objections (
+    mr_id INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    voter TEXT NOT NULL,
+    objection TEXT NOT NULL,
+    ts REAL NOT NULL,
+    PRIMARY KEY (mr_id, round, voter)
+);
 """
 
 
@@ -983,6 +1013,123 @@ class SharedMemory:
             self.set_task_status(task_id, "in_review")
         self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
         return True
+
+    # ------------------------------------------------------------ P18 peer panels
+    def ensure_panel(self, mr_id: int, opened_ts: float | None = None) -> dict:
+        """Create the panel row for an MR if missing (voting, round 1); return it.
+
+        Idempotent and lazy: legacy MRs opened before P18 get a panel the first
+        time any reviewer touches them, so no migration backfill is needed."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO mr_panels (mr_id, state, round, opened_ts) "
+                "VALUES (?, 'voting', 1, ?)",
+                (mr_id, opened_ts if opened_ts is not None else time.time()),
+            )
+        panel = self.get_panel(mr_id)
+        assert panel is not None  # just inserted
+        return panel
+
+    def get_panel(self, mr_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT mr_id, state, round, opened_ts, due_ts, defense, updated_ts "
+                "FROM mr_panels WHERE mr_id=?", (mr_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "mr_id": row[0], "state": row[1], "round": row[2],
+            "opened_ts": row[3], "due_ts": row[4],
+            "defense": json.loads(row[5] or "{}"), "updated_ts": row[6],
+        }
+
+    def set_panel(
+        self, mr_id: int, state: str | None = None, round: int | None = None,
+        due_ts: float | None = None, clear_due: bool = False,
+        defense: dict | None = None,
+    ) -> None:
+        """Patch the panel row; only the engine mutates state transitions."""
+        sets, args: list = [], []
+        if state is not None:
+            sets.append("state=?"); args.append(state)
+        if round is not None:
+            sets.append("round=?"); args.append(round)
+        if clear_due:
+            sets.append("due_ts=NULL")
+        elif due_ts is not None:
+            sets.append("due_ts=?"); args.append(due_ts)
+        if defense is not None:
+            sets.append("defense=?"); args.append(json.dumps(defense)[:8000])
+        sets.append("updated_ts=?"); args.append(time.time())
+        args.append(mr_id)
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE mr_panels SET {', '.join(sets)} WHERE mr_id=?", args)
+
+    def record_panel_vote(
+        self, mr_id: int, round: int, voter: str, vote: str, reason: str = "",
+    ) -> bool:
+        """Record one reviewer's vote. The FIRST vote of a (mr, round, voter)
+        sticks — a reviewer cannot silently flip their verdict after the fact
+        (audit trail). Returns False when the vote already exists."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO panel_votes (mr_id, round, voter, vote, reason, ts) "
+                "VALUES (?,?,?,?,?,?)",
+                (mr_id, round, voter, vote, reason[:2000], time.time()),
+            )
+            return cur.rowcount > 0
+
+    def panel_votes(self, mr_id: int, round: int | None = None) -> list[dict]:
+        sql = "SELECT round, voter, vote, reason, ts FROM panel_votes WHERE mr_id=?"
+        args: list = [mr_id]
+        if round is not None:
+            sql += " AND round=?"
+            args.append(round)
+        sql += " ORDER BY ts, voter"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"round": r[0], "voter": r[1], "vote": r[2], "reason": r[3], "ts": r[4]}
+            for r in rows
+        ]
+
+    def record_panel_objection(
+        self, mr_id: int, round: int, voter: str, objection: str,
+    ) -> None:
+        """Upsert the objection behind a reject vote — what the author must
+        defend. The latest text wins (the reviewer refines while drafting)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO panel_objections (mr_id, round, voter, objection, ts) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(mr_id, round, voter) "
+                "DO UPDATE SET objection=excluded.objection, ts=excluded.ts",
+                (mr_id, round, voter, objection[:3000], time.time()),
+            )
+
+    def panel_objections(self, mr_id: int, round: int | None = None) -> list[dict]:
+        sql = "SELECT round, voter, objection, ts FROM panel_objections WHERE mr_id=?"
+        args: list = [mr_id]
+        if round is not None:
+            sql += " AND round=?"
+            args.append(round)
+        sql += " ORDER BY ts, voter"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [
+            {"round": r[0], "voter": r[1], "objection": r[2], "ts": r[3]}
+            for r in rows
+        ]
+
+    def panels_in_state(self, *states: str) -> list[dict]:
+        """Panel rows in the given state(s), oldest first (the sweep's queue)."""
+        marks = ",".join("?" for _ in states)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT mr_id FROM mr_panels WHERE state IN ({marks}) ORDER BY mr_id",
+                tuple(states),
+            ).fetchall()
+        return [self.get_panel(r[0]) for r in rows if self.get_panel(r[0]) is not None]
 
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(
