@@ -108,12 +108,11 @@ async def main() -> None:
     settings.ensure_dirs()
 
     scratch = Path(tempfile.mkdtemp(prefix="live-run-"))
-    # Hermetic run: memory AND the vector store live in the scratch dir so a
-    # repeat run on the same topic is not skipped by the P7 dedup gate via
-    # findings persisted by earlier runs (and the repo data/ stays clean).
+    # Hermetic run: data_dir is the single root — chroma_path, workspaces_dir
+    # and db_path are derived properties of it — so a repeat run on the same
+    # topic is not skipped by the P7 dedup gate via findings persisted by
+    # earlier runs (and the repo data/ stays clean).
     settings.data_dir = scratch / "data"
-    settings.chroma_path = scratch / "data" / "chroma"
-    settings.workspaces_dir = scratch / "data" / "workspaces"
     settings.ensure_dirs()
     mem = SharedMemory(scratch / "memory.db")
     # Pin to ONE pool identity (production does the same per agent thread):
