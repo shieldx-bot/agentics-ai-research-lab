@@ -52,6 +52,7 @@ from agentics.research import diversity as research_diversity
 from agentics.research import free_tools
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
+from agentics import diversity as qd
 from agentics.verify_ops import (
     Evidence, cmds_from_evidence, run_experiment, run_experiments, summarize,
     verdict_for,
@@ -155,7 +156,45 @@ def _memory_context(ctx: AgentContext) -> dict:
         # supported claims are reusable common ground, refuted ones are dead
         # ends (rendered by verified_knowledge_text, below).
         "verified": verified_knowledge_text(ctx) or "(nothing verified yet)",
+        # Kosmos world model: the swarm's structured current state (newest
+        # findings, verified/refuted facts, open gaps) for coherent long runs.
+        "world": _world_model_text(ctx) or "(world model empty)",
     }
+
+
+def _world_model_text(ctx: AgentContext) -> str:
+    """Kosmos world model, consumption side — the swarm's structured state
+    (newest findings, verified/refuted facts, open gaps) as bounded prompt
+    text. Empty when the model has no notes yet (cold start unchanged)."""
+    try:
+        n = int(getattr(ctx.settings, "world_context_notes", 12) or 12)
+        return ctx.memory.world_render(limit=n)
+    except Exception:  # noqa: BLE001 — world model must never break a cycle
+        return ""
+
+
+def _pem_gate(ctx: AgentContext, claim: str, exclude_id: int | None = None) -> bool:
+    """DAPS Persistent-Edit-Memory gate: reject a NEW hypothesis that is a
+    near-clone of one already in the stream (word-Jaccard over non-stopword
+    tokens, signature axes included). Returns True when acceptable."""
+    threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+    try:
+        priors = ctx.memory.recent_hypotheses(limit=12)
+    except Exception:  # noqa: BLE001 — a broken gate must not block research
+        return True
+    dup = qd.near_duplicate(claim, priors, threshold,
+                            exclude_ids={exclude_id} if exclude_id else None)
+    if dup is None:
+        return True
+    score, prior = dup
+    try:
+        ctx.memory.journal(ctx.agent_id, "hypothesis_near_duplicate", {
+            "claim": claim[:160], "duplicate_of": prior.get("id"),
+            "status": prior.get("status"), "jaccard": round(score, 3),
+            "why": "PEM gate: near-clone rejected, not a new discovery"})
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
@@ -372,6 +411,26 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         replay_report = []
     replayed_n = sum(1 for r in replay_report if r.get("replayed"))
     replay_events = [r.get("event", "") for r in replay_report if r.get("replayed")]
+    # DAPS diversity audit: mechanism entropy over the recent hypothesis
+    # stream. DAPS showed SURFACE diversity staying flat while MECHANISM
+    # entropy collapses (and in-loop gains stop transferring) — so we monitor
+    # mechanism categories, not wording variety, and alert the owner early.
+    try:
+        recent_hyps = ctx.memory.recent_hypotheses(limit=20)
+        audit = qd.audit([h["claim"] for h in recent_hyps])
+        ctx.memory.journal(ctx.agent_id, "diversity_audit", audit)
+        if (audit["window"] >= 8
+                and audit["entropy_nats"] < float(
+                    getattr(ctx.settings, "diversity_min_entropy", 1.0))):
+            ctx.memory.post_message(
+                ctx.agent_id, "alert",
+                f"DIVERSITY ALERT (DAPS): mechanism entropy {audit['entropy_nats']} "
+                f"nats over last {audit['window']} hypotheses — the research "
+                f"stream is collapsing onto few categories "
+                f"({audit['categories']}). Mode collapse suspected: next "
+                "proposals should target an under-represented category.")
+    except Exception:  # noqa: BLE001 — the audit must never break the scan
+        pass
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
@@ -775,6 +834,14 @@ async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
         ctx.memory.add_finding,
         ctx.agent_id, title, content, list(citations), state.get("issue_number"),
     )
+    # Kosmos world model: the new finding becomes structured shared state so
+    # every other agent's next prompt sees it without reading the full text.
+    try:
+        await asyncio.to_thread(
+            ctx.memory.world_add, ctx.agent_id, "finding",
+            f"{topic}: {answer[:200]}", source=f"finding#{fid}")
+    except Exception:  # noqa: BLE001 — world model must never break research
+        pass
     # v3 sync-trim: remember WHICH vector doc indexes this row, so the day the
     # findings trim evicts it the vector tier deletes the same doc (the ghost
     # rows the recall path used to skip at read time never accumulate).
@@ -921,12 +988,50 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
     if ctx.llm is None:
         return False
     try:
-        backlog = await asyncio.to_thread(ctx.memory.proposed_hypotheses, 1)
+        backlog = await asyncio.to_thread(ctx.memory.proposed_hypotheses, 6)
     except Exception:  # noqa: BLE001
         backlog = []
     if not backlog:
         return False
+    # DAPS CCR: pick the candidate whose MECHANISM category is rarest in the
+    # recent hypothesis stream (ties -> oldest), not blindly the oldest —
+    # acceptance pressure otherwise amplifies the proposer's skewed prior.
+    try:
+        recent = await asyncio.to_thread(ctx.memory.recent_hypotheses, 10)
+        backlog_ids = {h["id"] for h in backlog}
+        recent_claims = [r["claim"] for r in recent
+                         if r.get("id") not in backlog_ids]
+        backlog = qd.coverage_order(backlog, recent_claims)
+    except Exception:  # noqa: BLE001 — CCR must never block the deep dive
+        pass
     hyp = backlog[0]
+    # DAPS PEM inherit: a registry proposal that is a near-clone of an
+    # already-SETTLED claim inherits that verdict instead of burning a
+    # protocol run on a re-wording (same convention as node_verify's reuse).
+    try:
+        threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+        settled_priors = [r for r in recent
+                          if r.get("status") in ("supported", "refuted")]
+        dup = qd.near_duplicate(hyp["claim"], settled_priors, threshold,
+                                exclude_ids={hyp["id"]})
+    except Exception:  # noqa: BLE001
+        dup = None
+    if dup is not None:
+        score, prior = dup
+        await asyncio.to_thread(
+            ctx.memory.update_hypothesis, hyp["id"], prior["status"],
+            note=(f"inherited verdict of settled h#{prior['id']} "
+                  f"(near-duplicate, jaccard={score:.2f})"))
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_reused",
+            {"hyp": hyp["id"], "claim": hyp["claim"][:160],
+             "settled_by": prior["id"], "status": prior["status"],
+             "jaccard": round(score, 3),
+             "why": "PEM: registry proposal is a near-clone of a settled claim"})
+        state["summary"] = (f"deep-dive: registry h#{hyp['id']} is a near-clone "
+                            f"of settled h#{prior['id']} -> verdict inherited")
+        state["done"] = True
+        return True
     try:
         crit = json.loads(hyp.get("criterion") or "{}")
     except Exception:  # noqa: BLE001
@@ -943,7 +1048,9 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         f"exactly this metric): {criterion_desc}\n\n"
         f"{PROTOCOL_CONTRACT}\n"
         'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
-        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]} '
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+        '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+        '"assumptions": "...", "effect": "..."}}]} '
         "with EXACTLY ONE entry."
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
@@ -975,6 +1082,10 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         ctx.memory.update_hypothesis, hyp_id, "testing")
     await asyncio.to_thread(
         ctx.memory.update_hypothesis_protocol_code, hyp_id, code[:20000])
+    sig = spec.get("signature")
+    if isinstance(sig, dict) and sig:
+        await asyncio.to_thread(
+            ctx.memory.set_hypothesis_signature, hyp_id, sig)
     await asyncio.to_thread(ctx.workspace.sync_main)   # workspace must exist
     path = f"experiments/verify_h{hyp_id}.py"
     try:
@@ -1027,6 +1138,14 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
          "note": note[:200], "evidence": ev_id,
          "criterion": criterion.as_dict(), "source": "registry_deep_dive"},
     )
+    # Kosmos world model: the settled registry claim becomes shared state.
+    wkind = ("verified" if status == "supported"
+             else "refuted" if status == "refuted" else "gap")
+    await asyncio.to_thread(
+        ctx.memory.world_add, ctx.agent_id, wkind,
+        f"{claim[:180]} -> {status}"
+        + (f" ({note[:120]})" if note else ""),
+        source=f"h#{hyp_id}")
     measured = ev.meta.get("metrics", {})
     state["summary"] = (
         f"deep-dive: tested registry h#{hyp_id} -> {status} "
@@ -1108,11 +1227,17 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
                                {"known_domains": len(domains)})
     except Exception:  # noqa: BLE001 — steering must never gate research
         breadth = ""
+    # Kosmos world model: the current shared state steers WHAT to research
+    # next — open gaps and untested leads, not just the static topic string.
+    world = _world_model_text(ctx)
+    world_line = (f"\n\nWorld model (swarm state — build on VERIFIED, avoid "
+                  f"REFUTED, close a GAP):\n{world}") if world else ""
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
         + (f"\n\nProblem statement from the issue:\n{body[:400]}" if body else "")
         + (f"\n\n{knowledge}" if knowledge else "")
+        + world_line
         + breadth
     )
 
@@ -1300,7 +1425,11 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "protocol.\n\n"
         f"{PROTOCOL_CONTRACT}\n"
         'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
-        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]}'
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+        '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+        '"assumptions": "...", "effect": "..."}}]}\n\n'
+        "The signature quintuple is the idea's compact identity for the "
+        "swarm's Quality-Diversity archive — keep each field under 25 words."
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
     parsed = parse_json_block(answer)
@@ -1343,10 +1472,23 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
                             "reused": True, "hypothesis_id": prior["id"],
                             "evidence_id": prior["evidence_id"]})
             continue
+        # DAPS PEM: reject a NEW hypothesis that is a near-clone of one
+        # already in the stream — surface novelty (new wording) must not be
+        # counted as a new discovery (IDEAgent diversity floor, live decay).
+        if not _pem_gate(ctx, claim):
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": "rejected by PEM diversity gate "
+                                    "(near-duplicate of a recent hypothesis)",
+                            "near_duplicate": True})
+            continue
         hyp_id = await asyncio.to_thread(
             ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
             task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
             status="testing", protocol_code=protocol_code[:20000])
+        sig = spec.get("signature")
+        if isinstance(sig, dict) and sig:
+            await asyncio.to_thread(
+                ctx.memory.set_hypothesis_signature, hyp_id, sig)
         path = f"experiments/verify_h{hyp_id}.py"
         try:
             await asyncio.to_thread(ctx.workspace.write_file, path, protocol_code)
@@ -1401,6 +1543,15 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
              "note": note[:200], "evidence": ev_id,
              "criterion": criterion.as_dict()},
         )
+        # Kosmos world model: the settled fact becomes shared state with
+        # provenance — every next cycle's prompts read it back.
+        wkind = ("verified" if status == "supported"
+                 else "refuted" if status == "refuted" else "gap")
+        await asyncio.to_thread(
+            ctx.memory.world_add, ctx.agent_id, wkind,
+            f"{claim[:180]} -> {status}"
+            + (f" ({note[:120]})" if note else ""),
+            source=f"h#{hyp_id}")
         results.append({"claim": claim, "status": status, "note": note,
                         "hypothesis_id": hyp_id, "evidence_id": ev_id,
                         "replication": False})
@@ -1678,6 +1829,15 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                       f"your plan must be consistent with these and your verify_cmds "
                       f"must check the NEW claims):\n{knowledge_txt}\n"
                       if knowledge_txt else "")
+    # Kosmos world model: the plan advances the swarm's CURRENT state — open
+    # gaps and verified facts steer the approach, refuted ones block it.
+    world_txt = _world_model_text(ctx)
+    world_rule = (
+        f"\nWorld model (the swarm's current structured state — plan must "
+        f"build on VERIFIED facts, close a GAP, never re-assert REFUTED):\n"
+        f"{world_txt}\n"
+        if world_txt else ""
+    )
     # A2X swarm lessons: OTHER agents' failures aggregated into signatures —
     # (xN) means the approach was tried N times by DIFFERENT agents and never
     # worked (Voyager lesson loop / Reflexion, at swarm scale).
@@ -1708,7 +1868,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{personal_rule}{recall_rule}{swarm_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
+        f"{tools_txt}\n{personal_rule}{recall_rule}{swarm_rule}{evolution_rule}{rework_rule}{knowledge_rule}{world_rule}\n"
         f"{PLAN_INSTRUCTION}"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)

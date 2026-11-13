@@ -196,6 +196,19 @@ class Settings:
         default_factory=lambda: _env_int("REPLAY_COOLDOWN_S", 1800))
     replay_max_per_hyp: int = field(
         default_factory=lambda: _env_int("REPLAY_MAX_PER_HYP", 10))
+    # QD diversity (DAPS / IDEAgent): a new hypothesis whose word-Jaccard
+    # with a recent one exceeds diversity_jaccard_max is rejected as a
+    # near-clone (PEM); the supervisor's diversity_audit alerts when
+    # mechanism entropy over the last 20 hypotheses drops below
+    # diversity_min_entropy nats (algorithmic mode collapse alarm).
+    diversity_jaccard_max: float = field(
+        default_factory=lambda: _env_float("DIVERSITY_JACCARD_MAX", 0.8))
+    diversity_min_entropy: float = field(
+        default_factory=lambda: _env_float("DIVERSITY_MIN_ENTROPY", 1.0))
+    # Kosmos world model: how many world_notes rows the agent snapshots
+    # carry into prompts (bounded — the model is a summary, not a ledger).
+    world_context_notes: int = field(
+        default_factory=lambda: _env_int("WORLD_CONTEXT_NOTES", 12))
     # P24bis — independent replication: reviewers re-run settled claims from
     # their stored protocols in their own workspaces. replication_limit caps
     # how many claims ONE reviewer cycle replicates (0 = off). No LLM is

@@ -83,6 +83,18 @@ CREATE TABLE IF NOT EXISTS journal (
     event TEXT NOT NULL,
     detail TEXT DEFAULT ''
 );
+-- Kosmos world model (arXiv 2511.02824): a STRUCTURED shared state that
+-- nodes append to and every prompt reads back, so 100s of cycles stay
+-- coherent on one objective. kind: finding | verified | refuted | gap |
+-- question. source: 'finding#N' / 'h#N' / 'evidence#N' provenance tag.
+CREATE TABLE IF NOT EXISTS world_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -425,6 +437,10 @@ class SharedMemory:
                 "ALTER TABLE hypotheses ADD COLUMN elo REAL NOT NULL DEFAULT 1200",
                 "ALTER TABLE hypotheses ADD COLUMN matches_played INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE hypotheses ADD COLUMN parents TEXT NOT NULL DEFAULT '[]'",
+                # IDEAgent quintuple signature: {problem, mechanism, novelty,
+                # assumptions, effect} — compact identity for the QD
+                # diversity gates (near-duplicate PEM, coverage CCR).
+                "ALTER TABLE hypotheses ADD COLUMN signature TEXT NOT NULL DEFAULT '{}'",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -1401,6 +1417,79 @@ class SharedMemory:
         with self._lock:
             rows = self._conn.execute(sql, (limit,)).fetchall()
         return [self._hypothesis_row(r) for r in rows]
+
+    def recent_hypotheses(self, limit: int = 12) -> list[dict]:
+        """Newest hypotheses across ALL statuses with their QD signature.
+
+        Input for the diversity gates (agentics/diversity.py): the PEM
+        near-duplicate check and the CCR coverage window. Deliberately NOT
+        filtered by status — a proposed near-clone of a rejected idea is
+        exactly what the gate must catch."""
+        sql = ("SELECT id, claim, status, signature FROM hypotheses "
+               "ORDER BY id DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, (limit,)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                sig = json.loads(r[3] or "{}")
+            except ValueError:
+                sig = {}
+            out.append({"id": r[0], "claim": r[1], "status": r[2],
+                        "signature": sig})
+        return out
+
+    def set_hypothesis_signature(self, hyp_id: int, sig: dict) -> bool:
+        """Store the IDEAgent quintuple {problem, mechanism, novelty,
+        assumptions, effect} on a hypothesis (idempotent overwrite)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET signature=? WHERE id=?",
+                (json.dumps(sig or {}, ensure_ascii=False), hyp_id))
+        return cur.rowcount > 0
+
+    # ------------------------------------------------- Kosmos world model
+    def world_add(self, agent: str, kind: str, text: str, source: str = "") -> int:
+        """Append one structured note to the shared world model.
+
+        kind: finding | verified | refuted | gap | question. Bounded state:
+        the table keeps at most the newest 400 notes (a world model is a
+        summary, not a ledger — the full history lives in evidence/journal)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO world_notes (ts, agent, kind, text, source) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (time.time(), agent, kind, (text or "")[:400],
+                 (source or "")[:60]))
+            self._conn.execute(
+                "DELETE FROM world_notes WHERE id NOT IN "
+                "(SELECT id FROM world_notes ORDER BY id DESC LIMIT 400)")
+        return cur.lastrowid
+
+    def world_items(self, kind: str | None = None, limit: int = 20) -> list[dict]:
+        with self._lock:
+            if kind:
+                rows = self._conn.execute(
+                    "SELECT id, ts, agent, kind, text, source FROM world_notes "
+                    "WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, ts, agent, kind, text, source FROM world_notes "
+                    "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r[0], "ts": r[1], "agent": r[2], "kind": r[3],
+                 "text": r[4], "source": r[5]} for r in rows]
+
+    def world_render(self, limit: int = 12) -> str:
+        """World model as bounded prompt text (Kosmos consumption side)."""
+        items = self.world_items(limit=limit)
+        if not items:
+            return ""
+        mark = {"finding": "FINDING", "verified": "VERIFIED",
+                "refuted": "REFUTED", "gap": "GAP", "question": "QUESTION"}
+        lines = [f"- [{mark.get(i['kind'], i['kind'].upper())}] {i['text'][:200]}"
+                 f" ({i['source']})" for i in items]
+        return "\n".join(lines)
 
     # ------------------------------------- independent replication (P24bis)
     # The P24 ledger above (hypotheses.replication + selection) is the
