@@ -1,4 +1,4 @@
-"""P21 — retention: dead agents leave clean workspaces, not disk debt.
+"""P22 — retention: dead agents leave clean workspaces, not disk debt.
 
 The sweep must prune ONLY when every safety condition holds: agent inactive
 beyond the idle window, no active claims/locks, and a CLEAN git tree (every

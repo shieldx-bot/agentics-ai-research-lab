@@ -569,7 +569,7 @@ class SharedMemory:
             )
             changed = cur.rowcount > 0
         if changed:
-            # P19 — immutable audit: overwriting a verdict is exactly the kind
+            # P21 — immutable audit: overwriting a verdict is exactly the kind
             # of action a production audit trail exists for (who re-judged
             # what, when, and on what grounds).
             try:
@@ -653,10 +653,10 @@ class SharedMemory:
             ).fetchall()
         return {r[0]: r[1] for r in rows}
 
-    # ------------------------------------------------- llm_usage (P18, budget)
+    # ------------------------------------------------- llm_usage (P20, budget)
     def record_llm_call(self, agent: str, purpose: str, ok: bool,
                         duration_s: float = 0.0) -> None:
-        """One LLM request made by one agent (P18 budget ledger). Self-trims
+        """One LLM request made by one agent (P20 budget ledger). Self-trims
         like the journal: the budget window only needs recent rows."""
         with self._lock, self._conn:
             self._conn.execute(
@@ -708,9 +708,9 @@ class SharedMemory:
             ).fetchone()
         return row[0] if row and row[0] else None
 
-    # ------------------------------------------------- audit_log (P19, immutable)
+    # ------------------------------------------------- audit_log (P21, immutable)
     def audit(self, agent: str, event: str, detail: dict | str = "") -> int:
-        """Append ONE row to the immutable audit log (P19).
+        """Append ONE row to the immutable audit log (P21).
 
         Unlike the journal (trimmed feed) and evidence (trimmed ledger), this
         table is NEVER trimmed and never updated in place: it is the lab's
@@ -1186,7 +1186,7 @@ class SharedMemory:
         if changed:
             self.journal(agent, "task_exempt_set" if exempt else "task_exempt_cleared",
                          {"task": task_id})
-            # P19 — immutable audit: lifting a protected-path exemption is a
+            # P21 — immutable audit: lifting a protected-path exemption is a
             # security decision; it must be traceable after the journal trims.
             try:
                 self.audit(agent, "task_exempt_set" if exempt else "task_exempt_cleared",

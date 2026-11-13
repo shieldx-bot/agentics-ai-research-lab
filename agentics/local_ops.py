@@ -564,7 +564,7 @@ class LocalMergeQueue:
                     integrator_id, f"merge MR #{mr_id} by {author}", "merged")
                 self.memory.journal(integrator_id, "merge",
                                     {"mr": mr_id, "author": author})
-                try:   # P19 — immutable audit trail (outlives the trimmed journal)
+                try:   # P21 — immutable audit trail (outlives the trimmed journal)
                     self.memory.audit(integrator_id, "merge", {
                         "mr": mr_id, "author": author,
                         "auto_merge": self.auto_merge})
@@ -595,7 +595,7 @@ class LocalMergeQueue:
             reason[:200])
         self.memory.journal(integrator_id, "merge_failed",
                             {"mr": mr_id, "why": reason[:300]})
-        try:   # P19 — immutable audit trail (outlives the trimmed journal)
+        try:   # P21 — immutable audit trail (outlives the trimmed journal)
             self.memory.audit(integrator_id, "mr_reject", {
                 "mr": mr_id, "author": item.get("author", ""),
                 "reason": reason[:300]})

@@ -65,7 +65,7 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             "counts": memory.hypothesis_counts(),
             "recent": memory.list_hypotheses(limit=12),
         },
-        # P19 — immutable trail (compliance) + P18 budget dial: how much of
+        # P21 — immutable trail (compliance) + P20 budget dial: how much of
         # the shared LLM pool the swarm has burned this hour.
         "audit": {"total": memory.audit_count(),
                   "recent": memory.audit_recent(limit=8)},

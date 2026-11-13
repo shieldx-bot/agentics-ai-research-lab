@@ -1,4 +1,4 @@
-"""P21 — retention: dead agents leave clean workspaces, not disk debt.
+"""P22 — retention: dead agents leave clean workspaces, not disk debt.
 
 The lab runs for months; every dead agent leaves `data/workspaces/<id>` on
 disk (a full clone). P6 marks them dead, P13 releases their locks — nothing
@@ -14,7 +14,7 @@ can be lost:
 
 Anything that fails a check is left alone — a stale clone is a nuisance, a
 deleted uncommitted result is a loss. Every prune is journaled AND audited
-(P20), so disk debt is paid down transparently.
+(P21), so disk debt is paid down transparently.
 """
 from __future__ import annotations
 

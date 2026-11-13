@@ -317,6 +317,93 @@ Test: `tests/test_reviewer_rerun.py`, `tests/test_p17_protocol_rerun.py`
 MR, main không có — sau re-run main phải sạch như cũ).
 Chi tiết: [VERIFICATION.md](VERIFICATION.md) mục 6.
 
+---
+
+## P20 — LLM budget & circuit breaker: agent chạy loạn là sự kiện có biên
+
+**Vấn đề:** P1-P17 ngăn agent giẫm chân nhau về **code**, nhưng không thứ gì
+giới hạn việc đốt **nguồn lực LLM dùng chung** (pool cookie/quota là hữu hạn).
+Một agent kẹt vòng hallucination hoặc đập vào provider chết có thể rút cạn
+pool của cả đàn vô hạn.
+
+**Chính sách** (`agentics/policies/budget.py`, mọi lời gọi LLM đi qua 2 cửa):
+
+1. **Ledger dùng chung** — mỗi lời gọi LLM ghi 1 dòng vào bảng `llm_usage`
+   (agent, purpose, ok = provider trả lời thật hay lỗi, duration). Ledger tự
+   trim như journal — chỉ cần các dòng gần đây.
+2. **Cap theo pool, cửa sổ trượt 1 giờ** — cap là **toàn đàn** vì tài nguyên
+   là toàn đàn (`LLM_MAX_CALLS_PER_HOUR`, mặc định 120, `0` = tắt). Hết cap,
+   mọi agent bị chặn đến khi cửa sổ trượt qua — không ai "nhờn" quota của ai.
+3. **Circuit breaker từng agent** — N lần lỗi provider liên tiếp
+   (`LLM_FAIL_STREAK_LIMIT`, mặc định 5) mở cooldown
+   (`LLM_BREAKER_COOLDOWN_S`, mặc định 900s): agent dừng gọi, journal
+   `budget_breaker_open` (mỗi lần mở ghi đúng 1 lần) + decision. Một câu
+   trả lời thật mở lại breaker tức thì.
+4. **Chặn trước, ghi sau** — lời gọi bị chặn **không bao giờ đến provider**;
+   mọi lời gọi (kể cả bị chặn) đều vào ledger. Lời gọi nghiên cứu bị chặn
+   vẫn rơi vào **free-tools fallback** (không tốn một đồng budget nào) —
+   owner vẫn nhận nghiên cứu khi pool cạn.
+5. **Không phá đường lành** — context không có budget (test, code cũ) đi
+   qua như cũ; policy không bao giờ raise.
+
+Owner nhìn tổng thể: card "budget" trên dashboard (`/api/state`) và
+`llm_usage` trong shared memory.
+
+Test: `tests/test_budget_policy.py` (+10).
+
+---
+
+## P21 — Audit trail bất biến: hành động quan trọng sống lâu hơn journal
+
+**Vấn đề:** journal vận hành trim còn 5000 dòng; evidence trim để giữ kích
+thước. Sau một sự cố (hoặc một tháng chạy), hành động từng xảy ra — merge
+gì, ai miễn protected path cho task nào, ai viết lại verdict bằng chứng nào —
+không còn dấu vết để đối chiếu.
+
+**Chính sách:** bảng `audit_log` là **append-only, không bao giờ trim, không
+bao giờ sửa tại chỗ**. Chỉ những hành động "đáng kể" được ghi, và mỗi hook
+bọc try/except — audit không bao giờ cản hành động nó ghi lại:
+
+| Sự kiện | Điểm cắm |
+|---|---|
+| `merge` | LocalMergeQueue + GitHub MergeQueue (author, auto_merge) |
+| `mr_reject` | 2 queue trên (pr/MR, lý do: guard, tier-2, conflict) |
+| `evidence_reverdict` | `set_evidence_verdict` (ai phán lại bằng chứng nào) |
+| `task_exempt_set/cleared` | `set_task_exempt` (miễn/chấm dứt protected path) |
+| `workspace_pruned` | P22 retention (đã dọn workspace của ai) |
+
+Owner tra cứu: `agentics audit [--event merge] [--limit 50]` — CLI không bao
+giờ bỏ sót; dashboard `/api/state` mang `audit.total` + 8 dòng mới nhất.
+
+Test: `tests/test_audit_trail.py` (+5, gồm merge thật qua queue local).
+
+---
+
+## P22 — Retention: agent chết để lại workspace sạch, không để lại nợ ổ đĩa
+
+**Vấn đề:** lab chạy nhiều tháng; mỗi agent chết để lại `data/workspaces/<id>`
+(một clone đầy đủ) trên đĩa mãi mãi. P6 đánh dấu chết, P13 nhả khóa — không
+có gì dọn clone.
+
+**Chính sách** (`agentics/policies/retention.py`, chạy trong node_scan sau
+các sweep claims/locks/panel): xóa workspace **CHỈ khi** mọi điều kiện an toàn
+thỏa đồng thời:
+
+1. Agent **không còn trong heartbeat set** active (P6 đã tuyên bố chết);
+2. Agent **không giữ claim / file lock** nào còn hiệu lực (P1/P13);
+3. **Git tree sạch** (`git status --porcelain` rỗng) — mọi commit đã nằm trên
+   bare repo dùng chung, clone chỉ là tài sản tái tạo được, không phải bản
+   duy nhất;
+4. **Idle** quá `WORKSPACE_RETENTION_MINUTES` (mặc định 240, `0` = tắt hẳn).
+
+Tree **bẩn** bị bỏ qua và journal `workspace_retention_skip` — clone cũ là
+chuyện khó chịu, kết quả chưa push bị mất là thất thoát thật. Mỗi lần dọn
+được journal + **audit** (P21) + alert broadcast — owner thấy ngay đã dọn gì
+và vì sao.
+
+Test: `tests/test_retention.py` (+7: prune, active/holder/dirty/fresh được
+giữ, kill-switch, audit).
+
 ## P19 — Peer panel: đánh giá lẫn nhau bằng bỏ phiếu, một lời phản đối là đủ
 
 P5 chỉ cấm tự duyệt; P17 bắt reviewer tái tạo bằng chứng. Nhưng một reviewer

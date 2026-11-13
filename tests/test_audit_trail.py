@@ -1,4 +1,4 @@
-"""P19 — the immutable audit trail: actions that change what gets merged,
+"""P21 — the immutable audit trail: actions that change what gets merged,
 what gets exempted and what gets re-judged must survive the trimmed journal.
 
 Covers the SharedMemory audit API (never trimmed, never rewritten) and the

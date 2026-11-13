@@ -1,4 +1,4 @@
-"""P18 — LLM budget & circuit breaker: a runaway agent cannot burn the pool.
+"""P20 — LLM budget & circuit breaker: a runaway agent cannot burn the pool.
 
 Every agent shares one cookie/quota pool (the lab's finite LLM resource).
 Policies P1-P17 prevent agents from stepping on each other's CODE; nothing
@@ -23,7 +23,7 @@ import time
 
 
 class BudgetPolicy:
-    """Shared-memory backed rate limiter + circuit breaker (P18)."""
+    """Shared-memory backed rate limiter + circuit breaker (P20)."""
 
     def __init__(
         self, memory,
@@ -46,13 +46,13 @@ class BudgetPolicy:
             return True, ""
         # circuit breaker first — cheapest check explains the most
         if self.breaker_open(agent):
-            return False, (f"P18 circuit breaker open for {agent} "
+            return False, (f"P20 circuit breaker open for {agent} "
                            f"(fail streak >= {self.fail_streak_limit}, "
                            f"cooldown {int(self.cooldown_s)}s)")
         if self.max_calls_per_hour > 0:
             used = self.memory.llm_calls_in_window(3600.0)
             if used >= self.max_calls_per_hour:
-                return False, (f"P18 pool budget exhausted: {used} calls in "
+                return False, (f"P20 pool budget exhausted: {used} calls in "
                                f"the last hour (cap {self.max_calls_per_hour})")
         return True, ""
 

@@ -79,7 +79,7 @@ class MergeQueue:
                                 item.pr_number, exc)
                 self.memory.add_decision(
                     integrator_id, f"merge PR #{item.pr_number} by {item.author}", "merged")
-                # P19 — immutable audit: a merge is the single most consequential
+                # P21 — immutable audit: a merge is the single most consequential
                 # action in the lab; the trail outlives the trimmed journal.
                 try:
                     self.memory.audit(integrator_id, "merge", {

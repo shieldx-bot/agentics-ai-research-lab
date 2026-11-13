@@ -30,7 +30,7 @@ class AgentContext:
     gh: object | None = None               # legacy github-mode client (dormant)
     claims: object | None = None           # LocalClaimPolicy (or legacy ClaimPolicy)
     merge_queue: object | None = None      # LocalMergeQueue (or legacy MergeQueue)
-    budget: object | None = None           # P18 BudgetPolicy (LLM budget + breaker)
+    budget: object | None = None           # P20 BudgetPolicy (LLM budget + breaker)
     panel: object | None = None            # PeerPanel (P19 — peer review votes)
     cycle: int = 0
     meta: dict = field(default_factory=dict)

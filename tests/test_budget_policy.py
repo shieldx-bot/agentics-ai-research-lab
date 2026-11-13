@@ -1,4 +1,4 @@
-"""P18 — LLM budget & circuit breaker: a runaway agent is a bounded event.
+"""P20 — LLM budget & circuit breaker: a runaway agent is a bounded event.
 
 Covers the shared-memory usage ledger, the pool-wide hourly cap, the
 per-agent fail-streak breaker with cooldown and reopen, and the `_llm_ask`
@@ -54,7 +54,7 @@ def test_pool_cap_blocks_every_agent_when_exhausted(mem):
     p = _policy(mem, max_calls_per_hour=3)
     for i in range(3):
         p.record("a02", "plan", True)
-    assert p.can_ask("a02") == (False, "P18 pool budget exhausted: 3 calls in "
+    assert p.can_ask("a02") == (False, "P20 pool budget exhausted: 3 calls in "
                                       "the last hour (cap 3)")
     # the pool is shared: a03 is blocked by a02's usage
     assert p.can_ask("a03")[0] is False
@@ -117,7 +117,7 @@ def test_llm_ask_blocked_by_budget_never_reaches_provider():
             pass
 
     budget = BudgetPolicy(None, max_calls_per_hour=0)
-    budget.can_ask = lambda agent: (False, "P18 pool budget exhausted (test)")
+    budget.can_ask = lambda agent: (False, "P20 pool budget exhausted (test)")
     budget.record = lambda *a, **k: None
     ctx = SimpleNamespace(llm=SimpleNamespace(ask=fake_ask, account=None),
                           agent_id="a03", role=Role.CODER, settings=SimpleNamespace(
@@ -127,12 +127,12 @@ def test_llm_ask_blocked_by_budget_never_reaches_provider():
     answer, citations = _run(_llm_ask(ctx, "prompt", purpose="plan", state=state))
     assert answer == "" and citations == []
     assert calls == []                     # the provider was never touched
-    assert "P18 budget" in state["error"]
+    assert "P20 budget" in state["error"]
 
 
 def test_llm_ask_without_budget_attr_still_works():
     """Tests and legacy paths build contexts without a budget — the gate
-    must degrade to a plain pass-through (P18 never breaks a healthy path)."""
+    must degrade to a plain pass-through (P20 never breaks a healthy path)."""
     calls = []
 
     async def fake_ask(*a, **k):

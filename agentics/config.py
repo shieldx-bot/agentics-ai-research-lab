@@ -163,7 +163,7 @@ class Settings:
         default_factory=lambda: _env_int("PEER_PANEL_SIZE", 2))
     peer_defense_ttl_minutes: int = field(
         default_factory=lambda: _env_int("PEER_DEFENSE_TTL_MINUTES", 30))
-    # P19 — LLM budget: pool-wide hourly cap (0 = off) + per-agent circuit
+    # P20 — LLM budget: pool-wide hourly cap (0 = off) + per-agent circuit
     # breaker after N consecutive provider failures. Defaults bound a
     # runaway agent without throttling a healthy swarm of 10.
     llm_max_calls_per_hour: int = field(
@@ -172,7 +172,7 @@ class Settings:
         default_factory=lambda: _env_int("LLM_FAIL_STREAK_LIMIT", 5))
     llm_breaker_cooldown_s: int = field(
         default_factory=lambda: _env_int("LLM_BREAKER_COOLDOWN_S", 900))
-    # P21 — retention: workspaces of agents inactive longer than this AND
+    # P22 — retention: workspaces of agents inactive longer than this AND
     # with a clean git tree get pruned by the supervisor sweep (0 = off).
     workspace_retention_minutes: int = field(
         default_factory=lambda: _env_int("WORKSPACE_RETENTION_MINUTES", 240))

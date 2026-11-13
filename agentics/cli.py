@@ -545,7 +545,7 @@ def audit(
     event: str = typer.Option("", "--event", "-e", help="lọc theo loại sự kiện (merge/mr_reject/task_exempt_set/...)"),
     limit: int = typer.Option(50, "--limit", "-l", help="số dòng tối đa"),
 ) -> None:
-    """Owner: nhật ký kiểm toán bất biến (P19) — merge, từ chối merge, miễn
+    """Owner: nhật ký kiểm toán bất biến (P21) — merge, từ chối merge, miễn
     protected path, re-verdict bằng chứng. Bảng này KHÔNG BAO GIỜ bị trim:
     đối chiếu sau sự cố vẫn đầy đủ dù journal vận hành đã cắt gọn."""
     settings = _settings()
@@ -558,7 +558,7 @@ def audit(
         if event:
             rows = [r for r in rows if r["event"] == event]
         total = mem.audit_count()
-        console.print(f"[bold]Audit trail (P19)[/] — {total} dòng bất biến, "
+        console.print(f"[bold]Audit trail (P21)[/] — {total} dòng bất biến, "
                       f"hiện {len(rows)} mới nhất")
         table = Table(title="Immutable audit log")
         table.add_column("ID", justify="right")

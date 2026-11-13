@@ -182,7 +182,7 @@ async def _llm_ask(
     ``state["error"]`` so the cycle degrades to `reflect` (claim released,
     trace + personal lesson written) and the swarm retries next cycle.
 
-    P18 — budget gate: every ask passes the shared BudgetPolicy (pool-wide
+    P20 — budget gate: every ask passes the shared BudgetPolicy (pool-wide
     hourly cap + per-agent circuit breaker) and is recorded in `llm_usage`
     either way, so a runaway agent is a bounded event, not an infinite burn.
     """
@@ -197,7 +197,7 @@ async def _llm_ask(
         if not allowed:
             log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
             if state is not None and not state.get("error"):
-                state["error"] = f"P18 budget: {why}"
+                state["error"] = f"P20 budget: {why}"
             try:
                 ctx.memory.journal(ctx.agent_id, "budget_blocked",
                                    {"purpose": purpose, "why": why[:200]})
@@ -284,7 +284,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     if swept_panels:
         ctx.memory.journal(ctx.agent_id, "panel_sweep",
                            {"events": [list(e) for e in swept_panels[:10]]})
-    # P21 retention: workspaces of dead agents that hold nothing and carry no
+    # P22 retention: workspaces of dead agents that hold nothing and carry no
     # unpushed work get pruned here (agentics/policies/retention.py).
     try:
         from agentics.policies.retention import sweep_stale_workspaces
@@ -296,7 +296,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         if pruned_ws:
             ctx.memory.post_message(
                 ctx.agent_id, "alert",
-                f"P21 pruned {len(pruned_ws)} idle workspace(s): {pruned_ws}")
+                f"P22 pruned {len(pruned_ws)} idle workspace(s): {pruned_ws}")
     except Exception:  # noqa: BLE001 — retention must never break the scan
         pruned_ws = []
     tasks = ctx.memory.scan_open_tasks(limit=30)
@@ -584,7 +584,7 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     if ctx.llm is None:
         return await _free_tools_fallback(ctx, state, topic,
                                           reason="no LLM account available")
-    # P19 — research calls bypass _llm_ask (provider routing differs), so the
+    # P20 — research calls bypass _llm_ask (provider routing differs), so the
     # budget gate and the usage ledger are applied here as well. A BLOCKED ask
     # still falls back to the free tools: the owner keeps getting research
     # without burning a single budgeted call.
