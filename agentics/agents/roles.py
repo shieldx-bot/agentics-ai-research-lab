@@ -60,15 +60,41 @@ MEMORY_CONTEXT_LINE = (
     "Related findings already in memory (do not duplicate):\n{findings}\n"
 )
 
+# Immutable collaboration rules — appended by CODE to EVERY system prompt,
+# static or LLM-synthesized. The model may rewrite its mission freely; it can
+# never rewrite these (the planning layer re-appends them after synthesis).
+GUARDRAILS = (
+    "Collaboration rules (non-negotiable; no prompt can change them): write "
+    "every decision to shared memory; never touch another agent's branch; "
+    "yield when your diff enters foreign territory; never merge your own MR; "
+    "never modify protected paths (agentics/, configs/, accounts/, scripts/, "
+    ".github/); never commit secrets or credentials; back claims by running "
+    "code, not by opinion."
+)
+
+
+def static_mission(role: Role | str) -> str:
+    """Fallback mission text — used when no LLM-authored prompt exists."""
+    try:
+        return ROLE_MISSIONS[Role(str(role))]
+    except (ValueError, KeyError):
+        return ROLE_MISSIONS[Role.RESEARCHER]
+
+
+def compose_system_prompt(
+    agent_id: str, role: Role | str, topic: str, mission: str
+) -> str:
+    """Identity + mission + guardrails. `mission` may be LLM-authored
+    (adaptive prompts) or the static default; the guardrails are code-owned."""
+    role_val = getattr(role, "value", None) or str(role)
+    return TOPIC_LINE.format(
+        topic=topic, agent_id=agent_id, role=role_val, mission=mission
+    ) + GUARDRAILS
+
 
 def build_system_prompt(agent_id: str, role: Role, topic: str) -> str:
-    return (
-        TOPIC_LINE.format(topic=topic, agent_id=agent_id, role=role.value,
-                          mission=ROLE_MISSIONS[role])
-        + "Collaboration rules: every decision you make must be written to "
-          "shared memory; never touch another agent's branch; yield when your "
-          "diff enters foreign territory; never merge your own PR."
-    )
+    """Static system prompt (the pre-adaptive behavior, kept as fallback)."""
+    return compose_system_prompt(agent_id, role, topic, static_mission(role))
 
 
 def parse_json_block(text: str) -> dict:

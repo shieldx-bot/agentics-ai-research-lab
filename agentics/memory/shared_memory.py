@@ -231,6 +231,20 @@ CREATE TABLE IF NOT EXISTS panel_objections (
     ts REAL NOT NULL,
     PRIMARY KEY (mr_id, round, voter)
 );
+CREATE TABLE IF NOT EXISTS role_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    category TEXT NOT NULL,
+    mission TEXT NOT NULL,                  -- LLM-written operating instructions
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    reason TEXT NOT NULL DEFAULT '',        -- cold_start | rework | too_many_failures
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    successes INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_role_prompts_active
+    ON role_prompts(role, category) WHERE status='active';
 """
 
 
@@ -284,6 +298,112 @@ class SharedMemory:
                     self._conn.execute(column)
                 except sqlite3.OperationalError:
                     pass  # column already exists
+
+    # ------------------------------------------------------------ role prompts
+    # Adaptive role prompts (LLM-authored, shared across the swarm): one active
+    # mission per (role, category), reworked after repeated failures. The
+    # immutable guardrails are appended by the planning layer, never stored.
+    def get_role_prompt(self, role: str, category: str) -> dict | None:
+        """The active mission for (role, category), with its measured record."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, category, mission, status, reason, ts, uses, "
+                "successes, failures FROM role_prompts "
+                "WHERE role=? AND category=? AND status='active'",
+                (role, category),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = ("id", "role", "category", "mission", "status", "reason",
+                "ts", "uses", "successes", "failures")
+        return dict(zip(keys, row))
+
+    def latest_role_prompt(self, role: str, category: str) -> dict | None:
+        """The newest mission row for (role, category) regardless of status —
+        its measured record conditions the next synthesis even after the row
+        was superseded for too many failures."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, role, category, mission, status, reason, ts, uses, "
+                "successes, failures FROM role_prompts "
+                "WHERE role=? AND category=? ORDER BY id DESC LIMIT 1",
+                (role, category),
+            ).fetchone()
+        if row is None:
+            return None
+        keys = ("id", "role", "category", "mission", "status", "reason",
+                "ts", "uses", "successes", "failures")
+        return dict(zip(keys, row))
+
+    def store_role_prompt(self, role: str, category: str, mission: str,
+                          reason: str = "") -> int:
+        """Supersede the current active mission, insert the new one (atomic)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE role_prompts SET status='superseded' "
+                "WHERE role=? AND category=? AND status='active'",
+                (role, category),
+            )
+            cur = self._conn.execute(
+                "INSERT INTO role_prompts (role, category, mission, status, "
+                "reason, ts) VALUES (?,?,?,?,?,?)",
+                (role, category, mission, "active", reason, time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    def bump_role_prompt(self, role: str, category: str, success: bool,
+                         rework_after: int = 2) -> str:
+        """Feed one cycle outcome back into the active mission.
+
+        success -> successes+1 and failures decay by one (a single bad cycle
+        must not thrash a good prompt); failure -> failures+1, and once the
+        failures reach `rework_after` the mission is superseded so the next
+        cycle re-synthesizes it conditioned on what went wrong. Returns the
+        row status after the bump ('' when no active row exists)."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id, failures FROM role_prompts "
+                "WHERE role=? AND category=? AND status='active'",
+                (role, category),
+            ).fetchone()
+            if row is None:
+                return ""
+            row_id, failures = int(row[0]), int(row[1])
+            if success:
+                failures = max(0, failures - 1)
+                self._conn.execute(
+                    "UPDATE role_prompts SET uses=uses+1, successes=successes+1, "
+                    "failures=? WHERE id=?", (failures, row_id))
+                return "active"
+            failures += 1
+            if rework_after > 0 and failures >= rework_after:
+                self._conn.execute(
+                    "UPDATE role_prompts SET uses=uses+1, failures=?, "
+                    "status='superseded', reason='too_many_failures' WHERE id=?",
+                    (failures, row_id))
+                return "superseded"
+            self._conn.execute(
+                "UPDATE role_prompts SET uses=uses+1, failures=? WHERE id=?",
+                (failures, row_id))
+            return "active"
+
+    def role_experience(self, role: str, category: str, limit: int = 8) -> str:
+        """Recent traces of this (role, category) as digest lines for the
+        synthesis meta-prompt — what was tried, how it ended, why it failed."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT outcome, attempted, failure FROM traces "
+                "WHERE role=? AND category=? ORDER BY id DESC LIMIT ?",
+                (role, category, limit),
+            ).fetchall()
+        lines = []
+        for outcome, attempted, failure in reversed(rows):
+            tried = (attempted or "(nothing recorded)")[:160]
+            line = f"- [{outcome}] {tried}"
+            if failure:
+                line += f" (failure: {failure[:120]})"
+            lines.append(line)
+        return "\n".join(lines)
 
     # ------------------------------------------------------------ messages
     def post_message(self, agent: str, kind: str, content: str, issue: int | None = None) -> None:
