@@ -711,7 +711,7 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
         hyp_id = await asyncio.to_thread(
             ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
             task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
-            status="testing")
+            status="testing", protocol_code=protocol_code[:20000])
         path = f"experiments/verify_h{hyp_id}.py"
         try:
             await asyncio.to_thread(ctx.workspace.write_file, path, protocol_code)

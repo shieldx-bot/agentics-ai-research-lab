@@ -47,6 +47,7 @@ def register_hypothesis(memory, agent: str, h: Hypothesis) -> int:
         agent, h.claim, h.criterion.as_dict(),
         task_id=h.task, finding_id=h.source_finding,
         protocol_path=h.script_path, status="testing",
+        protocol_code=h.code[:20000],   # P23: the claim stays replayable
     )
     memory.post_message(
         agent, "evidence",

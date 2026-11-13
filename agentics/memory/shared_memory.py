@@ -198,7 +198,9 @@ CREATE TABLE IF NOT EXISTS hypotheses (
         -- proposed | testing | supported | refuted | inconclusive
     verdict_note TEXT DEFAULT '',           -- machine note (measured X vs criterion)
     evidence_id INTEGER,
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    protocol_code TEXT NOT NULL DEFAULT ''  -- full protocol source, so replays
+                                            -- survive workspace pruning (P21/P23)
 );
 CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
@@ -330,6 +332,9 @@ class SharedMemory:
                 "ALTER TABLE evidence ADD COLUMN runs TEXT NOT NULL DEFAULT '[]'",
                 # P16bis dedup: normalized claim identity for reuse across agents
                 "ALTER TABLE hypotheses ADD COLUMN claim_hash TEXT DEFAULT ''",
+                # P23 replay: keep the protocol source so settled claims can be
+                # re-run even after P21 pruned the workspaces that held them
+                "ALTER TABLE hypotheses ADD COLUMN protocol_code TEXT NOT NULL DEFAULT ''",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -744,6 +749,7 @@ class SharedMemory:
         self, agent: str, claim: str, criterion: dict,
         task_id: int | None = None, finding_id: int | None = None,
         protocol_path: str = "", status: str = "proposed",
+        protocol_code: str = "",
     ) -> int:
         """Register a hypothesis BEFORE the protocol runs (pre-registration).
 
@@ -751,17 +757,19 @@ class SharedMemory:
         "target"[, "tolerance"]} — the machine verdict compares the measured
         number against it, so the goalposts cannot move after the run.
         The claim's normalized hash is stored so the next agent meeting the
-        same claim can reuse the settled verdict instead of re-running (H3)."""
+        same claim can reuse the settled verdict instead of re-running (H3).
+        `protocol_code` keeps the protocol source INSIDE memory, so a settled
+        claim stays replayable even after P21 prunes the workspace."""
         from agentics.verify.hypothesis import claim_hash as _chash
 
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
-                "criterion, protocol_path, status, claim_hash) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "criterion, protocol_path, status, claim_hash, protocol_code) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, task_id, finding_id, claim[:500],
                  json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
-                 status, _chash(claim)),
+                 status, _chash(claim), protocol_code[:20_000]),
             )
             return int(cur.lastrowid or 0)
 
@@ -814,9 +822,7 @@ class SharedMemory:
     def get_hypothesis(self, hyp_id: int) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, ts, agent, task_id, finding_id, claim, criterion, "
-                "protocol_path, status, verdict_note, evidence_id, attempts "
-                "FROM hypotheses WHERE id=?", (hyp_id,),
+                f"SELECT {self.HYP_COLS} FROM hypotheses WHERE id=?", (hyp_id,),
             ).fetchone()
         if row is None:
             return None
@@ -824,9 +830,7 @@ class SharedMemory:
 
     def list_hypotheses(self, limit: int = 50, status: str | None = None,
                         task_id: int | None = None) -> list[dict]:
-        sql = ("SELECT id, ts, agent, task_id, finding_id, claim, criterion, "
-               "protocol_path, status, verdict_note, evidence_id, attempts "
-               "FROM hypotheses")
+        sql = f"SELECT {self.HYP_COLS} FROM hypotheses"
         clauses, args = [], []
         if status:
             clauses.append("status=?")
@@ -848,7 +852,13 @@ class SharedMemory:
                 "finding_id": r[4], "claim": r[5],
                 "criterion": json.loads(r[6] or "{}"),
                 "protocol_path": r[7], "status": r[8], "verdict_note": r[9],
-                "evidence_id": r[10], "attempts": r[11]}
+                "evidence_id": r[10], "attempts": r[11],
+                "protocol_code": r[12] if len(r) > 12 else ""}
+
+    # canonical column list for get/list — _hypothesis_row reads positionally
+    HYP_COLS = ("id, ts, agent, task_id, finding_id, claim, criterion, "
+                "protocol_path, status, verdict_note, evidence_id, attempts, "
+                "protocol_code")
 
     def hypothesis_counts(self) -> dict[str, int]:
         with self._lock:
