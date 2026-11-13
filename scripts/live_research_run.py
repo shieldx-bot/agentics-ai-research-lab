@@ -1,25 +1,15 @@
-"""Live research run — the real RESEARCHER cycle over the configured browser backend.
+"""Live research run — the real RESEARCHER cycle over Hyperbrowser cloud browser.
 
 Runs the actual graph nodes (node_start -> node_research -> node_plan) with
-only GitHub/workspace edges stubbed: the LLM edge is fully live (the
-Perplexity cookie pool) and memory is a real SharedMemory.
-
-Backends (LIVE_BACKEND, default: hyperbrowser when HB_API_KEY is set,
-else the free local cookie WebSocket):
-    local        raw cookie WebSocket from THIS machine — free, no key,
-                 needs a residential IP (Perplexity 403-blocks datacenters)
-    hyperbrowser stealth cloud browser (residential proxy) — works from
-                 datacenter IPs, needs HB_API_KEY / HB_API_KEYS
+only GitHub/workspace edges stubbed: the LLM edge is fully live (Perplexity
+through a Hyperbrowser stealth session), memory is a real SharedMemory.
 
 Env:
-    HB_API_KEY   Hyperbrowser API key (enables the hyperbrowser backend)
-    LIVE_BACKEND backend override: "local" | "hyperbrowser" (optional)
+    HB_API_KEY   Hyperbrowser API key (required)
     LIVE_TOPIC   research topic override (optional)
-    LIVE_REPORT  report path override (default: data/live_run_report.json)
 
 Usage:
-    HB_API_KEY=... python scripts/live_research_run.py   # cloud backend
-    python scripts/live_research_run.py                  # local cookies
+    HB_API_KEY=... python scripts/live_research_run.py
 """
 from __future__ import annotations
 
@@ -35,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from agentics.agents.roles import Role  # noqa: E402
-from agentics.config import get_settings  # noqa: E402
+from agentics.config import Settings  # noqa: E402
 from agentics.graph import nodes  # noqa: E402
 from agentics.llm.session_host import BrowserSessionHost  # noqa: E402
 from agentics.memory.shared_memory import SharedMemory  # noqa: E402
@@ -56,17 +46,7 @@ def build_ctx(settings: Settings, host: BrowserSessionHost, mem: SharedMemory):
     """AgentContext-shaped namespace with GitHub/workspace edges stubbed."""
     from types import SimpleNamespace
 
-    def _report(node: str = "", status: str = "working", task_id: int | None = None,
-                task_title: str | None = None, intent: dict | None = None,
-                event: str = "", detail: str | dict = "", **_) -> None:
-        # same contract as AgentContext.report (agents/base.py): live state +
-        # optional journal entry, so the dashboard shows the run while it goes
-        mem.report("live-r01", Role.RESEARCHER.value, node=node, status=status,
-                   cycle=0, task_id=task_id, task_title=task_title, intent=intent)
-        if event:
-            mem.journal("live-r01", event, detail)
-
-    ctx = SimpleNamespace(
+    return SimpleNamespace(
         agent_id="live-r01",
         role=Role.RESEARCHER,
         settings=settings,
@@ -81,46 +61,22 @@ def build_ctx(settings: Settings, host: BrowserSessionHost, mem: SharedMemory):
         cycle=0,
         meta={"personal": FakePersonal()},
         heartbeat=lambda status="working": None,
+        report=lambda **k: None,   # node_start reports intent (P19+); display only
     )
-    ctx.report = _report
-    return ctx
 
 
 async def main() -> None:
-    # get_settings() (not bare Settings()) so configs/lab.yaml AND the
-    # gitignored configs/secrets.yaml apply — the same pipeline production
-    # uses. secrets.yaml is where hyperbrowser_api_key lives.
-    settings = get_settings()
-    hb_key = os.environ.get("HB_API_KEY", "") or settings.hyperbrowser_api_key
-    backend = os.environ.get("LIVE_BACKEND", "").lower() or (
-        "hyperbrowser" if hb_key else "local")
-    if backend not in ("local", "hyperbrowser"):
-        print(f"ERROR: unknown LIVE_BACKEND {backend!r} (local | hyperbrowser)")
-        sys.exit(2)
-    settings.browser_backend = backend
-    if backend == "hyperbrowser":
-        if not hb_key:
-            print("ERROR: LIVE_BACKEND=hyperbrowser needs HB_API_KEY "
-                  "(or LIVE_BACKEND=local for the free cookie WebSocket)")
-            sys.exit(2)
-        settings.hyperbrowser_api_key = hb_key
+    settings = Settings()
+    settings.browser_backend = "hyperbrowser"
+    settings.hyperbrowser_api_key = os.environ["HB_API_KEY"]
     settings.research_topic = os.environ.get("LIVE_TOPIC", DEFAULT_TOPIC)
     settings.ensure_dirs()
 
     scratch = Path(tempfile.mkdtemp(prefix="live-run-"))
-    # Hermetic run: data_dir is the single root — chroma_path, workspaces_dir
-    # and db_path are derived properties of it — so a repeat run on the same
-    # topic is not skipped by the P7 dedup gate via findings persisted by
-    # earlier runs (and the repo data/ stays clean).
-    settings.data_dir = scratch / "data"
-    settings.ensure_dirs()
     mem = SharedMemory(scratch / "memory.db")
-    # Pin to ONE pool identity (production does the same per agent thread):
-    # research and plan then reuse the SAME client/cloud session instead of
-    # churning sessions per node — the cap-sized single-token case needs it.
-    host = BrowserSessionHost.from_settings(settings).view(prefer_index=0)
+    host = BrowserSessionHost.from_settings(settings)
     ctx = build_ctx(settings, host, mem)
-    report = {"topic": settings.research_topic, "backend": backend}
+    report = {"topic": settings.research_topic, "backend": "hyperbrowser"}
 
     t0 = time.monotonic()
     state = {}
@@ -128,13 +84,10 @@ async def main() -> None:
     state = nodes.node_start(ctx, state)
     print(f"[{time.monotonic() - t0:6.1f}s] node_research (topic: {settings.research_topic[:70]}…)")
     state = await nodes.node_research(ctx, state)
-    # node_research may legitimately return WITHOUT papers (P7 dedup skip,
-    # budget-blocked run) — never assume a finding exists.
-    answer = (state.get("papers") or [{}])[0].get("answer", "")
+    answer = state.get("papers", [{}])[0].get("answer", "")
     report["research"] = {
         "done": state.get("done"), "error": state.get("error", ""),
         "citations": state.get("citations", []),
-        "answer": answer,
         "answer_chars": len(answer),
         "bibtex": state.get("bibtex", ""),
     }
@@ -173,18 +126,10 @@ async def main() -> None:
     print(f"[{time.monotonic() - t0:6.1f}s] memory: {len(findings)} finding(s) persisted")
 
     for client in list(host._clients.values()):
-        closer = getattr(client, "close", None)
-        if closer is None:
-            continue  # local PerplexityClient keeps no session to tear down
-        try:
-            await closer()
-        except Exception as exc:  # noqa: BLE001
-            print(f"client teardown warning: {exc}")
+        await client.close()
     mem.close()
 
-    out = Path(os.environ.get(
-        "LIVE_REPORT", str(REPO / "data" / "live_run_report.json")))
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = scratch / "live_run_report.json"
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"report saved: {out} | total wall time: {time.monotonic() - t0:.0f}s")
 

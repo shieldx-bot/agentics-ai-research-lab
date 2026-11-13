@@ -17,6 +17,7 @@ dependencies = [
     "GitPython>=3.1.43",
     "aiohttp>=3.10.0",
     "websockets>=13.0",
+    "hyperbrowser>=1.15.0",
     "PyYAML>=6.0.1",
     "python-dotenv>=1.0.1",
     "typer>=0.12.5",
