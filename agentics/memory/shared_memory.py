@@ -205,8 +205,11 @@ CREATE TABLE IF NOT EXISTS hypotheses (
     verdict_note TEXT DEFAULT '',           -- machine note (measured X vs criterion)
     evidence_id INTEGER,
     attempts INTEGER NOT NULL DEFAULT 0,
-    protocol_code TEXT NOT NULL DEFAULT ''  -- full protocol source, so replays
+    protocol_code TEXT NOT NULL DEFAULT '', -- full protocol source, so replays
                                             -- survive workspace pruning (P21/P23)
+    replication TEXT NOT NULL DEFAULT '',   -- P24: '' | confirmed | refuted |
+                                            -- inconclusive (first replica's verdict)
+    replication_attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
@@ -348,6 +351,11 @@ class SharedMemory:
                 "ALTER TABLE hypotheses ADD COLUMN protocol_code TEXT NOT NULL DEFAULT ''",
                 # v3 sync-trim: link each finding row to its vector document
                 "ALTER TABLE findings ADD COLUMN vector_doc_id TEXT NOT NULL DEFAULT ''",
+                # P24 replication: an INDEPENDENT agent re-runs the stored
+                # protocol in its own workspace; the first completed
+                # replication is recorded here (refuted closes the ledger).
+                "ALTER TABLE hypotheses ADD COLUMN replication TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE hypotheses ADD COLUMN replication_attempts INTEGER NOT NULL DEFAULT 0",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -961,12 +969,66 @@ class SharedMemory:
                 "criterion": json.loads(r[6] or "{}"),
                 "protocol_path": r[7], "status": r[8], "verdict_note": r[9],
                 "evidence_id": r[10], "attempts": r[11],
-                "protocol_code": r[12] if len(r) > 12 else ""}
+                "protocol_code": r[12] if len(r) > 12 else "",
+                "replication": r[13] if len(r) > 13 else "",
+                "replication_attempts": r[14] if len(r) > 14 else 0}
 
     # canonical column list for get/list — _hypothesis_row reads positionally
     HYP_COLS = ("id, ts, agent, task_id, finding_id, claim, criterion, "
                 "protocol_path, status, verdict_note, evidence_id, attempts, "
-                "protocol_code")
+                "protocol_code, replication, replication_attempts")
+
+    def hypotheses_needing_replication(self, agent: str, limit: int = 2) -> list[dict]:
+        """P24 — settled claims whose stored protocol an INDEPENDENT agent
+        should re-run in its own workspace (scientific replication, zero LLM).
+
+        Composes with the P23 replay engine, not a second verdict path: the
+        caller feeds the returned rows to `verify.replay.replay_hypothesis`
+        (same runner, same drift events), this selection adds what the
+        supervisor sweep does NOT have — per-agent INDEPENDENCE (the author
+        cannot replicate their own claim), oldest-first fairness (the
+        longest-unreplicated common ground goes first), and once-only
+        bookkeeping so ordinary agent cycles never burn cycles re-running
+        the same claim forever (the sweep re-checks newest-first for drift;
+        this path replicates each claim ONCE per swarm).
+
+        A row qualifies when: the claim is SETTLED 'supported' (refuted and
+        inconclusive claims are dead ends / fresh runs, nothing to confirm),
+        the protocol source is stored (P23), the requesting agent is NOT the
+        author, and the claim has not been replicated yet (or an earlier
+        replication came back inconclusive — a sandbox hiccup — with fewer
+        than 2 attempts, so a flaky environment never permanently blocks a
+        real verdict)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                "WHERE status='supported' AND protocol_code != '' AND agent != ? "
+                "AND (replication = '' OR (replication = 'inconclusive' "
+                "     AND replication_attempts < 2)) "
+                "ORDER BY id ASC LIMIT ?",
+                (agent, limit),
+            ).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
+
+    def record_replication(self, hyp_id: int, outcome: str) -> bool:
+        """Record the first completed replication's outcome on the claim.
+
+        Bookkeeping only — the actual verdict/drift handling belongs to the
+        P23 replay engine the caller used: a refuted replication is closed
+        by replay_hypothesis (re-settles the claim + journals
+        claim_falsified, so verified_knowledge self-corrects); this just
+        marks the claim as independently replicated so it is never re-picked
+        (verdict_note stays the ORIGINAL machine verdict; the replication
+        detail lives in the journal and the replay's own evidence row)."""
+        if outcome not in ("confirmed", "refuted", "inconclusive"):
+            raise ValueError(f"invalid replication outcome: {outcome!r}")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET replication=?, replication_attempts="
+                "replication_attempts+1 WHERE id=?",
+                (outcome, hyp_id),
+            )
+            return cur.rowcount > 0
 
     def hypothesis_counts(self) -> dict[str, int]:
         with self._lock:
