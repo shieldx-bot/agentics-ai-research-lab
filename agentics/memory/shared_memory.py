@@ -1050,7 +1050,8 @@ class SharedMemory:
         defense: dict | None = None,
     ) -> None:
         """Patch the panel row; only the engine mutates state transitions."""
-        sets, args: list = [], []
+        sets: list = []
+        args: list = []
         if state is not None:
             sets.append("state=?"); args.append(state)
         if round is not None:
