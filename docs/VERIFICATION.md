@@ -34,7 +34,7 @@ document describes how the pieces compose today.
 | --- | --- | --- | --- |
 | declared checks (MR flow) | `verify_ops.py` (`run_experiments`) | Coder/Writer: `verify_cmds` declared in `node_plan`, executed in `node_implement` before push | process exit code (`confirmed` / `refuted` / `inconclusive`) |
 | hypothesis contract (MR flow) | `agentics/verify/` (`hypothesis.py`, `experiment.py`: register_hypothesis → run_hypothesis → settle_hypothesis) | Coder/Writer: `hypotheses` declared in `node_plan` (claim + prediction + criterion + experiment code) | measurement vs criterion, re-adjudicated from the protocol's `AGENTICS_RESULT` output, 2-run reproducibility gate |
-| plan-hypothesis bridge (MR flow) | `agentics/verify/runner.py` (`ExperimentRunner`), wired in `node_implement` | same declared `hypotheses` — the runner materializes the protocol, runs `run_protocol`, and judges | marker path (`AGENTICS_RESULT`) or the RESULT-FILE fallback (`results/<id>.json` with `{"value": n}`); missing both is `inconclusive`, never guessed |
+| plan-hypothesis bridge (MR flow) | `graph/nodes.node_implement` composing the `agentics/verify/` glue (register → run → settle per hypothesis) | same declared `hypotheses` — the claim is pre-registered BEFORE the run, the protocol executes twice, and the settled verdict + protocol file join the MR record | marker path (`AGENTICS_RESULT`); missing / unparsable / non-reproducible output is `inconclusive`, never guessed through |
 | research claims (researcher flow) | `verify_metrics.py` (`Criterion`, `run_protocol`) + `graph/nodes.node_verify` | Researcher: after storing a finding, `node_verify` extracts up to 2 quantitative claims, pre-registers each with a criterion, writes one protocol per claim into `experiments/verify_h<id>.py` and runs it TWICE | measured metric vs pre-registered criterion + reproducibility check |
 | shared ledger | `SharedMemory.record_evidence` / `attach_protocol_outcome` / `add_hypothesis` / `update_hypothesis` | every layer above | — |
 | shared knowledge | `verified_knowledge()` → `_memory_context` → every system prompt; dashboard panel; `agentics evidence` / `agentics hypotheses` CLI | automatic | — |
@@ -91,13 +91,29 @@ hypothesis can never become `supported` on that evidence.
 ## 6. The reviewer runs code before it opines
 
 `node_review` spends zero LLM tokens on an MR that cannot survive its own
-measurements — two mechanical gates run BEFORE any model opinion:
+measurements — mechanical gates run BEFORE any model opinion:
 
 * **declared-checks re-run** — the reviewer re-executes up to 3 of the
-  author's recorded checks on the pushed branch in its own workspace and
-  records them as `method="reviewer_rerun"` evidence; a re-run that refutes
-  the author's check vetoes the approval outright ("evidence overrides model
-  opinion");
+  author's recorded `run_command` checks on the pushed branch in its own
+  workspace (`cmds_from_evidence` → `run_checks_on_branch`, throw-away
+  `review/tmp` branch, main always restored) and records them as
+  `method="reviewer_rerun"` evidence; a re-run that refutes the author's
+  check vetoes the approval outright ("evidence overrides model opinion");
+* **protocol reproduction (P17)** — an exit-code re-run cannot judge a
+  quantitative claim: a protocol always exits 0, the frozen criterion is
+  the verdict. For the author's CONFIRMED protocol rows the reviewer
+  re-runs the FULL two-run adjudication against the ledger's criterion
+  (`run_protocols_on_branch`): a script that still prints AGENTICS_RESULT
+  but misses the criterion is REFUTED here — invisible to any exit-code
+  re-run;
+* **the ledger follows the machine** — a refuted re-run (either path)
+  re-verdicts the author's ORIGINAL evidence row (`set_evidence_verdict`,
+  `verdict_by` trail), downgrades the hypothesis to `refuted` (so
+  `verified_knowledge` stops presenting a dead claim as common ground)
+  and journals `reviewer_rerun_refuted`. An inconclusive re-run (sandbox
+  hiccup) only annotates the MR comment — never a false refutation. On
+  the green path the MR comment carries the re-run digest, so the owner
+  sees WHICH checks were reproduced;
 * **tier-2 full-suite gate** (`verify_merge`) — the reviewer merges
   main+MR into a throw-away copy and runs the full pytest suite. This
   catches an MR that declared NO checks at all and mirrors the owner's
@@ -154,6 +170,10 @@ deserve a fresh run. Pinned by `tests/test_hypothesis_dedup.py`.
 (criterion adjudication + reproducibility), `tests/test_evidence_memory.py`
 (shared ledger), `tests/test_hypothesis_memory.py` (lifecycle + verified
 knowledge), `tests/test_node_verify.py` (researcher flow node-level),
-`tests/test_p16_bridge.py` (plan-declared hypotheses), `tests/test_experiment_runner.py` (runner verdict paths, tier-2 gate, streaming), plus the demo:
+`tests/test_p16_bridge.py` (plan-declared hypotheses),
+`tests/test_experiment_runner.py` (runner verdict paths, tier-2 gate,
+streaming), `tests/test_reviewer_rerun.py` + `tests/test_p17_protocol_rerun.py`
+(reviewer re-runs + protocol reproduction, incl. a real RepoWorkspace test
+proving the protocol is checked out of the MR branch), plus the demo:
 `python scripts/local_mode_demo.py` prints a `supported` and a `refuted`
 hypothesis from real protocol executions.

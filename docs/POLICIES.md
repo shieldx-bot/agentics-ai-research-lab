@@ -275,3 +275,44 @@ thật** trong bảng `evidence` của memory dùng chung:
 
 Test: `tests/test_verify_ops.py`, `tests/test_evidence_memory.py`,
 `tests/test_nodes_integration.py` (phần P16), `tests/test_dashboard_api.py`.
+
+---
+
+## P17 — Reviewer tái tạo bằng chứng: tự khai không phải là lời cuối
+
+**Vấn đề:** P16 cho reviewer ĐỌC bảng evidence của tác giả, nhưng toàn bộ
+bằng chứng vẫn là *tự khai* — một protocol buggy (hoặc một trạng thái
+workspace thiếu may mắn) có thể ghi "confirmed" và MR đi qua trên lời của
+chính tác giả.
+
+**Chính sách:** khi review, reviewer **chạy lại bằng chứng của tác giả
+trong workspace của chính mình** (một trust domain riêng), trên branch MR
+thật:
+
+1. **Exit-code re-run** — tối đa 3 lệnh `run_command` của tác giả được phục
+   hồi từ evidence feed (`cmds_from_evidence`, chỉ nhận dòng
+   `method="run_command"`) và chạy lại qua `run_checks_on_branch` (branch
+   tạm `review/tmp`, luôn trả lại main sạch).
+2. **Tái tạo protocol** — exit code không thể phán một claim định lượng
+   (protocol luôn exit 0, criterion mới là verdict). Với các dòng protocol
+   `confirmed` của tác giả, reviewer chạy lại TOÀN BỘ adjudication
+   2-lần-chạy với criterion đóng băng trong ledger
+   (`RepoWorkspace.run_protocols_on_branch`): script vẫn in
+   AGENTICS_RESULT nhưng metric không đạt → REFUTED — trường hợp
+   exit-code re-run không bao giờ bắt được.
+3. **Evidence overrides model opinion** — re-run bị refuted (bất kể đường
+   nào) hạ verdict approve → request_changes, **re-verdict dòng gốc** của
+   tác giả (`set_evidence_verdict` + `verdict_by`), hạ hypothesis trong
+   ledger xuống `refuted` (verified_knowledge ngưng coi claim chết là
+   kiến thức chung), journal `reviewer_rerun_refuted`.
+4. **Không block oan** — re-run inconclusive (timeout, guard, sandbox lệch
+   trạng thái) chỉ ghi chú vào comment MR, không bao giờ bị coi là refuted.
+
+Mọi re-run được ghi thành evidence `method="reviewer_rerun"` và digest
+re-run nằm trong comment MR — việc cross-check tự nó cũng là kiến thức
+chung (H3), owner thấy ngay MR nào đã được tái tạo kiểm chứng.
+
+Test: `tests/test_reviewer_rerun.py`, `tests/test_p17_protocol_rerun.py`
+(kể cả tái tạo thật trên RepoWorkspace: protocol chỉ tồn tại trên branch
+MR, main không có — sau re-run main phải sạch như cũ).
+Chi tiết: [VERIFICATION.md](VERIFICATION.md) mục 6.
