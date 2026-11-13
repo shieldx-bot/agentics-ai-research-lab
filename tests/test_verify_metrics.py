@@ -123,6 +123,18 @@ def test_run_protocol_non_reproducible_is_inconclusive(tmp_path):
     assert ev.verdict == "inconclusive" and "reproducible" in ev.output
 
 
+def test_run_protocol_syntax_error_run_is_inconclusive_not_refuted(tmp_path):
+    """Live-found honesty fix (Nov-2026 pre-prod eval): a run that dies before
+    printing the RESULT marker (e.g. SyntaxError, exit 1) measured nothing —
+    the per-run ledger must say inconclusive, never "refuted"."""
+    ws = _workspace(tmp_path)
+    script = _script(ws, "speedups = ]\n")                 # SyntaxError, exit 1
+    ev = run_protocol(ws, script, Criterion("precision", ">=", 0.9))
+    assert ev.verdict == "inconclusive"
+    assert ev.meta["runs"][0]["verdict"] == "inconclusive"
+    assert ev.meta["runs"][0]["exit_code"] == 1
+
+
 def test_run_protocol_without_marker_is_inconclusive(tmp_path):
     ws = _workspace(tmp_path)
     script = _script(ws, "print('done', 0.99)\n")

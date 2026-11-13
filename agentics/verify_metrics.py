@@ -226,6 +226,10 @@ def run_protocol(
                 runs, {}, output_parts, total_duration, criterion)
         parsed = parse_metrics(ev.output)
         if not parsed:
+            # the protocol never measured, so the raw exit code cannot refute
+            # the IDEA (a SyntaxError's exit 1 is a machine failure, not a
+            # refutation) — the per-run ledger must not say "refuted" here.
+            runs[-1]["verdict"] = "inconclusive"
             return _protocol_evidence(
                 script, last_exit, "inconclusive",
                 f"run {i + 1} printed no parsable {RESULT_MARKER} line",
