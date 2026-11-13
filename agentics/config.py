@@ -197,6 +197,20 @@ class Settings:
     # visible before failing an ask with a diagnostic error (challenge page,
     # logged-out wall, or a UI markup change).
     hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
+
+    # --- Adaptive planning & role prompts (LLM-authored) ---------------------
+    # Role missions are WRITTEN by the LLM (shared swarm-wide via the
+    # role_prompts table, reworked after repeated failures, conditioned on
+    # recent traces); plans are PROPOSED by the LLM (approach-first) on top
+    # of the minimal machine contract. False = the static pre-adaptive lab.
+    adaptive_prompts: bool = field(
+        default_factory=lambda: _env_bool("ADAPTIVE_PROMPTS", True))
+    role_prompt_ttl_hours: float = field(
+        default_factory=lambda: _env_float("ROLE_PROMPT_TTL_HOURS", 24.0))
+    role_prompt_max_chars: int = field(
+        default_factory=lambda: _env_int("ROLE_PROMPT_MAX_CHARS", 1600))
+    role_prompt_rework_failures: int = field(
+        default_factory=lambda: _env_int("ROLE_PROMPT_REWORK_FAILURES", 2))
     # Free keyless research tools (docs/FREE_TOOLS.md): arXiv / OpenAlex /
     # Crossref / HuggingFace datasets / Wikipedia / DuckDuckGo. They ground
     # research in real publisher metadata and keep node_research alive when

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agentics.agents.base import AgentContext
-from agentics.agents.roles import Role, build_system_prompt, parse_json_block
+from agentics.agents.roles import Role, parse_json_block
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS,
@@ -28,6 +28,12 @@ from agentics.evolution.traces import (
 )
 from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
+from agentics.planning import (
+    PLAN_INSTRUCTION,
+    bump_prompt_feedback,
+    normalize_plan,
+    resolve_system_prompt,
+)
 from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
@@ -104,9 +110,9 @@ async def _llm_ask(
             state["error"] = "no LLM account available"
         return "", []
     try:
+        system = await resolve_system_prompt(ctx, state)
         resp = await ctx.llm.ask(
-            prompt, mode=mode, purpose=purpose, system=build_system_prompt(
-                ctx.agent_id, ctx.role, ctx.settings.research_topic)
+            prompt, mode=mode, purpose=purpose, system=system
         )
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
@@ -639,25 +645,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
         f"{tools_txt}\n{evolution_rule}{rework_rule}{knowledge_rule}\n"
-        "Propose a concrete implementation plan for this repo. Reply ONLY with "
-        'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
-        '"steps": ["..."], "commit_message": "...", '
-        '"verify_cmds": ["<python -m pytest ... or python <workspace .py script> '
-        'that CHECKS the idea; exit 0 must mean the hypothesis holds>"], '
-        '"hypotheses": [{"hypothesis_id": "slug", "claim": "one testable claim", '
-        '"prediction": "what the measurement will show", '
-        '"metric": "snake_case_metric", "comparison": ">|>=|<|<=|==", '
-        '"threshold": 0.5, "code": "<FULL python source: computes the metric, '
-        'then prints EXACTLY one final line AGENTICS_RESULT: '
-        '{\\"<metric>\\": <number>} (standard library only, deterministic, '
-        'no network)>"}]} '
-        "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
-        "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
-        "is how your idea gets VERIFIED by running real code instead of an LLM's "
-        "opinion — declare at least one check for a code task. 'hypotheses' "
-        "(optional, max 2) makes the claim MEASURABLE: the criterion is "
-        "pre-registered, the protocol runs twice and the runner re-adjudicates "
-        "the measurement — a lying script cannot pass.)"
+        f"{PLAN_INSTRUCTION}"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
@@ -665,40 +653,43 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["error"] = state.get("error") or "plan parsing failed"
         state["done"] = True
         return state
-    state["plan"] = json.dumps(parsed, ensure_ascii=False)[:8000]
-    state["commit_message"] = parsed.get("commit_message", "update")
-    verify_cmds = [str(c) for c in (parsed.get("verify_cmds") or [])][:5]
-    state["verify_cmds"] = verify_cmds
-    hyp_raws = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:2]
-    state["hypotheses"] = hyp_raws
-    reuses = [n for n in parsed.get("reuses", []) if isinstance(n, str)][:10]
-    state["reuses"] = reuses
-    for name in reuses:
+    # The model proposed the plan (approach-first, extras of its own naming);
+    # normalize_plan extracts just the machine contract the lab consumes.
+    core = normalize_plan(parsed)
+    state["plan"] = json.dumps(core.parsed, ensure_ascii=False)[:8000]
+    state["commit_message"] = core.commit_message
+    state["verify_cmds"] = core.verify_cmds
+    state["hypotheses"] = core.hypotheses
+    state["reuses"] = core.reuses
+    state["expected_files"] = core.expected_files
+    state["plan_approach"] = core.approach
+    if core.extras:
+        state["plan_extras"] = json.dumps(core.extras, ensure_ascii=False)[:2000]
+    for name in core.reuses:
         ctx.memory.bump_tool_use(name)      # no-op if the name is not registered
-    expected_files = [f.get("path", "") for f in (parsed.get("files") or [])][:15]
-    expected_files = [f for f in expected_files if f]
-    state["expected_files"] = expected_files
     ctx.report(
         node="plan",
         intent={
             "goal": f"Implement task #{state.get('issue_number')}: {state.get('issue_title', '')}",
-            "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
-            "expected_files": expected_files,
-            "verify_cmds": verify_cmds,
-            "hypotheses": [str(h.get("claim", ""))[:120] for h in hyp_raws],
+            "approach": core.approach[:200],
+            "steps": core.steps[:8],
+            "expected_files": core.expected_files,
+            "verify_cmds": core.verify_cmds,
+            "hypotheses": [str(h.get("claim", ""))[:120] for h in core.hypotheses],
+            "extras": sorted(core.extras)[:6],
             "why": f"category={state.get('category', 'other')}",
         },
     )
     # P13 — lock the declared scope across the swarm: another agent already
     # planning the same files is stopped BEFORE burning LLM cycles on implement.
     locks = getattr(getattr(ctx, "local", None), "locks", None)
-    if locks is not None and expected_files:
+    if locks is not None and core.expected_files:
         ok, conflicts = await asyncio.to_thread(
-            locks.try_acquire_all, ctx.agent_id, expected_files)
+            locks.try_acquire_all, ctx.agent_id, core.expected_files)
         if not ok:
             ctx.memory.journal(ctx.agent_id, "lock_conflict", {
                 "task": state.get("issue_number"),
-                "files": expected_files,
+                "files": core.expected_files,
                 "held_by": conflicts,
             })
             return await _yield(
@@ -707,7 +698,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 f"{list(conflicts.items())[:3]} — pick another angle",
             )
         ctx.memory.journal(ctx.agent_id, "intent_bound", {
-            "task": state.get("issue_number"), "files": expected_files,
+            "task": state.get("issue_number"), "files": core.expected_files,
         })
     return state
 
@@ -1465,6 +1456,9 @@ def node_reflect(ctx: AgentContext, state: ResearchState) -> ResearchState:
                         issue_number, ctx.agent_id, exc)
     ctx.meta["personal"].add_lesson(lesson, issue_number)
     ctx.memory.add_decision(ctx.agent_id, f"cycle {ctx.cycle} done", lesson[:200])
+    # Adaptive prompts: feed the cycle outcome back into the LLM-authored
+    # mission (failures accumulate → the mission is reworked next cycle).
+    bump_prompt_feedback(ctx, state)
     ctx.memory.journal(ctx.agent_id, "cycle_done", {
         "cycle": ctx.cycle, "summary": lesson[:300],
         "outcome": _trace_outcome(state),

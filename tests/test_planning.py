@@ -260,3 +260,110 @@ def test_normalize_plan_backward_compatible_without_verify():
                                     "commit_message": "m"})
     assert core.verify_cmds == [] and core.hypotheses == []
     assert core.expected_files == [] and core.commit_message == "m"
+
+
+# ------------------------------------------------------------ graph wiring
+def _plan_ctx(mem, llm=None):
+    from types import SimpleNamespace
+
+    class _Personal:
+        def add_lesson(self, lesson, issue=None):
+            pass
+
+    return SimpleNamespace(
+        agent_id="a04", role=Role.CODER, memory=mem, llm=llm,
+        claims=None, cycle=1,
+        meta={"personal": _Personal()},
+        settings=SimpleNamespace(
+            research_topic="NFV", evolution_every_n_cycles=10,
+            adaptive_prompts=True, role_prompt_ttl_hours=24.0,
+            role_prompt_max_chars=1600, role_prompt_rework_failures=2,
+        ),
+        heartbeat=lambda status="working": None,
+        report=lambda **kw: _plan_ctx.reports.append(kw),
+        local=None,
+    )
+
+
+_plan_ctx.reports = []
+
+
+def test_node_plan_prompt_proposes_instead_of_template(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    seen = {}
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        seen["p"] = prompt
+        return json.dumps({
+            "approach": "Chunk first, then parse; regex rejected (backtracking).",
+            "files": [{"path": "experiments/p.py", "change": "new"}],
+            "steps": ["chunk", "parse"],
+            "commit_message": "feat: chunked parser",
+            "verify_cmds": ["python experiments/p.py"],
+            "risks": ["1GB inputs"],
+        }), []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    state = asyncio.run(nodes.node_plan(_plan_ctx(mem), {
+        "issue_number": 3, "issue_title": "Parser", "issue_body": "",
+        "papers": [{"answer": ""}], "category": "code",
+    }))
+    # the prompt ASKS for a self-proposed approach, not a fill-in template
+    assert "PROPOSE the plan yourself" in seen["p"]
+    assert '"approach" (required, first)' in seen["p"]
+    # model-authored proposal lands in the state for the owner to read
+    assert state["plan_approach"].startswith("Chunk first")
+    assert json.loads(state["plan_extras"]) == {"risks": ["1GB inputs"]}
+    # machine contract intact for the downstream machinery
+    assert state["expected_files"] == ["experiments/p.py"]
+    assert state["verify_cmds"] == ["python experiments/p.py"]
+    assert state["commit_message"] == "feat: chunked parser"
+    intent = _plan_ctx.reports[-1]["intent"]
+    assert intent["approach"].startswith("Chunk first")
+    assert intent["extras"] == ["risks"]
+
+
+def test_node_plan_backward_compatible_minimal_json(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        return json.dumps({"files": [], "steps": ["s1"],
+                           "commit_message": "m"}), []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    state = asyncio.run(nodes.node_plan(_plan_ctx(mem), {
+        "issue_number": 1, "issue_title": "T", "issue_body": "",
+        "papers": [{"answer": ""}], "category": "code",
+    }))
+    assert state["verify_cmds"] == [] and state["plan_approach"] == ""
+    assert "plan_extras" not in state
+
+
+def test_llm_ask_resolves_adaptive_system_prompt(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    llm = FakeLLM(answers=[GOOD_MISSION, "plan json"])
+    ctx = _plan_ctx(mem, llm=llm)
+    answer, _ = asyncio.run(nodes._llm_ask(
+        ctx, "do the plan", purpose="plan", state={"category": "code"}))
+    assert answer == "plan json"
+    # call 1: mission synthesis (static system), call 2: the plan itself with
+    # the SYNTHESIZED mission + code-owned guardrails as the system prompt
+    assert llm.calls[0]["purpose"] == "role_synthesis"
+    assert GOOD_MISSION in llm.calls[1]["system"]
+    assert GUARDRAILS in llm.calls[1]["system"]
+
+
+def test_reflect_feeds_cycle_outcome_into_the_mission(mem):
+    from agentics.graph import nodes
+
+    mem.store_role_prompt("coder", "code", GOOD_MISSION)
+    ctx = _plan_ctx(mem)
+    ctx.heartbeat = lambda status="working": None
+    ctx.claims = None
+    nodes.node_reflect(ctx, {"category": "code", "error": "tier-1 tests failed"})
+    assert mem.get_role_prompt("coder", "code")["failures"] == 1
+    nodes.node_reflect(ctx, {"category": "code", "summary": "ok"})
+    row = mem.get_role_prompt("coder", "code")
+    assert row["successes"] == 1 and row["failures"] == 0  # decayed
