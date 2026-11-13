@@ -3,9 +3,9 @@
 Covers the seam between the LLM's plan text and the exit-code verdicts:
 `normalize_verify_cmds` (plan text -> safe argv, active interpreter only)
 and the production flow node_implement uses (normalize -> run_experiments
--> record_evidence), proven against a real RepoWorkspace. Without the
-normalizer, run_experiments wraps the plan's string as "/bin/sh -c", the
-guard rejects it (exit 126) and EVERY check would sit at "inconclusive".
+-> record_evidence), proven against a real RepoWorkspace. verify_ops itself
+coerces raw strings via coerce_cmd (same interpreter, no shells), so even a
+raw plan string runs instead of rotting at eternal 'inconclusive'.
 """
 
 import sys
@@ -82,20 +82,25 @@ def test_plan_string_reaches_confirmed_through_the_production_flow(lab):
     assert row["verdict"] == "confirmed"
 
 
-def test_raw_plan_string_runs_without_a_shell_and_non_python_is_blocked(lab):
-    """Updated for the runner-level coercion contract (5f2105c): a plan-JSON
-    string like "python check_ok.py" is parsed to argv and really runs (no
-    shell involved), while a NON-python string is refused BEFORE any shell
-    exists (126 -> inconclusive) — a declared check either really runs or is
-    recorded as inconclusive with the reason, never faked as success."""
+def test_raw_plan_string_is_coerced_and_runs(lab):
+    """Contract evolution (5f2105c): verify_ops.coerce_cmd parses raw plan
+    strings into the allowlisted argv (active interpreter, no shells), so a
+    declared check can no longer rot at eternal 'inconclusive' — the string
+    runs and the verdict comes from the REAL exit code."""
     ws, mem = lab
     (ws.path / "check_ok.py").write_text("print(40 + 2)\n", encoding="utf-8")
     evs = run_experiments(ws, ["python check_ok.py"], timeout=240)
     assert evs[0].exit_code == 0 and evs[0].verdict == "confirmed"
-    assert evs[0].cmd.startswith(sys.executable)      # shell never involved
+    assert evs[0].cmd.startswith(sys.executable)   # coerced, not /bin/sh
 
-    evil = run_experiments(ws, ["rm -rf /"], timeout=240)
-    assert evil[0].exit_code == 126 and evil[0].verdict == "inconclusive"
+
+def test_non_python_string_command_is_rejected_without_running(lab):
+    """The allowlist still holds: anything that is not python/pytest is
+    refused (126 -> inconclusive) — never executed."""
+    ws, mem = lab
+    (ws.path / "check_ok.py").write_text("print(40 + 2)\n", encoding="utf-8")
+    evs = run_experiments(ws, ["rm -rf ."], timeout=240)
+    assert evs[0].exit_code == 126 and evs[0].verdict == "inconclusive"
 
 
 def test_refuted_check_is_recorded_for_everyone_to_see(lab):

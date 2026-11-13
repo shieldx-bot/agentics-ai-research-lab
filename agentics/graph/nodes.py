@@ -566,16 +566,18 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         'that CHECKS the idea; exit 0 must mean the hypothesis holds>"], '
         '"hypotheses": [{"hypothesis_id": "slug", "claim": "one testable claim", '
         '"prediction": "what the measurement will show", '
-        '"criterion": {"metric": "snake_case_name", "op": ">|>=|<|<=|==|between", '
-        '"target": 0.5}, "code": "<FULL python source; deterministic; prints '
-        'EXACTLY one final line: AGENTICS_RESULT: {\\"<metric>\\": <number>}"}]} '
+        '"metric": "snake_case_metric", "comparison": ">|>=|<|<=|==", '
+        '"threshold": 0.5, "code": "<FULL python source: computes the metric, '
+        'then prints EXACTLY one final line AGENTICS_RESULT: '
+        '{\\"<metric>\\": <number>} (standard library only, deterministic, '
+        'no network)>"}]} '
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
         "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
         "is how your idea gets VERIFIED by running real code instead of an LLM's "
         "opinion — declare at least one check for a code task. 'hypotheses' "
-        "(optional, max 2) makes the claim MEASURABLE: the protocol runs twice "
-        "and the runner re-judges the criterion from the AGENTICS_RESULT "
-        "measurement — a lying script cannot pass.)"
+        "(optional, max 2) makes the claim MEASURABLE: the criterion is "
+        "pre-registered, the protocol runs twice and the runner re-adjudicates "
+        "the measurement — a lying script cannot pass.)"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
@@ -835,13 +837,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 "cmds": [e.cmd[:120] for e in inconclusive][:5]})
 
     # P16 (hypothesis contract) — the richer experiment form: the plan may
-    # declare MEASURABLE hypotheses (claim + frozen criterion + protocol).
-    # Composes the verify package's register -> run -> settle glue: the
-    # protocol runs TWICE (reproducibility gate) and the criterion is
-    # re-adjudicated from the AGENTICS_RESULT measurement, so a lying script
-    # cannot pass. Every verdict lands in the same shared evidence table
-    # (H3) the reviewer, dashboard and CLI read, and the settled claim joins
-    # verified_knowledge() (supported claims become common ground).
+    # declare MEASURABLE hypotheses (metric + threshold + protocol code).
+    # The register -> run -> settle composition (agentics/verify.experiment)
+    # pre-registers the claim with a frozen criterion, runs the protocol
+    # through verify_metrics.run_protocol (2 runs, reproducibility gate), and
+    # the verdict is re-adjudicated from the MEASUREMENT — a lying script
+    # cannot claim success. Every verdict lands in the shared evidence table
+    # (H3) the reviewer, dashboard and CLI read.
     hyp_raws = state.get("hypotheses") or []
     if hyp_raws:
         from agentics.verify.experiment import (
@@ -851,36 +853,36 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
 
         hyp_task = state.get("issue_number")
         for raw in hyp_raws:
-            if isinstance(raw, dict):
-                raw.setdefault("task", hyp_task)   # settle/announce on this task
             hyp, reason = parse_hypothesis(raw)
             if hyp is None:                     # malformed proposal: never guessed through
                 ctx.memory.journal(ctx.agent_id, "p16_hypothesis_invalid",
                                    {"task": hyp_task, "reason": reason[:200]})
                 continue
+            # a plan-declared hypothesis belongs to THIS task — the proposal
+            # may omit the binding, the cycle supplies it (evidence rows must
+            # be findable per task by the reviewer / dashboard / CLI)
+            if hyp.task is None:
+                hyp.task = hyp_task
+            # pre-registration (broadcast) -> protocol run -> settlement with
+            # evidence_id; supported claims become verified_knowledge, refuted
+            # ones stop being repeated by the swarm.
             hyp_id = await asyncio.to_thread(
                 register_hypothesis, ctx.memory, ctx.agent_id, hyp)
             ev = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
-            ev_id = await asyncio.to_thread(
-                settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev)
-            # the protocol file was written into the workspace and rides the
-            # pushed branch (git add -A) — the MR record must list it too, or
-            # the reviewer sees a file in the diff the record does not explain
-            if getattr(ctx.workspace, "path", None) and \
-                    (ctx.workspace.path / hyp.script_path).exists():
-                state["changed_files"] = sorted(
-                    set(state.get("changed_files") or []) | {hyp.script_path})
+            await asyncio.to_thread(
+                settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
+                method="hypothesis_contract")
+            note = (ev.meta.get("note") or ev.output[:160]) if ev.meta else ev.output[:160]
             if ev.verdict == "refuted":
                 return await _yield(
                     ctx, state,
-                    f"P16 hypothesis '{hyp.hypothesis_id}' REFUTED by measurement "
-                    f"(evidence #{ev_id}): {ev.output[-200:]} — the idea did not "
-                    "hold; fix the code or re-plan",
+                    f"P16 hypothesis '{hyp.hypothesis_id}' REFUTED by measurement: "
+                    f"{note} — the idea did not hold; fix the code or re-plan",
                 )
             if ev.verdict == "inconclusive":
                 ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
                     "task": hyp_task, "hypothesis": hyp.hypothesis_id,
-                    "reason": ev.output[-200:]})
+                    "reason": note[:200]})
 
     try:
         pushed = await asyncio.to_thread(

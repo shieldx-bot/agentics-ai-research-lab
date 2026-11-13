@@ -128,6 +128,17 @@ def parse_hypothesis(raw: object) -> tuple[Hypothesis | None, str]:
 
     crit_raw = raw.get("criterion")
     if not isinstance(crit_raw, dict):
+        # Flat form (plan-JSON contract, kept for compatibility): the proposal
+        # carries metric/comparison/threshold at the top level — normalized to
+        # the structured criterion so there is exactly ONE adjudicator shape.
+        crit_raw = {
+            "metric": raw.get("metric"),
+            "op": raw.get("comparison"),
+            "target": raw.get("threshold"),
+        }
+        if raw.get("tolerance") is not None:
+            crit_raw["tolerance"] = raw.get("tolerance")
+    if not isinstance(crit_raw, dict):
         return None, "missing criterion object {metric, op, target}"
     try:
         criterion = Criterion.from_dict(crit_raw)
