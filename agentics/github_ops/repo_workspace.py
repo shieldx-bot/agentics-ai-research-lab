@@ -13,6 +13,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from agentics.config import Settings
@@ -342,3 +343,27 @@ class RepoWorkspace:
         finally:
             self.sync_main()
             self._git("branch", "-D", "verify/tmp", check=False)
+
+    def run_checks_on_branch(
+        self, branch: str, cmds: list[list[str]], timeout: int = 300,
+    ) -> list[tuple[list[str], int, str, float]]:
+        """Reviewer-side independent re-run (P16 / hypothesis 1): check out
+        origin/<branch> into a throw-away branch and run the author's declared
+        checks HERE, in this reviewer's workspace — a real reviewer runs the
+        paper's code instead of trusting the recorded output. Always restores
+        a clean main. Returns [(argv, exit_code, output, seconds)]."""
+        self.sync_main()
+        results: list[tuple[list[str], int, str, float]] = []
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "review/tmp", f"origin/{branch}")
+            for cmd in cmds:
+                started = time.monotonic()
+                code, out = self.run_command(cmd, timeout=timeout)
+                results.append((cmd, int(code), out, time.monotonic() - started))
+        except RuntimeError as exc:
+            results.append((cmds[0] if cmds else [], 128, str(exc), 0.0))
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "review/tmp", check=False)
+        return results

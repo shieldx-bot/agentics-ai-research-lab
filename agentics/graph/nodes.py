@@ -33,7 +33,9 @@ from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
 from agentics.research import papers as papers_mod
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
-from agentics.verify_ops import run_experiments, summarize
+from agentics.verify_ops import (
+    cmds_from_evidence, run_experiments, summarize, verdict_for,
+)
 
 log = logging.getLogger("graph.nodes")
 
@@ -44,6 +46,7 @@ STOP_YIELD = "yield"
 def _memory_context(ctx: AgentContext) -> dict:
     msgs = ctx.memory.recent_messages(limit=15)
     findings = ctx.memory.list_findings(limit=10)
+    evs = ctx.memory.latest_evidence(limit=6)
     return {
         "messages": "\n".join(
             f"- [{m['agent']}|{m['kind']}] {m['content'][:200]}" for m in msgs
@@ -1043,6 +1046,44 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # evidence), so the verdict weighs measurements, not just author claims.
     ev_rows = ctx.memory.evidence_for_task(candidate.get("task_id"))
 
+    # P16 / hypothesis 1: the reviewer RE-RUNS the author's declared checks in
+    # their OWN workspace against the MR branch — a real reviewer runs the
+    # paper's code instead of trusting the recorded output. Re-runs are
+    # recorded as evidence with method="reviewer_rerun" (hypothesis 3).
+    rerun_digest = rerun_note = ""
+    rerun_refuted = False
+    rerun_rows = cmds_from_evidence(ev_rows, max_cmds=3, exclude_agent=ctx.agent_id)
+    rerun_ws = getattr(ctx, "workspace", None)
+    if rerun_rows and candidate.get("branch") and hasattr(rerun_ws, "run_checks_on_branch"):
+        try:
+            reruns = await asyncio.to_thread(
+                rerun_ws.run_checks_on_branch, candidate["branch"],
+                [argv for _, argv, _ in rerun_rows], 300)
+            rerun_counts: dict[str, int] = {}
+            for (cmd_str, _argv, hypothesis), (argv, code, out, secs) in zip(rerun_rows, reruns):
+                ev_verdict = verdict_for(code)
+                rerun_counts[ev_verdict] = rerun_counts.get(ev_verdict, 0) + 1
+                rerun_refuted = rerun_refuted or ev_verdict == "refuted"
+                await asyncio.to_thread(
+                    ctx.memory.record_evidence, ctx.agent_id, candidate.get("task_id"),
+                    cmd_str, code, ev_verdict,
+                    hypothesis=hypothesis or candidate.get("title", ""),
+                    method="reviewer_rerun", output=out, duration_s=secs)
+            rerun_note = (f"[P16 reviewer re-ran {len(reruns)} check(s) on branch "
+                          f"{candidate['branch']}: {rerun_counts}]")
+        except Exception as exc:  # noqa: BLE001 — a re-run failure must never kill the review
+            rerun_note = f"[P16 reviewer re-run unavailable: {exc}]"
+            try:
+                await asyncio.to_thread(
+                    ctx.memory.record_evidence, ctx.agent_id,
+                    candidate.get("task_id"), "reviewer re-run", 128,
+                    "inconclusive",
+                    hypothesis=candidate.get("title", ""),
+                    method="reviewer_rerun", output=str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+    rerun_digest = rerun_note
+
     # P10 layers 3+4: protected paths never reach main via any MR — rejected
     # here, before the LLM is even asked.
     guard = getattr(getattr(ctx, "local", None), "guard", None)
@@ -1065,6 +1106,8 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ]
             ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
                        + "\n".join(ev_lines))
+            if rerun_note:
+                ev_desc += f"\n\nReviewer's own re-runs: {rerun_note}"
         prompt = (
             f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
             f"Files:\n{files_desc}\n\n"
@@ -1085,6 +1128,13 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
             for e in ev_rows:
                 counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
             comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
+
+    if rerun_refuted and verdict == "approve":
+        # Evidence overrides model opinion: an independent re-run that refutes
+        # the author's check can never be approved, whatever the LLM says.
+        verdict = "request_changes"
+        comment = (f"{rerun_digest} the author's check FAILED in the reviewer's "
+                   f"own workspace — evidence overrides model opinion. {comment}")
 
     if verdict == "approve":
         await asyncio.to_thread(
