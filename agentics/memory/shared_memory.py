@@ -1126,7 +1126,7 @@ class SharedMemory:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT h.id, h.claim, h.criterion, h.protocol_code, "
-                "h.protocol_path, h.agent AS author, h.evidence_id "
+                "h.protocol_path, h.agent AS author, h.evidence_id, h.task_id "
                 "FROM hypotheses h JOIN evidence e ON e.id = h.evidence_id "
                 "WHERE h.status='supported' AND e.verdict='confirmed' "
                 "AND COALESCE(h.protocol_code,'') != '' "
@@ -1138,7 +1138,7 @@ class SharedMemory:
         return [{"hypothesis_id": r[0], "claim": r[1],
                  "criterion": json.loads(r[2] or "{}"),
                  "protocol_code": r[3], "protocol_path": r[4],
-                 "author": r[5], "evidence_id": r[6]}
+                 "author": r[5], "evidence_id": r[6], "task_id": r[7]}
                 for r in rows]
 
     def record_replication(
