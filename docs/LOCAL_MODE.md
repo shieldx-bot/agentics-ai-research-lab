@@ -297,3 +297,20 @@ LLM itself, with code owning only the safety rails.
   (JSON of the model's own fields, shown to the owner) — instead of dropping
   them by a rigid schema. A plan without `verify_cmds`/`hypotheses` behaves
   exactly like the pre-adaptive plans (backward compatible).
+
+### Plan-conditioned downstream prompts (no fixed recipe left)
+
+- The per-file implement ask (`node_implement`, `_implement_brief`) is no
+  longer a minimal fixed template: it carries the planner's OWN proposal —
+  the declared `approach`, the P16 `verify_cmds` that will judge the code
+  and the pre-registered hypotheses — so the implementer writes code that
+  satisfies the checks it itself declared. Bounded (approach 700 chars,
+  5 cmds, 2 hypotheses); a minimal/legacy plan reproduces the old prompt
+  byte for byte. Zero extra LLM calls.
+- The research query (`node_research`) now carries the issue's own problem
+  statement (a bounded 400-char body excerpt) instead of only the title +
+  a fixed recipe. Dedup still keys on the title-based topic, so the P7
+  skip guard is untouched.
+- Both paths are covered offline in `tests/test_plan_conditioned_prompts.py`
+  (brief content, runaway caps, legacy-plan backward compat, body excerpt
+  bound).
