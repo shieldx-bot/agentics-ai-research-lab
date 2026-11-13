@@ -46,11 +46,18 @@ cùng một repo mà không giẫm chân nhau.
 - **Auto-merge mặc định tắt**. Chỉ owner bật `AUTO_MERGE=true` sau khi đã xác minh
   branch protection, CI bắt buộc, secret scanning và cross-review. PR không được
   tự approve; Integrator vẫn phải kiểm tra trạng thái CI và quyền merge.
+- Ở chế độ local với `AUTO_MERGE=false`: hàng đợi ghi nhận MR "ready" rồi dừng —
+  **owner là người bấm merge** qua `agentics mr list / approve / merge` (lệnh merge
+  vẫn chạy đủ P10 guard + tier-2 verification + mọi side-effect như Integrator).
 
 ## P5 — Cross-review bắt buộc
 - PR phải được **1 agent khác** (khác tác giả) review `APPROVE` mới vào hàng đợi merge.
 - Reviewer kiểm tra: đúng issue, ownership matrix, chất lượng, citation chuẩn
   (với phần nghiên cứu), không chèn secret.
+- MR bị `request_changes` không bị bỏ rơi: ở chu kỳ kế tiếp chính **tác giả**
+  rework ngay MR đó — tiếp tục từ head đã push của nhánh (không reset về main,
+  không mở MR thứ hai cho cùng task), push phần sửa rồi mở lại MR `open` cho
+  reviewer duyệt lại. Task giữ trạng thái `in_review` trong lúc rework.
 
 ## P6 — Heartbeat & ốm chết
 - Mỗi agent ghi heartbeat vào shared memory đầu mỗi chu kỳ.
@@ -75,10 +82,6 @@ cùng một repo mà không giẫm chân nhau.
 - Trước khi lập plan, agent đọc trace của agent khác và registry tool; tool mới chỉ vào
   registry khi PR được **merge**.
 
-## P10 — Kiểm tra hai tầng
-- Tầng 1 (tác giả, trước push): `py_compile` + `pytest -x`. Tầng 2 (Integrator, trước merge):
-  test đầy đủ trên `main + PR`; fail → không merge, ghi failure trace + comment vào PR.
-
 ## P11 — Self-evolution có rào chắn
 - PR `evolution` chỉ được sửa allowlist. Chi tiết và giới hạn: [EVOLUTION.md](EVOLUTION.md).
 
@@ -93,6 +96,10 @@ cùng một repo mà không giẫm chân nhau.
 - Claim issue: **label là khoá chính tắc**. Comment claim fail (network) không được rollback
   claim — rollback thất bại sẽ để lại label mồ côi khoá issue vĩnh viễn (đã gặp ở issue #19).
   Nhánh release/sweep của agent sở hữu sẽ dọn label sau.
+
+## P15 — Kiểm tra hai tầng
+- Tầng 1 (tác giả, trước push): `py_compile` + `pytest -x`. Tầng 2 (Integrator, trước merge):
+  test đầy đủ trên `main + PR`; fail → không merge, ghi failure trace + comment vào PR.
 
 ---
 
@@ -114,17 +121,12 @@ Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`) + **1 t�
    tạo/sửa một file protected (ValueError → cycle yield).
 2. **Diff trước push** — `node_implement` quét toàn bộ changed files; vi phạm
    → yield, không commit, không push.
-   2.5. **Pre-receive hook trong `data/lab.git`** — các tầng trên chỉ thấy
-   traffic đi qua code agentics; một `git push` thẳng vào bare repo bỏ qua tất
-   cả. Hook tự sinh từ danh sách `protected_paths` hiện hành
-   (`LocalRepo.install_pre_receive`) và git từ chối mọi push đưa protected
-   path vào origin ngay ở tầng git, kể cả nhánh/MR chưa từng tồn tại. Chỉ
-   hook mang sentinel
-   `# agentics pre-receive (managed)` mới được agentics cập nhật — hook của
-   owner không bao giờ bị ghi đè.
 3. **Cửa review + cửa merge** — Reviewer hạ mọi verdict "approve" thành
    "request_changes" nếu diff chạm protected paths; `LocalMergeQueue.drain`
    từ chối merge MR vi phạm kể cả khi đã được duyệt.
+4. **Tầng git — pre-receive hook trong `data/lab.git`** (chi tiết ở cuối mục
+   này): push thẳng vào bare repo, bỏ qua mọi tầng trong-process, vẫn bị git
+   từ chối.
 
 **Exception duy nhất thuộc về owner:**
 
@@ -134,3 +136,100 @@ Thực thi ở **3 tầng độc lập** (`agentics/policies/guard.py`) + **1 t�
 
 `accounts/` và `configs/secrets.yaml` (credentials) **không bao giờ** được
 miễn, kể cả với exception.
+
+**Tầng 4a — DETECT trên cây runtime** (`agentics/sandbox/integrity.py`): 3 tầng
+trên ngăn *changeset* của agent chạm vào engine, nhưng chưa có gì bảo vệ **cây
+runtime mà chính lab đang chạy từ đó** — một merge hỏng, một process lọt qua
+guard, hay owner sửa tay đều có thể thay đổi engine giữa chừng mà không ai hay.
+`IntegrityGuard` hash toàn bộ `agentics/`, `configs/`, `scripts/` và các file
+dependency lúc khởi động (`data/integrity/baseline.json`); Supervisor kiểm tra
+lại mỗi chu kỳ thứ 5; bất kỳ drift nào trở thành `integrity_alert` trên journal
++ alert trong memory — là cảnh báo, không phải dừng vòng lặp: owner quyết định.
+Owner kiểm tra bất kỳ lúc nào bằng `python -m agentics.cli verify` (chấp nhận
+thay đổi đã review: `--refresh`).
+
+**Tầng git — pre-receive hook** *(bổ trợ, không thay thế các tầng trên)*
+(`data/lab.git/hooks/pre-receive`, sinh tự động bởi `LocalRepo.ensure()` và
+`LocalRepo.ensure_guard()` — được cài lại mỗi lần khởi động lab, tự chữa lành
+khi bị xóa/sửa): mọi push đi qua hook này, kể cả push nằm ngoài graph (quy
+trình lỗi, thao tác tay). Quy tắc, đúng theo `origin_hook_script`:
+
+- **Owner là người quyết**: push mà commit cuối không có committer email
+  `agentics+*` đi qua không hạn chế (owner có thể đẩy bất cứ gì, kể cả code
+  lab).
+- **Agent không được đụng `main`** — work chỉ đi qua luồng MR; xóa `main` với
+  identity agent cũng bị từ chối.
+- **Commit của agent bị kiểm theo từng commit** (`git diff-tree` trên
+  `base..new`, chỉ xét commit có committer `agentics+*`) — một nhánh được
+  rebase trên các commit mới của owner không thể lẻn thay đổi qua lỗ hở.
+  Danh sách bị chặn là **đúng danh sách protected paths hiện hành** (mặc định
+  `agentics/ configs/ accounts/ scripts/ .github/` + credentials
+  `accounts/ configs/secrets.yaml` không bao giờ miễn), và hook được sinh từ
+  cùng nguồn với các tầng trong-process (`PROTECTED_PATHS` / lab.yaml) — mở
+  rộng danh sách một nơi là mở rộng ở mọi tầng, không lệch pha.
+- Merge hợp lệ của Integrator đi qua với env của Integrator.
+
+**Lưu ý thiết kế:** exemption theo task của owner (`allow-protected`) có hiệu
+lực ở các tầng trong-process; ở tầng git, commit agent chạm protected path
+vẫn bị chặn — phần work đó đến origin qua identity owner hoặc luồng merge
+của Integrator. Đây là lựa chọn cố ý: tầng git chỉ tin identity, không đọc
+DB exemption.
+
+---
+
+## P10 bổ sung — whitelist ring "cấm tuyệt đối" + lớp 4b tự phục hồi workspace
+*(đóng góp từ người đến sau trên chính nhánh này — bổ trợ tầng 4a, không thay thế)*
+
+**Vòng ngoài (whitelist):** ngoài danh sách protected, guard còn hỗ trợ
+`writable_roots` — khi được cấu hình (mặc định trong `configs/lab.yaml` là hợp
+các vùng ownership), MỌI file ngoài các gốc đó đều bị từ chối kể cả khi không
+phải machinery (file lạ ở gốc repo, thư mục dữ liệu bẩn...). Owner exemption
+theo task vẫn nâng được vòng này; `accounts/` và `configs/secrets.yaml` thì
+không bao giờ.
+
+**Tầng 4b — DETECT + tự phục hồi trên workspace của agent**
+(`agentics/policies/integrity.py`): tầng 4a bảo vệ cây runtime, nhưng agent
+*không chạy code trong cây runtime* — chúng chạy trong clone riêng dưới
+`data/workspaces/`, nơi script thí nghiệm được phép chạy Python qua
+`run_command` và có thể tính toán đường dẫn lúc runtime rồi ghi đè code lab
+trong clone của mình. `IntegrityWatcher` re-hash các cây protected trong MỖI
+workspace mỗi `INTEGRITY_INTERVAL_S` giây (mặc định 20, 0 = tắt); drift
+(sửa / xóa / file mới trong vùng cấm) được **hoàn tác từ git ngay lập tức**
+và ghi journal `integrity_drift` — dashboard báo đỏ. Hai watcher chia mặt
+phẳng: 4a = cây runtime (chỉ phát hiện, owner quyết định), 4b = workspace
+(phát hiện + tự lành, vì clone là tài sản tái tạo được từ main).
+
+`main` của bare repo không cần watcher nào: nó chỉ tiến qua merge queue đã qua
+đủ 3 tầng guard.
+
+---
+
+## P13 — File locks: hai agent không đè tay nhau
+
+**Vấn đề:** mỗi agent một workspace riêng, nên hai agent cùng khai báo sửa một
+file chỉ phát hiện nhau ở bước merge (conflict) hoặc tệ hơn — làm trùng việc.
+
+**Chính sách:** ở bước **plan**, danh sách file dự kiến được **khóa toàn cục**
+(SQLite, TTL = `FILE_LOCK_TTL_MINUTES`, mặc định 30 phút). Agent khác có plan
+chạm vào file đang bị giữ sẽ bị **yield ngay trước khi đốt chu kỳ implement**,
+kèm journal `lock_conflict` hiển thị trên dashboard. Khóa acquire kiểu
+all-or-nothing (không bao giờ giữ nửa plan). Agent chết → khóa tự hết hạn;
+supervisor quét dọn lock hết hạn mỗi chu kỳ scan; agent nhả khóa khi kết thúc
+chu kỳ (reflect).
+
+---
+
+## P14 — Intent binding: diff phải nằm trong phạm vi đã tuyên bố
+
+**Vấn đề:** dashboard hiển thị intent (goal/steps/expected_files) do agent
+công bố ở `report()` — nhưng nếu diff thật đi ra ngoài phạm vi tuyên bố thì
+intent chỉ là trưng bày.
+
+**Chính sách:** `node_implement` đối chiếu `changed_files` với
+`expected_files` đã khóa ở plan. File nào nằm ngoài phạm vi tuyên bố → yield
+toàn bộ chu kỳ, journal `scope_violation` (kèm cả danh sách khai báo lẫn
+file vượt phạm vi) — owner thấy ngay sự lệch giữa **lời khai** và **việc làm**.
+Plan rỗng file (task thu hồi tài liệu vào memory) không bị kiểm tra này.
+
+Đầy đủ kiến trúc Local Mode và đáp án 2 giả thuyết nghiên cứu:
+[LOCAL_MODE.md](LOCAL_MODE.md).

@@ -142,6 +142,9 @@ def test_merge_conflict_fails_gracefully_and_marks_mr_failed(lab):
     # owner silently advances main → the merge is no longer a fast-forward
     owner = _workspace(lab, "owner")
     owner.sync_main()
+    # the P10 origin hook binds to the committer email: a simulated owner must
+    # commit under an owner identity (real owner commits are not "agentics+")
+    owner._git("config", "user.email", "owner@local")
     owner.write_file("README.md", "owner edit\n")
     owner._git("add", "-A")
     owner._git("commit", "-m", "owner edit")
@@ -163,3 +166,81 @@ def test_merge_conflict_fails_gracefully_and_marks_mr_failed(lab):
         )
     assert merged == 0
     assert mem.get_review(mr_id)["status"] == "failed"
+
+
+def test_rework_resumes_pushed_branch_and_reopens_the_same_mr(lab):
+    """request_changes → author reworks the SAME branch/MR → re-review → merge.
+
+    The branch restarts from its pushed head, so the already-reviewed work
+    survives; the fix lands on top; no second MR is ever opened.
+    """
+    mem = lab.mem
+    task_id = mem.create_task("bench skeleton v2", category="code",
+                              body="Create experiments/bench.py.")
+    branch = branch_name("a05", task_id, "bench skeleton v2")
+
+    # ---- round 1: author pushes the first implementation, MR opens
+    author = _workspace(lab, "a05")
+    author.sync_main()
+    author.checkout_new_branch(branch)
+    author.write_file("experiments/bench.py", "def run():\n    return 1\n")
+    assert author.commit_and_push(branch, f"agent(a05): bench v1 (#{task_id})")
+    mr_id = mem.open_review(task_id, f"[a05] bench (#{task_id})", "b",
+                            author="a05", branch=branch,
+                            files=["experiments/bench.py"])
+    assert mem.get_task(task_id)["status"] == "in_review"
+
+    # ---- reviewer requests changes
+    mem.set_review_verdict(mr_id, "changes_requested", "a07", "run() must return 42")
+
+    # ---- round 2 (rework): resume the pushed branch, fix, push again
+    author.sync_main()
+    author.checkout_branch_from_origin(branch)
+    author.write_file("experiments/bench.py", "def run():\n    return 42\n")
+    assert author.commit_and_push(branch, f"agent(a05): bench rework (#{task_id})")
+    files = sorted(set(mem.get_review(mr_id)["files"])
+                   | set(author.diff_files_vs_main()))
+    assert mem.reopen_review(mr_id, files=files, verification="tier-1 passed")
+    reopened = mem.get_review(mr_id)
+    assert reopened["status"] == "open" and reopened["reviewer"] == ""
+    assert "experiments/bench.py" in reopened["files"]
+    # still exactly one MR for the task
+    assert [r["id"] for r in mem.reviews_by_task(task_id)] == [mr_id]
+
+    # ---- branch history keeps BOTH commits (reviewed work not reset away)
+    log = subprocess.run(
+        ["git", "-C", str(lab.repo.path), "log", "--oneline", branch],
+        capture_output=True, text=True).stdout
+    assert "bench v1" in log and "bench rework" in log
+
+    # ---- reviewer approves the rework, integrator merges
+    mem.set_review_verdict(mr_id, "approved", "a07", "lgtm now")
+    mem.mq_enqueue(mr_id, author="a05")
+    integrator = _workspace(lab, "a09")
+    ok, note = integrator.verify_merge(branch)
+    assert ok, note
+    queue = LocalMergeQueue(mem, auto_merge=True, guard=lab.guard)
+    assert queue.drain(
+        "a09",
+        verify=lambda mr: integrator.verify_merge(mem.get_review(mr)["branch"]),
+        merge=lambda mr: integrator.merge_branch_to_main(
+            mem.get_review(mr)["branch"], f"merge MR #{mr} — task #{task_id}"),
+    ) == 1
+    assert mem.get_review(mr_id)["status"] == "merged"
+    assert mem.get_task(task_id)["status"] == "merged"
+    # the fix AND the original work are both on main
+    content = subprocess.run(
+        ["git", "-C", str(lab.repo.path), "show", "main:experiments/bench.py"],
+        capture_output=True, text=True).stdout
+    assert "return 42" in content
+
+
+def test_reopen_review_refuses_wrong_status_mr(lab):
+    """Only a changes_requested MR can be reopened (approved/merged stay closed)."""
+    mem = lab.mem
+    tid = mem.create_task("some work")
+    mr = mem.open_review(tid, "MR", "b", author="a04", branch="b1", files=[])
+    # an approved MR must not be sneakily reopened
+    mem.set_review_verdict(mr, "approved", "a07", "lgtm")
+    assert mem.reopen_review(mr, files=[]) is False
+    assert mem.get_review(mr)["status"] == "approved"

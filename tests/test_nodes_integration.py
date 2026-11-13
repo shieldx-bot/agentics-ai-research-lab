@@ -304,8 +304,9 @@ class FakeWorkspace:
         key = "pytest" if "pytest" in cmd else "compile"
         return self.results.get(key, (0, "ok"))
 
-    def commit_and_push(self, branch, msg):
+    def commit_and_push(self, branch, msg, allow_protected=False):
         self.pushed.append(branch)
+        self.allow_protected = allow_protected
         return True
 
 
@@ -384,13 +385,18 @@ def test_implement_yields_on_protected_write_even_mid_plan(mem, tmp_path, monkey
 
 
 def test_exempted_evolution_task_may_touch_allowed_agent_files(mem, tmp_path):
-    """Owner exception: task flagged exempt + evolution allowlist → passes."""
+    """Owner exception: task flagged exempt + evolution allowlist → passes.
+
+    The exemption must travel to the push as well: commit_and_push receives
+    allow_protected=True so the P10 origin hook (layer 4) lets the branch
+    through — an owner-exempted task stays viable end-to-end."""
     tid = _task(mem, "self-evolution: refine prompts", category="evolution")
     mem.set_task_exempt(tid, True, agent="owner")
     ws = FakeWorkspace(tmp_path, ["agentics/agents/roles.py", "tests/test_roles.py"])
     state = asyncio.run(nodes.node_implement(
         _impl_ctx(mem, ws), _impl_state("evolution", issue_number=tid)))
     assert ws.pushed and not state.get("yield_reason")
+    assert ws.allow_protected is True
 
 
 def test_non_exempt_evolution_task_cannot_touch_agent_files(mem, tmp_path):
@@ -548,3 +554,24 @@ def test_integrator_refuses_merge_of_protected_diff(mem):
     nodes.node_integrate(ctx, {})
     assert mem.get_review(mr_id)["status"] == "failed"
     assert mem.get_task(1)["status"] == "failed"
+
+
+def test_implement_survives_a_hallucinated_edit_path(mem, tmp_path, monkeypatch):
+    """read_file returns None when the plan says 'edit' but the file does not
+    exist in the workspace — the node must treat it as a new file instead of
+    crashing with TypeError on current[:6000] (found while integrating)."""
+    _llm_json(monkeypatch, payload_by_purpose={"implement": "x = 1\n"})
+
+    class NoFileWorkspace(FakeWorkspace):
+        def read_file(self, p):
+            return None               # the path was hallucinated by the plan
+
+    ws = NoFileWorkspace(tmp_path, ["experiments/hallucinated.py"])
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws),
+        {**_impl_state(), "plan": json.dumps(
+            {"files": [{"path": "experiments/hallucinated.py", "change": "edit"}],
+             "commit_message": "new experiment"})},
+    ))
+    assert state.get("error") is None, state
+    assert ws.pushed and state["action"] == "open_pr"

@@ -78,9 +78,10 @@ class _FakeIssue:
 
 
 class _FakeRepo:
-    def __init__(self, issues):
+    def __init__(self, issues, repo_id=701):
         self._issues = issues
         self.get_issues_calls = 0
+        self.id = repo_id          # stable identity -> the scan cache applies
 
     def get_issues(self, **kw):
         self.get_issues_calls += 1
@@ -88,6 +89,8 @@ class _FakeRepo:
 
 
 def test_scan_open_issues_cached_across_calls():
+    """Adapted to the stable-identity cache key (c90ded0): only objects with
+    a REAL ``repo.id`` are cached, so the fake carries one explicitly."""
     repo = _FakeRepo([_FakeIssue(1, "Fix a", labels=())])
     first = issue_ops.scan_open_issues(repo)
     second = issue_ops.scan_open_issues(repo)
@@ -96,8 +99,8 @@ def test_scan_open_issues_cached_across_calls():
 
 
 def test_scan_cache_distinguishes_repos_and_limits():
-    repo_a = _FakeRepo([_FakeIssue(1, "A")])
-    repo_b = _FakeRepo([_FakeIssue(2, "B")])
+    repo_a = _FakeRepo([_FakeIssue(1, "A")], repo_id=701)
+    repo_b = _FakeRepo([_FakeIssue(2, "B")], repo_id=702)
     assert issue_ops.scan_open_issues(repo_a)[0].number == 1
     assert issue_ops.scan_open_issues(repo_b)[0].number == 2
     assert repo_a.get_issues_calls == 1 and repo_b.get_issues_calls == 1

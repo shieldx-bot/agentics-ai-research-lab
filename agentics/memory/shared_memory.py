@@ -159,7 +159,36 @@ CREATE TABLE IF NOT EXISTS skills (
     uses INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_skills_cluster ON skills(cluster_id, status);
+CREATE TABLE IF NOT EXISTS file_locks (
+    path TEXT PRIMARY KEY,                  -- normalized relative path
+    agent TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    task_id INTEGER,
+    hypothesis TEXT NOT NULL DEFAULT '',
+    method TEXT NOT NULL DEFAULT 'run_command',
+    cmd TEXT NOT NULL,
+    exit_code INTEGER NOT NULL,
+    verdict TEXT NOT NULL,                  -- confirmed | refuted | inconclusive
+    output TEXT NOT NULL DEFAULT '',
+    duration_s REAL NOT NULL DEFAULT 0,
+    artifact TEXT NOT NULL DEFAULT '',      -- workspace path of the check script
+    note TEXT NOT NULL DEFAULT '',          -- reviewer re-verdict / context
+    verdict_by TEXT NOT NULL DEFAULT ''     -- who set/confirmed the verdict
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id, id);
 """
+
+
+# Journal growth cap: the append-only activity feed is trimmed to the newest
+# rows every N inserts (never on each write — trimming is a rare bulk DELETE).
+_JOURNAL_TRIM_EVERY = 500
+_JOURNAL_KEEP_ROWS = 5000
 
 
 @dataclass
@@ -181,6 +210,7 @@ class SharedMemory:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        self._journal_inserts = 0      # drives the periodic journal trim
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
             for column in (
@@ -239,6 +269,104 @@ class SharedMemory:
              "title": r[4], "content": r[5], "citations": json.loads(r[6])}
             for r in reversed(rows)
         ]
+
+    # ------------------------------------------------------------ evidence (P16)
+    def record_evidence(
+        self, agent: str, task_id: int | None, cmd: str, exit_code: int,
+        verdict: str, hypothesis: str = "", method: str = "run_command",
+        output: str = "", duration_s: float = 0.0, artifact: str = "",
+        broadcast: bool = True,
+    ) -> int:
+        """Store one empirical verification result — a REAL run's outcome.
+
+        This is the shared, structured answer to "did anyone actually check
+        this idea, and what happened?" Every record is broadcast to all agents
+        (messages + journal) so verdicts are common knowledge, not private
+        model opinion."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO evidence (ts, agent, task_id, hypothesis, method, "
+                "cmd, exit_code, verdict, output, duration_s, artifact) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), agent, task_id, hypothesis[:300], method,
+                 cmd[:400], int(exit_code), verdict, output[-1500:],
+                 float(duration_s), artifact[:300]),
+            )
+            ev_id = int(cur.lastrowid or 0)
+        if broadcast:
+            self.post_message(
+                agent, "evidence",
+                f"[{verdict.upper()}] task #{task_id}: `{cmd[:120]}` "
+                f"(exit {exit_code}) — {hypothesis[:120]}",
+                issue=task_id,
+            )
+            self.journal(agent, "evidence", {
+                "id": ev_id, "task": task_id, "cmd": cmd[:160],
+                "exit": int(exit_code), "verdict": verdict,
+            })
+        return ev_id
+
+    def set_evidence_verdict(self, ev_id: int, verdict: str,
+                             note: str = "", by: str = "") -> bool:
+        """Re-verdict an evidence row (e.g. a Reviewer cross-checks the run
+        or an owner rejects a green check). Appends to the note trail."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE evidence SET verdict=?, note=?, verdict_by=? WHERE id=?",
+                (verdict, note[:600], by[:64], ev_id),
+            )
+            return cur.rowcount > 0
+
+    def _evidence_row(self, r) -> dict:
+        return {"id": r[0], "ts": r[1], "agent": r[2], "task_id": r[3],
+                "hypothesis": r[4], "method": r[5], "cmd": r[6],
+                "exit_code": r[7], "verdict": r[8], "output": r[9],
+                "duration_s": r[10], "artifact": r[11], "note": r[12],
+                "verdict_by": r[13]}
+
+    _EVIDENCE_COLS = ("id, ts, agent, task_id, hypothesis, method, cmd, "
+                      "exit_code, verdict, output, duration_s, artifact, "
+                      "note, verdict_by")
+
+    def evidence_for_task(self, task_id: int | None) -> list[dict]:
+        """All evidence recorded for one task, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
+                "WHERE task_id IS ? ORDER BY id", (task_id,)
+            ).fetchall()
+        return [self._evidence_row(r) for r in rows]
+
+    def latest_evidence(self, limit: int = 30) -> list[dict]:
+        """Newest evidence across every agent — the shared verdict feed
+        (newest first: the dashboard and agents care about the latest)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
+                "ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._evidence_row(r) for r in rows]
+
+    def evidence_search(self, term: str, limit: int = 30) -> list[dict]:
+        """Cross-agent lookup: prior verdicts mentioning a term (hypothesis,
+        command, output, artifact) — an agent can reuse what others verified."""
+        like = f"%{term[:120]}%"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._EVIDENCE_COLS} FROM evidence "
+                "WHERE hypothesis LIKE ? OR cmd LIKE ? OR output LIKE ? "
+                "OR artifact LIKE ? ORDER BY id DESC LIMIT ?",
+                (like, like, like, like, limit),
+            ).fetchall()
+        return [self._evidence_row(r) for r in rows]
+
+    def evidence_counts(self) -> dict[str, int]:
+        """Verdict histogram — the dashboard's 'is this lab self-checking?' dial."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT verdict, COUNT(*) FROM evidence GROUP BY verdict"
+            ).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     # ------------------------------------------------------------ decisions
     def add_decision(self, agent: str, decision: str, reason: str = "") -> None:
@@ -401,6 +529,16 @@ class SharedMemory:
                 "INSERT INTO journal (ts, agent, event, detail) VALUES (?,?,?,?)",
                 (time.time(), agent, event, str(detail)[:2000]),
             )
+            # The lab runs forever; the journal is an append-only feed the
+            # dashboard reads through a small window. Keep the table bounded
+            # (checked every _JOURNAL_TRIM_EVERY inserts, not on each write).
+            self._journal_inserts += 1
+            if self._journal_inserts % _JOURNAL_TRIM_EVERY == 0:
+                self._conn.execute(
+                    "DELETE FROM journal WHERE id NOT IN "
+                    "(SELECT id FROM journal ORDER BY id DESC LIMIT ?)",
+                    (_JOURNAL_KEEP_ROWS,),
+                )
 
     def recent_journal(self, limit: int = 50, agent: str | None = None) -> list[dict]:
         sql = "SELECT id, ts, agent, event, detail FROM journal"
@@ -595,6 +733,49 @@ class SharedMemory:
             args = [reviewer, comment[:3000], status, mr_id]
         with self._lock, self._conn:
             self._conn.execute(sql, args)
+
+    def reviews_by_author(self, author: str, status: str | None = None) -> list[dict]:
+        """MRs written by one agent, oldest first (the rework queue)."""
+        sql, args = "SELECT id FROM reviews WHERE author=?", [author]
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [self._review_row(r[0]) for r in rows]
+
+    def reviews_by_task(self, task_id: int) -> list[dict]:
+        """Every MR raised against a task, oldest first (orphan detection)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM reviews WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
+        return [self._review_row(r[0]) for r in rows]
+
+    def reopen_review(self, mr_id: int, files: list[str], verification: str = "") -> bool:
+        """Rework: an author pushes fixes and puts their MR back into review.
+
+        Only a changes_requested MR authored by ``agent`` is reopened; reviewer
+        fields are cleared so the (possibly different) reviewer starts fresh.
+        The task goes back to in_review if it was parked elsewhere.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT author, status, task_id FROM reviews WHERE id=?", (mr_id,)
+            ).fetchone()
+            if row is None or row[1] != "changes_requested":
+                return False
+            author, _, task_id = row
+            self._conn.execute(
+                "UPDATE reviews SET status='open', files=?, verification=?, "
+                "reviewer='', verdict_comment='', approved_by='' WHERE id=?",
+                (json.dumps(files), verification[:500], mr_id),
+            )
+        if task_id is not None:
+            self.set_task_status(task_id, "in_review")
+        self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
+        return True
 
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(
@@ -906,6 +1087,69 @@ class SharedMemory:
                 "UPDATE merge_queue SET status=?, attempts = attempts + ? WHERE pr_number=?",
                 (status, 1 if bump_attempt else 0, pr_number),
             )
+
+    # ------------------------------------------------------------ file locks (P13)
+    def acquire_file_lock(self, path: str, agent: str, ttl_s: float) -> bool:
+        """Atomic per-file lock: a live lock held by another agent wins."""
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT agent, expires_at FROM file_locks WHERE path=?", (path,)
+            ).fetchone()
+            if row:
+                holder, expires_at = row
+                if expires_at > now and holder != agent:
+                    return False
+                self._conn.execute(
+                    "UPDATE file_locks SET agent=?, acquired_at=?, expires_at=? "
+                    "WHERE path=?", (agent, now, now + ttl_s, path),
+                )
+                return True
+            try:
+                self._conn.execute(
+                    "INSERT INTO file_locks (path, agent, acquired_at, expires_at) "
+                    "VALUES (?,?,?,?)", (path, agent, now, now + ttl_s),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def release_file_lock(self, path: str, agent: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM file_locks WHERE path=? AND agent=?", (path, agent),
+            )
+            return cur.rowcount == 1
+
+    def release_agent_locks(self, agent: str) -> list[str]:
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT path FROM file_locks WHERE agent=?", (agent,)
+            ).fetchall()
+            self._conn.execute("DELETE FROM file_locks WHERE agent=?", (agent,))
+        return [r[0] for r in rows]
+
+    def active_file_locks(self) -> list[dict]:
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT path, agent, acquired_at, expires_at FROM file_locks "
+                "WHERE expires_at > ? ORDER BY path", (now,),
+            ).fetchall()
+        return [{"path": r[0], "agent": r[1], "acquired_at": r[2],
+                 "expires_at": r[3]} for r in rows]
+
+    def sweep_file_locks(self) -> list[str]:
+        """Drop expired locks (dead agents must not freeze files forever)."""
+        now = time.time()
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT path FROM file_locks WHERE expires_at <= ?", (now,)
+            ).fetchall()
+            if rows:
+                self._conn.execute(
+                    "DELETE FROM file_locks WHERE expires_at <= ?", (now,))
+        return [r[0] for r in rows]
 
     def close(self) -> None:
         with self._lock:

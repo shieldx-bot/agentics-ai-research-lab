@@ -1,138 +1,232 @@
-# LOCAL MODE — lab chạy hoàn toàn trên một máy, không GitHub
+# LOCAL_MODE — the lab runs entirely on one machine (no GitHub)
 
-> Trạng thái: nhánh `update_interactive_local`. Nhánh này hội tụ **một** dựng
-> chế độ local duy nhất (cd8b536) — các proposal song song cũ đã được rà soát
-> và chỉ phần nào bổ trợ thật sự mới được port vào (xem §7).
+> Answers the owner's two hypotheses:
+>
+> **H1 — Can agents work directly in local without corrupting the agent code
+> itself?** Yes — enforced by the P10 protected-paths guard (3 layers) plus
+> the integrity DETECT layer (layer 4).
+>
+> **H2 — Can the owner see what the agents are doing, and why (no blackbox)?**
+> Yes — every agent publishes its intent at every step; the journal, the
+> `status` command and the live web dashboard make it owner-visible.
 
-## 1. Nó thay thế GitHub bằng gì?
+This document describes the local-only execution mode introduced on this
+branch. It supersedes the previous GitHub-coupled workflow: the research cycle
+performs **zero network calls** apart from the LLM provider traffic itself.
 
-| Khái niệm GitHub | Thay thế local |
-| --- | --- |
-| remote repository | bare repo tại `data/lab.git` (`LocalRepo`) |
-| issues | bảng `tasks` trong shared memory (SQLite) |
-| claim labels (P1) | bảng `claims` — nguồn sự thật duy nhất (`LocalClaimPolicy`) |
-| pull requests | bảng `reviews` ("MR") |
-| PR review / approval | verdict do Reviewer ghi vào `reviews` (P5: không tự duyệt MR của mình) |
-| merge + push lên main | hàng đợi merge tuần tự (`LocalMergeQueue`, P4) merge `--no-ff` vào bare repo |
+---
 
-Không dòng code nào trong vòng nghiên cứu thực hiện call mạng (trừ traffic
-LLM/provider). Package `github_ops/` giữ nguyên trên đĩa như mã ngủ đông —
-vẫn có unit test, không còn được import bởi vòng lặp.
+## 1. Architecture
 
-## 2. Hai câu hỏi của owner, hai cơ chế trả lời
+Every GitHub touchpoint of the research cycle has a local replacement:
 
-**Q1 — "Agent làm việc local mà có sửa nhầm code agent không?"** → **P10
-protected paths** (`agentics/policies/guard.py`), chặn 4 lớp:
+| GitHub concept         | local replacement                                              |
+| ---------------------- | -------------------------------------------------------------- |
+| remote repository      | a bare git repo at `data/lab.git` ("origin"), seeded once from the running checkout |
+| issues                 | the `tasks` table in shared memory (`data/shared_memory.db`)    |
+| claim labels (P1)      | the `claims` table only (single-layer; one process, one lock)   |
+| pull requests          | the `reviews` table ("MR" — merge request)                      |
+| PR reviews / approvals | verdicts written by Reviewer agents to `reviews`                |
+| merge + push to main   | a local `--no-ff` merge pushed as fast-forward to `data/lab.git` (P4) |
+| GitHub Actions CI      | tier-1 (compile + fast tests, author) and tier-2 (full suite on main+MR, Integrator) run in the agent workspaces |
 
-1. `RepoWorkspace.write_file` — plan không thể tạo/sửa file protected
-2. diff chạm protected path → bị đánh dấu, không mở MR được
-3. **pre-receive hook** trong `data/lab.git` (lớp 2.5, thêm ở §7-B) — kể cả
-   `git push` thẳng vào origin, bỏ qua mọi tầng app, vẫn bị git từ chối
-4. `LocalMergeQueue.drain` + `node_review` — MR chạm protected path không
-   bao giờ được duyệt/merge
+The `agentics/github_ops` package stays on disk as **dormant legacy code**
+(still covered by its own unit tests) but is no longer imported by the
+research cycle. `configs/lab.yaml` now also seeds the local backlog with
+starter tasks, and the Supervisor tops the backlog up from a rotation of
+survey angles when it runs dry (`agentics/local_ops.py`).
 
-Ngoại lệ **chỉ** owner cấp: `python -m agentics.cli allow-protected <task_id>`
-(theo task) hoặc `ALLOW_PROTECTED_PATHS=1` (theo phiên chạy). `accounts/` và
-`configs/secrets.yaml` không bao giờ được miễn, kể cả khi có exemption.
+### One research cycle, end to end
 
-**Q2 — "Owner làm gì biết các agent đang làm gì, vì sao?"** → agent công bố
-**intent** (goal / why / steps / expected files) vào heartbeat tại mỗi bước
-(claim, plan, review, open_mr…), kèm bảng `journal` ghi mọi quyết định. Ba
-cách xem, cùng một nguồn sự thật:
-
-- Web: `python -m agentics.cli dashboard` → `http://127.0.0.1:8080`
-  (agent card có mục đích hiện tại, task board, MR pipeline, merge queue,
-  memory stats, activity feed — làm mới 2.5s, hoạt động offline)
-- Terminal: `python -m agentics.cli journal -f` (stream trực tiếp, thêm ở §7-C),
-  hoặc `agentics journal -a a02 -n 5` để xem một agent
-- `agentics status` — trạng thái nhanh (node + intent + task đang giữ)
-
-## 3. Backlog tự nuôi (Supervisor)
-
-`TaskSource.supervisor_top_up()` sinh task khi backlog cạn, theo thứ tự ưu
-tiên:
-
-1. **Điều tra failure** — trace thất bại mới nhất chưa có task nào nhận →
-   task `bugfix` "Investigate failure …" (vòng GEA ăn chính lịch sử sự cố
-   của đàn; failure đã được điều tra không bao giờ mở lại)
-2. **Survey angle xoay vòng** — góc nghiên cứu ít dùng nhất được mở tiếp
-   (State-of-the-art → Benchmark → Empirical comparison → Failure-mode →
-   Reproducibility → Tooling), nên backlog cạn mãi không lặp lại cùng một
-   survey
-
-Mỗi lần cạn backlog chỉ sinh tối đa 1 task; owner luôn có thể chèn việc riêng
-bằng `python -m agentics.cli task "tên việc" --category code`.
-
-## 4. Chạy
-
-```bash
-cp .env.example .env            # cấu hình cookie/LLM; KHÔNG cần GITHUB_TOKEN
-python -m agentics.cli run      # vòng lặp vô tận, 100% local
-python -m agentics.cli dashboard  # tab 2: mắt owner
-python -m agentics.cli journal -f # tab 3: stream sự kiện terminal
+```
+owner: agentics task "Benchmark X"          # or Supervisor seeds it
+  → Supervisor: sweep stale claims, top up backlog
+  → Coder/Writer: claim task (SQLite lock, TTL lease)
+      publish intent: goal / why / expected files
+  → research → plan (LLM JSON: files, steps, reuses)
+  → implement: workspace clone of data/lab.git, P10 write gate per file,
+      tier-1 (py_compile + pytest), commit, push branch
+  → open MR: reviews row (task, branch, files, verification)
+  → Reviewer: cross-review (never own MR), P10 re-check,
+      verdict approve → merge queue (P4)
+  → Integrator: tier-2 (full tests on main+MR), then local merge
+      task → merged; tools registered in the plan become active
+  → reflect: lesson + trace into shared memory (GEA), journal entry
 ```
 
-Kiểm tra sức khỏe offline không cần LLM:
+---
 
-```bash
-pytest tests/test_local_review_merge.py -q   # E2E thật: claim→implement→review→merge bằng git thật
-pytest tests/test_local_ops.py -q            # đơn vị: repo, task, claim, merge queue, hook
+## 2. H1 — the agent code cannot be corrupted (5 layers)
+
+**Layer 0 — ownership matrix (P3, `configs/lab.yaml`).** The writable research
+surface per role is `experiments/`, `tests/`, `benchmarks/` (coder),
+`research_notes/` (researcher), `docs/` (writer), `reports/` (integrator).
+The lab's own code is out of bounds for every role.
+
+**Layers 1–3 — protected paths (P10, `agentics/policies/guard.py`).** The
+paths below are hard-blocked for ALL agents, at three independent gates:
+
+```
+agentics/   configs/   accounts/   scripts/   .github/
 ```
 
-## 5. Merge queue hoạt động thế nào (P4)
+1. **Write gate** — `RepoWorkspace.write_file` refuses to even create/edit a
+   protected file, whatever the plan says.
+2. **Diff gate** — `node_implement` scans every changed file before the
+   commit; a violation yields the cycle (no commit, no push).
+3. **Review + merge gates** — the Reviewer downgrades any "approve" whose
+   diff touches protected paths; `LocalMergeQueue.drain` refuses to merge a
+   violating MR even if it was approved.
 
-Integrator rút hàng đợi tuần tự: MR có verdict `approved` mới được rút; mỗi
-MR chạy tier-2 verify (full test trên main+MR) trước khi merge `--no-ff` lên
-main của bare repo; conflict hoặc verify fail → MR bị đánh dấu, task trả về;
-`AUTO_MERGE=0` → queue chỉ ghi nhận MR sẵn sàng, owner tự merge tay.
+The ONLY exemptions are owner-granted: per task
+(`python -m agentics.cli allow-protected <task_id>`, revoke with `--revoke`)
+or run-wide (`ALLOW_PROTECTED_PATHS=1`). Credentials (`accounts/`,
+`configs/secrets.yaml`) are **never** exemptable.
 
-## 6. Biến môi trường chính (local mode)
+**Git layer — pre-receive hook on the origin (`LocalRepo.ensure_guard`,
+`origin_hook_script`).** The gates above only see traffic that flows through
+agentics code; a raw `git push` to `data/lab.git` bypasses all of them. The
+bare origin therefore enforces the same rulebook at receive-pack time:
+owner pushes (committer email not `agentics+*`) pass untouched; agents may
+never move or delete `main` (work goes through the MR flow); agent commits
+are checked PER COMMIT (`git diff-tree`), so a branch rebased on top of fresh
+owner commits cannot smuggle changes past the check. The hook is regenerated
+from the same protected-path lists the in-process layers read (including the
+runtime `PROTECTED_PATHS` / lab.yaml extension) on every boot — do not edit
+it by hand; drift is self-healed.
 
-| Biến | Ý nghĩa |
-| --- | --- |
-| `AUTO_MERGE` | mặc định `0` — queue chỉ ghi nhận MR sẵn sàng, owner tự merge tay; `1` = merge tự động sau tier-2 |
-| `PROTECTED_PATHS` | mở rộng danh sách path protected (phân tách bằng dấu phẩy) |
-| `ALLOW_PROTECTED_PATHS` | `1` = owner cho phép cả run chạm code lab (kể cả qua git push) |
-| `DASHBOARD_PORT` | port dashboard (mặc định 8080) |
-| `GH_SCAN_CACHE_TTL`, `GH_MIN_API_INTERVAL`, `HB_INPUT_TIMEOUT` | reliability tuning hợp về từ main (dormant GH ops / Hyperbrowser fail-fast) |
+**Layer 4 — DETECT (`agentics/sandbox/integrity.py`).** Layers 1–3 stop agent
+*changesets*; nothing yet guarded the tree the orchestrator itself runs from.
+`IntegrityGuard` hashes `agentics/`, `configs/`, `scripts/` and the dependency
+manifests at startup (`data/integrity/baseline.json`); the Supervisor
+re-verifies every 5th cycle; any drift — botched merge, escaped process,
+manual edit — becomes an `integrity_alert` journal entry + memory alert.
+Owner check at any time: `python -m agentics.cli verify`
+(accept reviewed changes with `--refresh`). Drift alerts; it never kills the
+loop — the owner decides.
 
-## 7. Nhật ký tích hợp (decision records)
+---
 
-Mục này ghi rõ các quyết định khi hội tụ các nhánh local-mode song song về
-**một nhánh duy nhất** — người đẩy sau phải đối chiếu code của người đi trước
-và chỉ port phần bổ trợ, không dựng lại kiến trúc.
+## 3. H2 — the owner always knows what is happening
 
-**A. Hợp `main` vào nhánh (408e7a5 — production reliability).** Nhánh local
-được cắt từ 4a39204, thiếu các fix reliability mà main đã có: LLM failure
-giờ degrade về `state["error"]` → reflect (nhả claim, ghi trace + lesson)
-thay vì giết LangGraph task; Hyperbrowser fail-fast nhận challenge/login-wall;
-GH pacing/retry + scan cache (dormant nhưng vẫn test). Resolution xung đột
-orchestrator: giữ phân loại `is_auth_failure` của nhánh (chính xác hơn
-heuristic cũ mà main đã xóa) — hai chính sách không mâu thuẫn vì node graph
-không còn raise; chỉ lỗi auth thật bubble lên mới cooldown cookie.
+Three channels, all backed by SQLite, all readable offline:
 
-**B. Pre-receive hook cho `data/lab.git` (lớp P10 thứ 4).** Ba gate P10 của
-cd8b536 chỉ thấy traffic đi qua code agentics; `git push` thẳng vào bare repo
-bypass tất cả. Hook được `LocalRepo.ensure()` cài/sửa tự sinh từ danh sách
-`protected_paths` hiện tại, chỉ ghi đè hook mang sentinel
-`# agentics pre-receive (managed)` — hook của owner không bao giờ bị đụng.
-`ALLOW_PROTECTED_PATHS=1` của shell push được tôn trọng (receive-pack kế thừa
-env khi push local), giống ngữ nghĩa override ở tầng app.
+1. **Published intent** — every node calls `ctx.report(...)`, storing the
+   agent's current node, status, task, and a structured intent
+   (`goal / why / steps / expected_files`) on the heartbeat row
+   (`heartbeats.current_node`, `.task_id`, `.intent`).
+2. **Activity journal** — an append-only feed (`journal` table) of what/why
+   each agent did: `claim`, `open_mr`, `review`, `merge`, `cycle_done`,
+   `task_created`, `task_exempt_set`, `integrity_alert`, `startup`… The table
+   is trimmed to the newest rows automatically, so a forever-running lab
+   stays bounded.
+3. **Surfaces**:
+   - `python -m agentics.cli status` — live agents (node + intent), task
+     counts, claims.
+   - `python -m agentics.cli watch` — terminal live view (agents with
+     intent, claims, merge queue, backlog), `--once` for a snapshot.
+   - `python -m agentics.cli events -f` — tail the activity journal live in
+     the terminal (`--agent a02` to filter, `-n` for history); without `-f`
+     it prints the recent story oldest-first.
+   - `python -m agentics.cli dashboard` — web UI at `http://127.0.0.1:8080`:
+     per-agent intent cards, task board, MR pipeline, merge queue, memory
+     health, live journal (polls `/api/state` every 2.5 s, zero external
+     assets, works fully offline).
+   - `python -m agentics.cli metrics` — how the lab itself is evolving
+     (merge rate by category, from the traces).
 
-**C. `agentics journal -f`.** Dashboard web của cd8b536 đã đủ cho owner; lệnh
-này là bản terminal cùng nguồn dữ liệu (bảng `journal`) cho ai làm việc bằng
-bàn phím — không tạo lớp lưu trữ sự kiện mới, không trùng lặp.
+---
 
-**D. Sửa rotation `supervisor_top_up`.** Bản cd8b536 luôn mở
-`SURVEY_ANGLES[0]` nên backlog cạn là lặp lại cùng một survey mãi mãi (dedup
-chỉ xét task OPEN). Đã thay bằng: (1) task điều tra failure mới nhất chưa có
-task nhận, (2) survey angle ít dùng nhất (xoay vòng thật sự, tính trên toàn
-bộ bảng tasks).
+## 4. Running it
 
-**E. Những gì cố ý KHÔNG port.** Kiến trúc emulator GitHub-API của proposal
-cũ (duck-typing PyGithub) bị bỏ — bản cd8b536 viết lại node trực tiếp lên
-bảng SQLite sạch hơn, không còn lớp giả lập cần giữ đồng bộ. EventBus/
-events.jsonl riêng cũng bỏ — bảng `journal` trong SQLite đã là nguồn sự thật
-chung cho cả dashboard lẫn `journal -f`; thêm một kênh jsonl nữa chỉ tạo hai
-nguồn thật. Smoke script riêng cũng bỏ — `tests/test_local_review_merge.py`
-đã là E2E thật với git thật, chạy được như một lệnh kiểm tra.
+```bash
+pip install -r requirements.txt          # no GITHUB_TOKEN needed anymore
+
+python -m agentics.cli run               # start the swarm (local-only mode)
+python -m agentics.cli dashboard         # owner's window (another terminal)
+python -m agentics.cli task "Improve the benchmark runner" \
+        --category code --body "what & why"    # feed work as the owner
+python -m agentics.cli status            # CLI snapshot
+python -m agentics.cli verify            # runtime-tree integrity check
+python -m agentics.cli stop              # graceful stop (STOP file)
+```
+
+Merge behaviour: with `AUTO_MERGE` on (default) the Integrator merges
+approved MRs serially after tier-2 passes; with `AUTO_MERGE` off the queue
+only records readiness and the owner merges by hand.
+
+---
+
+## 5. Testing
+
+`python -m pytest -q` — 214 tests, no network required:
+
+- `tests/test_local_ops.py` — task CRUD, claim lifecycle, backlog seeding,
+  merge-queue semantics (serial, conflict retries, AUTO_MERGE off).
+- `tests/test_local_review_merge.py` — full claim → implement → review →
+  merge lifecycle on a **real** git bare repo, conflict path, author blocked
+  from pushing agent code.
+- `tests/test_protected_guard.py` — P10 semantics (normalisation, task
+  exemption, env override, credentials never exemptable).
+- `tests/test_integrity.py` — manifest build/verify/drift, orchestrator
+  startup baseline (layer 4).
+- `tests/test_dashboard_api.py` — dashboard state endpoint.
+- `tests/test_scan_cache_stability.py` — legacy `github_ops` scan cache keyed
+  on stable identity only (CPython `id()` reuse could resurrect a stale list).
+- `tests/test_journal_cap.py` — journal trim keeps the feed bounded.
+
+---
+
+## 6. Known limitations
+
+- **Single machine** — shared memory is one SQLite file (WAL) and "origin" is
+  one bare repo; scale-out needs an actual server or a sync layer.
+- **Merge channel** — merges are fast-forward pushes to `data/lab.git`; if
+  two Integrators ran concurrently the second push would fail as
+  non-fast-forward (by design there is exactly one Integrator, P4).
+
+---
+
+## 7. Reconciliation log (multi-agent integration decisions)
+
+This branch is built by several agents pushing to ONE branch; the later
+pusher must cross-check the earlier work and only integrate what genuinely
+complements it. Log of the reconciliations that produced this file:
+
+**A. `main` merged in (408e7a5 — production reliability).** The branch was
+cut before main gained: LLM failures degrade to `state["error"]` → reflect
+(claim released, trace + lesson recorded) instead of killing the LangGraph
+task; Hyperbrowser fail-fast challenge detection; GH pacing/retry/scan-cache
+for the dormant github_ops (still unit-tested). Orchestrator conflict
+resolution kept this branch's `is_auth_failure` classifier (more precise than
+the heuristic main removed) — the policies compose: graph nodes no longer
+raise, so only genuine auth failures cool a cookie. The prod-fix review test
+was ported from the GitHub-PR fixture to the local MR flow.
+
+**B. Pre-receive hook — parallel proposals deduplicated.** Two agents built
+the git layer independently. The shipped `origin_hook_script` was kept (owner
+identity by committer email, per-commit checks, main protection); the
+parallel version was dropped. One delta was kept from it: `ensure_guard` now
+generates the hook from the RUNTIME `protected_paths` (lab.yaml /
+`PROTECTED_PATHS`), so extending the list at the app layer also extends the
+git layer — one source of truth, no drift.
+
+**C. Backlog rotation — hybrid.** The original top-up always re-opened
+`SURVEY_ANGLES[0]`. Two parallel fixes landed: a least-used-first rotation
+and a total-count rotation with walk-forward. Kept: least-used ordering
+(robust against owner tasks inflating a counter) + walk-forward when a title
+is still open elsewhere, PLUS a new first-priority source neither had: the
+newest un-investigated failed trace becomes a bugfix task (GEA loop; an
+investigated failure never re-opens).
+
+**D. Terminal live view — one command, not two.** `events` already read the
+journal; it gained `-f/--follow` (live streaming) instead of adding a
+duplicate `journal` command. `watch` remains the full-screen live view.
+
+**E. Deliberate non-ports.** The parallel GitHub-API emulator (duck-typed
+PyGithub) proposal: dropped — rewriting the nodes onto the SQLite task board
+(cd8b536) is cleaner and has no emulation layer to keep in sync. A separate
+`events.jsonl` event bus: dropped — the `journal` table is the single source
+of truth shared by the dashboard, `events`, `watch` and `explain`. A
+standalone smoke script: dropped — `tests/test_local_review_merge.py` already
+is a real-git E2E that doubles as the offline health check.

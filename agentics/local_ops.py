@@ -19,62 +19,25 @@ from __future__ import annotations
 
 import logging
 import re
+import stat
 import subprocess
 from pathlib import Path
 
 from agentics.config import PROJECT_ROOT, Settings
 from agentics.memory.shared_memory import SharedMemory
+from agentics.policies.guard import (
+    ALWAYS_PROTECTED, DEFAULT_PROTECTED_PATHS, INTEGRATOR_MERGE_ENV,
+)
 
 log = logging.getLogger("local.ops")
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
-# First line of every hook we manage — hooks without it are owner property.
-PRE_RECEIVE_SENTINEL = "# agentics pre-receive (managed)"
-
-
-def _pre_receive_script(paths: list[str] | tuple[str, ...]) -> str:
-    """POSIX-sh pre-receive hook blocking pushes that introduce ``paths``.
-
-    ``git diff --name-only`` output is matched against escaped literal path
-    prefixes (guard.is_protected semantics: exact or prefix match), so a
-    settings entry like ``configs/`` covers ``configs/secrets.yaml`` too.
-    """
-    import re as _re
-
-    alts = "|".join(_re.escape(p) for p in paths)
-    return f'''#!/bin/sh
-{PRE_RECEIVE_SENTINEL} — P10 defence in depth for the local origin (data/lab.git).
-# Installed by agentics.local_ops.LocalRepo; regenerated on lab boot when the
-# protected-path list changes. Refuses ANY push introducing protected lab
-# paths — including direct pushes that bypass workspaces, reviews and the
-# merge queue. Owner override: ALLOW_PROTECTED_PATHS=1 in the pushing shell.
-ZERO=0000000000000000000000000000000000000000
-case "$ALLOW_PROTECTED_PATHS" in
-    1|true|yes|on) exit 0 ;;
-esac
-status=0
-while read old new ref; do
-    [ "$new" = "$ZERO" ] && continue          # branch deletion
-    if [ "$old" = "$ZERO" ]; then
-        range="$new --not --all"
-    else
-        range="$old..$new"
-    fi
-    bad=$(git diff --name-only $range 2>/dev/null | grep -E '^({alts})')
-    if [ -n "$bad" ]; then
-        echo "push refused — protected lab paths cannot enter the local origin (P10):" >&2
-        echo "$bad" | head -5 >&2
-        status=1
-    fi
-done
-exit $status
-'''
-
 
 def branch_name(agent_id: str, task_id: int, title: str) -> str:
     slug = _SLUG_RE.sub("-", title.lower()).strip("-")[:40]
     return f"agent/{agent_id}/task-{task_id}-{slug}"
+
 
 
 # Angles the Supervisor rotates through when the backlog runs dry, so the
@@ -89,6 +52,76 @@ SURVEY_ANGLES: tuple[str, ...] = (
 )
 
 
+# ------------------------------------------------------------- P10 layer 4
+def origin_hook_script(
+    default_branch: str = "main",
+    protected: tuple[str, ...] | None = None,
+) -> str:
+    """The pre-receive hook for the bare origin — the git-protocol layer (4/4)
+    of the P10 guard. Layers 1-3 (write_file, node diff, run_command) run
+    inside the workspace; this one runs INSIDE the bare repo at receive-pack
+    time, so even a raw `git push` that bypassed the workspace API is judged
+    by the same rulebook:
+
+        * the owner always wins: any push whose new tip is not agent-authored
+          (committer email not starting with "agentics+") passes untouched;
+        * agents (email ``agentics+*``) may never move or delete the default
+          branch — main moves only through the Integrator's sanctioned merge
+          (``RepoWorkspace.merge_branch_to_main``, which sets
+          INTEGRATOR_MERGE_ENV) or an owner push;
+        * agent commits may not touch a protected path — checked PER COMMIT
+          (``git diff-tree``), so an agent branch rebased on top of fresh
+          owner commits cannot smuggle changes past the check;
+        * branch deletions other than the default branch are fine.
+
+    The patterns are generated from the same ProtectedPathsGuard lists
+    (DEFAULT_PROTECTED_PATHS + ALWAYS_PROTECTED) the in-process layers use,
+    so the layers cannot drift apart.
+    """
+    protected = tuple(protected) if protected else DEFAULT_PROTECTED_PATHS + ALWAYS_PROTECTED
+    pats = "|".join(p.rstrip("/") if p.endswith("/") else p for p in protected)
+    return f"""#!/bin/sh
+# agentics P10 origin guard — auto-generated from agentics/policies/guard.py.
+# DO NOT EDIT by hand: LocalRepo.ensure() re-installs it on every boot.
+[ "${INTEGRATOR_MERGE_ENV}" = "1" ] && exit 0   # sanctioned merge / exempt push
+ZERO=0000000000000000000000000000000000000000
+DEFAULT="refs/heads/{default_branch}"
+while read old new ref; do
+    if [ "$new" = "$ZERO" ]; then                       # branch deletion
+        if [ "$ref" = "$DEFAULT" ]; then
+            echo "guard P10: the default branch cannot be deleted" >&2
+            exit 1
+        fi
+        continue                                        # agent branches: fine
+    fi
+    # owner power: a push whose tip is owner-authored is the owner's business
+    if ! git log --format=%ce -1 "$new" | grep -q '^agentics+'; then
+        exit 0
+    fi
+    if [ "$ref" = "$DEFAULT" ]; then
+        echo "guard P10: agents cannot move '{default_branch}' — work goes through the MR flow" >&2
+        exit 1
+    fi
+    if [ "$old" = "$ZERO" ]; then                       # first push of a branch
+        base=$(git rev-parse --verify --quiet "$DEFAULT" || true)
+    else
+        base=$old
+    fi
+    [ -n "$base" ] || continue
+    blocked=$(git log --format='%H %ce' "$base..$new" \\
+        | awk '$2 ~ /^agentics+/ {{print $1}}' \\
+        | xargs -r git diff-tree --no-commit-id --name-only -r \\
+        | grep -E "^({pats})" || true)
+    if [ -n "$blocked" ]; then
+        echo "guard P10: agent commits touch protected paths:" >&2
+        echo "$blocked" | sed 's/^/  - /' >&2
+        exit 1
+    fi
+done
+exit 0
+"""
+
+
 class LocalRepo:
     """The shared bare repository that plays the role of "origin" locally."""
 
@@ -99,7 +132,7 @@ class LocalRepo:
     def ensure(self, src: Path | None = None) -> Path:
         """Seed the bare repo once from the running lab checkout."""
         if (self.path / "HEAD").exists():
-            self.install_pre_receive()          # repair path for existing repos
+            self.ensure_guard()                 # self-heal hook on every boot
             return self.path
         src = src or PROJECT_ROOT
         if not (src / ".git").exists():
@@ -121,49 +154,37 @@ class LocalRepo:
             ["git", "-C", str(self.path), "symbolic-ref", "HEAD", "refs/heads/main"],
             capture_output=True, text=True,
         )
-        self.install_pre_receive()
+        self.ensure_guard()
         return self.path
 
-    # ------------------------------------------------------------------ P10
-    def install_pre_receive(self) -> Path:
-        """Defence in depth BELOW the app-level P10 gates (ported from the
-        earlier local-mode proposal on this branch).
+    def ensure_guard(self) -> None:
+        """Install (or upgrade) the P10 pre-receive hook on the bare origin.
 
-        The three app gates (workspace write, pre-push diff scan, review +
-        merge) only see traffic that flows through agentics code. A direct
-        ``git push`` to data/lab.git bypasses all of them — this pre-receive
-        hook closes that hole at the git layer: any push introducing a
-        protected path is refused before a branch or MR can even exist.
+        Idempotent and self-healing: the hook is generated from the same
+        protected-path lists the in-process layers use, so a drifted or
+        hand-deleted hook is repaired on every boot.
 
-        The pattern is generated from the CURRENT settings (lab.yaml can
-        extend the default list); ``ALWAYS_PROTECTED`` credentials/secret
-        paths are always included. Only hooks carrying the agentics sentinel
-        are (re)written — an owner-customised hook is never clobbered.
-        The ``ALLOW_PROTECTED_PATHS=1`` env switch of the PUSHING process is
-        honoured (receive-pack inherits it for local pushes), mirroring the
-        app-layer override semantics.
+        Reconciliation note (vs the parallel hook proposal merged here): the
+        shipped ``origin_hook_script`` was kept — owner pushes are identified
+        by committer email, agent rules are enforced PER COMMIT (rebase
+        smuggling cannot slip through) and the default branch only moves via
+        the sanctioned integrator env. This call site is the one delta kept
+        from the parallel proposal: the pattern list follows the RUNTIME
+        settings (``PROTECTED_PATHS`` / lab.yaml), so extending the list at
+        the app layer also extends the git layer — same source of truth, no
+        drift.
         """
-        from agentics.policies.guard import ALWAYS_PROTECTED
-
-        base = tuple(getattr(self.settings, "protected_paths", None) or ())
-        paths = [p for p in (*base, *ALWAYS_PROTECTED) if p]
-        script = _pre_receive_script(paths)
         hook = self.path / "hooks" / "pre-receive"
         hook.parent.mkdir(parents=True, exist_ok=True)
-        if hook.exists():
-            current = hook.read_text(encoding="utf-8", errors="replace")
-            if current == script:
-                return hook                     # already up to date
-            if PRE_RECEIVE_SENTINEL not in current[:256]:
-                log.info("pre-existing owner hook at %s left untouched", hook)
-                return hook
+        runtime_paths = tuple(
+            getattr(self.settings, "protected_paths", None) or DEFAULT_PROTECTED_PATHS
+        )
+        script = origin_hook_script(protected=runtime_paths + ALWAYS_PROTECTED)
+        if hook.exists() and hook.read_text(encoding="utf-8") == script:
+            return
         hook.write_text(script, encoding="utf-8")
-        try:
-            hook.chmod(0o755)
-        except OSError:
-            pass
-        log.info("pre-receive P10 hook installed at %s", hook)
-        return hook
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        log.info("P10 pre-receive guard installed on %s", self.path)
 
     def main_head(self) -> str:
         proc = subprocess.run(
@@ -209,17 +230,17 @@ class TaskSource:
     def supervisor_top_up(self) -> int:
         """Supervisor: if nothing is claimable, grow the backlog by one task.
 
-        Two self-generated sources, in priority order (ported from the earlier
-        local-mode proposal on this branch — review of cd8b536 found that the
-        original top-up always re-opened ``SURVEY_ANGLES[0]``, so a dry backlog
-        re-created the same survey forever and never reached the other angles):
+        Two self-generated sources, in priority order (reconciliation of the
+        two parallel fixes on this branch):
 
           1. failure-driven investigation — the newest failed trace without a
-             task yet becomes an investigation task (the GEA loop fed by the
-             swarm's own incident history),
-          2. the next survey angle — angles ROTATE, least-used first, so the
-             infinite research loop revisits the topic from a new side each
-             time instead of repeating the first angle.
+             task yet becomes a bugfix task (the GEA loop fed by the swarm's
+             own incident history; an already-investigated failure never
+             re-opens — recurring failures are the evolution task's job),
+          2. the next survey angle — angles rotate least-used-first and walk
+             forward when a title is still open elsewhere, so a long-running
+             backlog sweeps every research angle instead of reopening
+             "State-of-the-art survey" forever.
 
         Returns the number of tasks created (0 or 1).
         """
@@ -266,7 +287,8 @@ class TaskSource:
         return 0
 
     def _open_next_survey_angle(self) -> int:
-        """Open the least-used survey angle for the research topic."""
+        """Open the least-used survey angle; if its title is still open or
+        claimed elsewhere, walk forward to the next least-used free angle."""
         topic = self.settings.research_topic
         used: dict[str, int] = {}
         for t in self.memory.list_tasks(limit=500):
@@ -274,20 +296,54 @@ class TaskSource:
                 if t["title"].startswith(f"{angle}:"):
                     used[angle] = used.get(angle, 0) + 1
                     break
-        angle = min(SURVEY_ANGLES, key=lambda a: (used.get(a, 0), SURVEY_ANGLES.index(a)))
-        task_id = self.memory.create_task_if_absent(
-            f"{angle}: {topic}",
-            body=("Backlog ran dry. Produce the next research increment with "
-                  "citations and store findings in shared memory."),
-            category="research",
-            agent="supervisor",
-        )
-        if task_id is not None:
-            self.memory.journal("supervisor", "backlog_top_up",
-                                {"task": task_id, "source": "survey_rotation",
-                                 "angle": angle})
-            return 1
+        ordered = sorted(SURVEY_ANGLES,
+                         key=lambda a: (used.get(a, 0), SURVEY_ANGLES.index(a)))
+        for angle in ordered:
+            created = self.memory.create_task_if_absent(
+                f"{angle}: {topic}",
+                body=("Backlog ran dry. Produce the next research increment with "
+                      "citations and store findings in shared memory."),
+                category="research",
+                agent="supervisor",
+            )
+            if created is not None:
+                self.memory.journal("supervisor", "backlog_top_up",
+                                    {"task": created, "angle": angle,
+                                     "source": "survey_rotation"})
+                return 1
         return 0
+
+    def repair_orphan_tasks(self) -> list[int]:
+        """Put tasks whose lifecycle stalled back into the open pool.
+
+        Two stall shapes exist and both shrink the backlog permanently if left
+        alone (scan_open_tasks only ever reads status='open'):
+
+        - ``claimed`` but no active claim row  — a crash between the atomic
+          claim and the task-status update, or a lease already swept;
+        - ``in_review`` but no live MR (open / changes_requested / approved) —
+          the MR row vanished or failed without the queue closing the task.
+
+        Runs every Supervisor scan, after sweep_stale released expired leases.
+        """
+        repaired: list[int] = []
+        for task in self.memory.list_tasks(limit=200, status="claimed"):
+            if task["id"] not in self.memory.all_active_claims():
+                self.memory.set_task_status(task["id"], "open", claimed_by="")
+                self.memory.journal("supervisor", "task_repair", {
+                    "task": task["id"], "why": "claimed without an active lease",
+                })
+                repaired.append(task["id"])
+        live_mr = ("open", "changes_requested", "approved")
+        for task in self.memory.list_tasks(limit=200, status="in_review"):
+            mrs = self.memory.reviews_by_task(task["id"])
+            if not any(r["status"] in live_mr for r in mrs):
+                self.memory.set_task_status(task["id"], "open", claimed_by="")
+                self.memory.journal("supervisor", "task_repair", {
+                    "task": task["id"], "why": "in_review without a live MR",
+                })
+                repaired.append(task["id"])
+        return repaired
 
 
 class LocalClaimPolicy:
@@ -311,7 +367,10 @@ class LocalClaimPolicy:
     def release(self, task_id: int, agent_id: str, reason: str = "") -> None:
         self.memory.release_claim(task_id, agent_id)
         task = self.memory.get_task(task_id)
-        if task and task["status"] in ("claimed", "in_review"):
+        # Only a plain claimed task returns to the open pool. An in_review task
+        # has a live MR — reopening it here would let a second MR be raised
+        # against the same task while the first still awaits re-review.
+        if task and task["status"] == "claimed":
             self.memory.set_task_status(task_id, "open", claimed_by="")
         self.memory.journal(agent_id, "release", {"task": task_id, "why": reason})
 
@@ -359,13 +418,21 @@ class LocalOps:
 
     def __init__(self, memory: SharedMemory, settings: Settings) -> None:
         from agentics.policies.guard import DEFAULT_PROTECTED_PATHS, ProtectedPathsGuard
+        from agentics.policies.intent import FileLockManager
 
         self.memory = memory
         self.settings = settings
         self.repo = LocalRepo(settings)
         self.tasks = TaskSource(memory, settings)
         paths = tuple(getattr(settings, "protected_paths", None) or ())
-        self.guard = ProtectedPathsGuard(paths=paths or DEFAULT_PROTECTED_PATHS)
+        roots = tuple(getattr(settings, "writable_roots", None) or ())
+        self.guard = ProtectedPathsGuard(
+            paths=paths or DEFAULT_PROTECTED_PATHS,
+            writable_roots=roots or None,
+        )
+        # P13 — plan-time file locks shared by the whole swarm
+        ttl_minutes = int(getattr(settings, "file_lock_ttl_minutes", 30) or 30)
+        self.locks = FileLockManager(memory, ttl_s=ttl_minutes * 60)
 
     def setup(self) -> None:
         """One-time preparation: seed the bare repo and the starter backlog."""

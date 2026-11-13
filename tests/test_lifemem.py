@@ -4,8 +4,14 @@ import math
 
 from agentics.memory import lifemem
 from agentics.memory.lifemem import (
-    assign_trace, distill_skill, embed, maybe_split, mean_resultant_length,
-    on_merge, skill_context, two_means_split,
+    assign_trace,
+    distill_skill,
+    embed,
+    maybe_split,
+    mean_resultant_length,
+    on_merge,
+    skill_context,
+    two_means_split,
 )
 from agentics.memory.shared_memory import SharedMemory
 

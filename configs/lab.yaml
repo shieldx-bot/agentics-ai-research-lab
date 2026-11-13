@@ -48,6 +48,30 @@ protected_paths:
   - scripts/
   - .github/
 
+# --- P14 whitelist ring ("cấm tuyệt đối" — vòng ngoài của ownership) ----------
+# Khi được đặt, MỌI file ngoài các gốc này bị từ chối với mọi agent (lớp
+# ownership P3 phân vai bên trong; vòng này chặn toàn bộ phần còn lại).
+# Owner exemption theo task vẫn nâng được vòng này, nhưng accounts/ và
+# configs/secrets.yaml không bao giờ được chạm. Bỏ trống ([]) để tắt.
+# Mặc định = hợp của các vùng ownership phía trên.
+writable_roots:
+  - research_notes/
+  - experiments/
+  - benchmarks/
+  - tests/
+  - docs/
+  - reports/
+  - README.md
+
+# --- P13 file locks (anti "hai agent đè tay nhau") ----------------------------
+# Khóa khai báo ở bước plan, TTL tự hết hạn khi agent chết.
+file_lock_ttl_minutes: 30
+
+# --- P10 lớp 4 — integrity self-healing ---------------------------------------
+# Re-hash cây protected trong mỗi workspace rồi tự phục hồi từ git nếu bị
+# một script lạc ghi đè. 0 = tắt.
+integrity_interval_s: 20
+
 # --- Perplexity ------------------------------------------------------------
 pplx_timeout: 180
 

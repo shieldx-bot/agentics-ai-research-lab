@@ -81,8 +81,9 @@ Chính sách chống xung đột: [docs/POLICIES.md](docs/POLICIES.md)
 > **Chế độ LOCAL-ONLY (nhánh `update_interactive_local`):** lab chạy hoàn toàn
 > trên máy của bạn — không cần `GITHUB_TOKEN`, không gọi GitHub. "origin" của
 > agent là bare repo tự seed tại `data/lab.git`; tasks/MR/review/merge đều
-> nằm trong SQLite. Owner theo dõi qua web dashboard (`agentics dashboard`)
-> hoặc terminal (`agentics journal -f`). Chi tiết kiến trúc + nhật ký tích
+> nằm trong SQLite. Owner theo dõi qua web dashboard (`agentics dashboard`),
+> terminal live view (`agentics watch`) hoặc stream sự kiện (`agentics events -f`).
+> Chi tiết kiến trúc + nhật ký tích
 > hợp: [docs/LOCAL_MODE.md](docs/LOCAL_MODE.md).
 
 ```bash
@@ -110,10 +111,16 @@ python -m agentics.cli run
 
 # 5) MẮT OWNER — xem agents đang làm gì, mục đích gì, realtime
 python -m agentics.cli dashboard     # → http://127.0.0.1:8080
+python -m agentics.cli watch        # terminal live view (SSH-friendly)
 
 # 6) Thêm việc cho đàn agent / sửa backlog
 python -m agentics.cli task "Nghiên cứu thuật toán X" --category research
 python -m agentics.cli task --list
+
+# 6b) CỔNG MERGE (khi AUTO_MERGE=false — mặc định): owner giữ chốt
+python -m agentics.cli mr list          # pipeline MR: ai làm, ai duyệt
+python -m agentics.cli mr approve 3     # owner duyệt thay/ thêm cross-review
+python -m agentics.cli mr merge 3       # owner merge (P10 + tier-2 vẫn chạy)
 
 # 7) DỪNG an toàn (owner quyết định)
 python -m agentics.cli stop          # hoặc: touch STOP
@@ -128,6 +135,14 @@ Sức khỏe bộ nhớ LifeMem (trace, cụm workflow, skill đã chưng cất)
 push, cửa merge). Exception DUY NHẤT là owner chạy
 `python -m agentics.cli allow-protected <task_id>` (coi `accounts/` và
 `configs/secrets.yaml` không bao giờ được miễn).
+
+**Các lớp bổ sung trên nhánh này (P13/P14 + integrity):** danh sách file dự
+kiến ở bước plan được **khóa toàn cục** (P13 — agent khác đụng trúng bị dừng
+trước khi đốt chu kỳ); diff ở bước implement phải nằm trong **phạm vi intent
+đã tuyên bố** (P14 — lệch phạm vi bị yield + báo dashboard); và một
+**IntegrityWatcher** quét định kỳ (~20s) tự hoàn tác mọi thay đổi vùng cấm
+bị script lạc ghi đè trong workspace — `INTEGRITY_INTERVAL_S=0` để tắt.
+Chi tiết: `docs/POLICIES.md` (P10 bổ sung, P13, P14).
 
 ---
 

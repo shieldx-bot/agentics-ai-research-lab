@@ -7,7 +7,8 @@ import pytest
 
 from agentics.config import Settings
 from agentics.local_ops import (
-    LocalClaimPolicy, LocalMergeQueue, LocalRepo, TaskSource, branch_name,
+    SURVEY_ANGLES, LocalClaimPolicy, LocalMergeQueue, LocalRepo, TaskSource,
+    branch_name,
 )
 from agentics.memory.shared_memory import SharedMemory
 from agentics.policies.guard import ProtectedPathsGuard
@@ -63,10 +64,11 @@ def test_local_repo_refuses_non_git_source(settings, tmp_path):
         LocalRepo(settings).ensure(src=empty)
 
 
-def _git(*args: str, env_extra: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def _git(*args: str, env_extra: dict | None = None, cwd: Path | None = None,
+         committer: str = "agentics+a02@example.com") -> subprocess.CompletedProcess:
     import os
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL=committer,
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL=committer)
     if env_extra:
         env.update(env_extra)
     return subprocess.run(["git", *args], cwd=cwd, env=env,
@@ -81,10 +83,12 @@ def _clone_and_commit(bare: Path, work: Path) -> None:
     _git("commit", "-qm", "research work", cwd=work)
 
 
-def test_pre_receive_hook_blocks_direct_push_of_lab_code(settings, project, tmp_path):
-    """P10 layer 2.5 (defence in depth): even a raw `git push` straight to
-    data/lab.git — no workspace, no review, no merge queue — cannot introduce
-    agentics/configs/accounts/scripts/.github paths into the origin."""
+def test_pre_receive_hook_blocks_agent_push_of_lab_code(settings, project, tmp_path):
+    """P10 git layer (reconciliation: kept the shipped origin_hook_script —
+    owner pushes are identified by committer email, agent rules apply PER
+    COMMIT, agents never touch main directly). E2E sanity here; the full
+    rulebook lives in test_origin_hook.py.
+    """
     repo = LocalRepo(settings)
     repo.ensure(src=project)
     work = tmp_path / "work"
@@ -94,59 +98,33 @@ def test_pre_receive_hook_blocks_direct_push_of_lab_code(settings, project, tmp_
     (work / "agentics" / "rogue.py").write_text("x = 1\n", encoding="utf-8")
     _git("add", ".", cwd=work)
     _git("commit", "-qm", "sneak lab code", cwd=work)
-    refused = _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=work)
+    refused = _git("push", "-q", "origin", "HEAD:refs/heads/agent/a02/task-1", cwd=work)
     assert refused.returncode != 0
-    assert "protected lab paths" in refused.stderr
-    # the refused commit never landed
-    assert repo.main_head() != _git("rev-parse", "HEAD", cwd=work).stdout.strip()
-
+    assert "protected" in refused.stderr.lower()
     # drop the refused commit, then a clean research-only push goes through
     _git("reset", "-q", "--hard", "origin/main", cwd=work)
     (work / "reports").mkdir(exist_ok=True)
     (work / "reports" / "more.md").write_text("more\n", encoding="utf-8")
     _git("add", ".", cwd=work)
     _git("commit", "-qm", "more research", cwd=work)
-    ok = _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=work)
-    assert ok.returncode == 0
-    assert repo.main_head() == _git("rev-parse", "HEAD", cwd=work).stdout.strip()
-
-
-def test_pre_receive_hook_honours_owner_env_override(settings, project, tmp_path):
-    """ALLOW_PROTECTED_PATHS=1 in the pushing shell lifts the git-layer block,
-    mirroring the app-layer override in policies/guard.py."""
-    repo = LocalRepo(settings)
-    repo.ensure(src=project)
-    work = tmp_path / "work"
-    _clone_and_commit(repo.path, work)
-    (work / "agentics").mkdir()
-    (work / "agentics" / "owner_backport.py").write_text("x = 1\n", encoding="utf-8")
-    _git("add", ".", cwd=work)
-    _git("commit", "-qm", "owner backport", cwd=work)
-    ok = _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=work,
-              env_extra={"ALLOW_PROTECTED_PATHS": "1"})
+    ok = _git("push", "-q", "origin", "HEAD:refs/heads/agent/a02/task-1", cwd=work)
     assert ok.returncode == 0
 
 
-def test_pre_receive_hook_never_clobbers_owner_hook(settings, project):
-    """A hook that does not carry the agentics sentinel belongs to the owner
-    and must survive ensure() untouched."""
+def test_ensure_guard_hook_follows_runtime_protected_paths(settings, project):
+    """Reconciliation delta kept from the parallel hook proposal: the git
+    layer must read the SAME protected_paths the app layers read (lab.yaml /
+    PROTECTED_PATHS), so extending the list once extends it everywhere."""
     repo = LocalRepo(settings)
     repo.ensure(src=project)
     hook = repo.path / "hooks" / "pre-receive"
-    hook.write_text("#!/bin/sh\nexit 0  # mine\n", encoding="utf-8")
-    repo.ensure(src=project)                    # repair path must not rewrite
-    assert "mine" in hook.read_text(encoding="utf-8")
-    assert repo.install_pre_receive().read_text(encoding="utf-8") == \
-        "#!/bin/sh\nexit 0  # mine\n"
-
-
-def test_pre_receive_hook_updated_when_settings_change(settings, project):
-    repo = LocalRepo(settings)
-    repo.ensure(src=project)
-    hook = repo.path / "hooks" / "pre-receive"
+    assert "agentics" in hook.read_text(encoding="utf-8")   # default list
     settings.protected_paths = list(settings.protected_paths) + ["docs/"]
-    repo.ensure(src=project)                    # repair path picks up new list
-    assert "docs/" in hook.read_text(encoding="utf-8")
+    repo.ensure(src=project)                    # boot/repair path re-generates
+    script = hook.read_text(encoding="utf-8")
+    assert "docs" in script                     # pattern rendered without "/"
+    repo.ensure(src=project)                    # idempotent — no thrash
+    assert hook.read_text(encoding="utf-8") == script
 
 
 def test_task_crud_and_scan_ordering(mem):
@@ -226,6 +204,25 @@ def test_task_source_supervisor_tops_up_when_dry(settings, mem):
 
 
 def test_supervisor_top_up_rotates_survey_angles(settings, mem):
+    """Backlog dry again and again must walk every angle, not repeat angle 0."""
+    src = TaskSource(mem, settings)
+    titles = []
+    for _ in range(len(SURVEY_ANGLES)):        # exactly one full rotation
+        created = src.supervisor_top_up()
+        if created:
+            newest = mem.list_tasks(limit=1)[0]
+            titles.append(newest["title"])
+            mem.set_task_status(newest["id"], "merged")   # dry the backlog again
+        else:
+            break
+    assert len(titles) >= 3                    # distinct angles over time
+    assert len(set(titles)) == len(titles)     # never the same angle twice in a row
+    angles_logged = [j["detail"] for j in mem.recent_journal(limit=50)
+                     if j["event"] == "backlog_top_up"]
+    assert len(angles_logged) == len(titles)
+
+
+def test_supervisor_top_up_uses_least_used_angle_first(settings, mem):
     """Regression (cd8b536 review): top-up used to re-open SURVEY_ANGLES[0]
     forever — the backlog dried, the same survey was re-created, and the other
     five angles were never reached. Least-used-first rotation fixes that."""
@@ -254,6 +251,8 @@ def test_supervisor_top_up_rotates_survey_angles(settings, mem):
     assert len(angles_used) == 3               # rotation keeps advancing
 
 
+
+
 def test_supervisor_top_up_investigates_newest_failure_first(settings, mem):
     """GEA: the newest failed trace with no task yet becomes a bugfix task
     before any survey angle is opened; an already-investigated failure
@@ -276,6 +275,52 @@ def test_supervisor_top_up_investigates_newest_failure_first(settings, mem):
     assert sum(t.startswith("Investigate failure (tool):") for t in titles) == 1
 
     _ = trace_id
+
+
+def test_repair_orphan_tasks_reopens_claimed_without_lease(settings, mem):
+    src = TaskSource(mem, settings)
+    tid = mem.create_task("crashed claim")
+    mem.set_task_status(tid, "claimed", claimed_by="a04")   # no claim row at all
+    assert src.repair_orphan_tasks() == [tid]
+    assert mem.get_task(tid)["status"] == "open"
+    events = [j["event"] for j in mem.recent_journal()]
+    assert "task_repair" in events
+
+
+def test_repair_orphan_tasks_keeps_live_claims_and_reviews(settings, mem):
+    src = TaskSource(mem, settings)
+    held = mem.create_task("held work")
+    policy = LocalClaimPolicy(mem, ttl_minutes=60)
+    assert policy.try_claim(held, "a04", "agent/a04/x")     # active lease -> untouched
+    in_review = mem.create_task("in review with live MR")
+    mr = mem.open_review(in_review, "MR", "b", author="a05",
+                         branch="agent/a05/x", files=[])
+    mem.set_review_verdict(mr, "changes_requested", "a07", "please fix")
+    assert src.repair_orphan_tasks() == []
+    assert mem.get_task(held)["status"] == "claimed"
+    assert mem.get_task(in_review)["status"] == "in_review"
+
+
+def test_repair_orphan_tasks_reopens_in_review_without_live_mr(settings, mem):
+    src = TaskSource(mem, settings)
+    stalled = mem.create_task("MR vanished")
+    mem.set_task_status(stalled, "in_review")
+    failed_mr = mem.open_review(stalled, "MR", "b", author="a05",
+                                branch="agent/a05/x", files=[])
+    mem.set_review_verdict(failed_mr, "failed", "a09", "tier-2 failed")
+    assert src.repair_orphan_tasks() == [stalled]
+    assert mem.get_task(stalled)["status"] == "open"
+
+
+def test_release_never_reopens_a_task_with_a_live_mr(mem):
+    """An in_review task has a live MR — release must not reopen it (P5)."""
+    tid = mem.create_task("reviewed work")
+    mr = mem.open_review(tid, "MR", "b", author="a04",
+                         branch="agent/a04/x", files=[])
+    mem.set_review_verdict(mr, "changes_requested", "a07", "fix")
+    policy = LocalClaimPolicy(mem, ttl_minutes=60)
+    policy.release(tid, "a04", "cycle ended without an MR")
+    assert mem.get_task(tid)["status"] == "in_review"
 
 
 def test_merge_queue_drains_approved_mrs_serially(mem):

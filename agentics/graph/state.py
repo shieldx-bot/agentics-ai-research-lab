@@ -54,6 +54,7 @@ class ResearchState(TypedDict, total=False):
     pr_url: str
     review_verdict: str            # approve | request_changes
     review_comment: str
+    rework_mr: int                 # set while reworking this changes_requested MR
     # control
     memory_context: dict[str, Any]
     yield_reason: str

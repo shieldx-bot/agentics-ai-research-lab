@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from agentics.config import Settings
-from agentics.policies.guard import ProtectedPathsGuard
+from agentics.policies.guard import INTEGRATOR_MERGE_ENV, ProtectedPathsGuard
 
 log = logging.getLogger("gh.workspace")
 
@@ -59,13 +59,17 @@ class RepoWorkspace:
             env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {basic}"
         return env
 
-    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _git(self, *args: str, check: bool = True,
+             extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         # Only network operations receive the credential. Local commands (especially
         # commit hooks) must not inherit a token they do not need.
         network_ops = {"fetch", "push", "pull", "ls-remote"}
         env = self._git_env() if args and args[0] in network_ops else self._command_environment()
+        if extra_env:
+            env = {**env, **extra_env}
         proc = subprocess.run(
             ["git", *args], cwd=self.path, capture_output=True, text=True, env=env,
+            check=False,
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
@@ -92,6 +96,24 @@ class RepoWorkspace:
 
     def checkout_new_branch(self, branch: str) -> None:
         self._git("checkout", "-B", branch)
+
+    def checkout_branch_from_origin(self, branch: str) -> None:
+        """Rework: resume a previously pushed branch instead of resetting to main.
+
+        The branch restarts from its origin head, so the already-reviewed work
+        is kept and the author only adds the fixes the review asked for. A
+        branch that was never pushed (or was deleted) falls back to a fresh one.
+        """
+        self.ensure_cloned()
+        fetch = self._git("fetch", "origin", branch, check=False)
+        verified = (
+            self._git("rev-parse", "--verify", f"origin/{branch}", check=False)
+            if fetch.returncode == 0 else None
+        )
+        if verified is not None and verified.returncode == 0:
+            self._git("checkout", "-B", branch, f"origin/{branch}")
+        else:
+            self._git("checkout", "-B", branch)
 
     # ------------------------------------------------------------ content
     def _resolve_workspace_path(self, rel_path: str) -> Path:
@@ -218,7 +240,15 @@ class RepoWorkspace:
         return files
 
     # ------------------------------------------------------------ push
-    def commit_and_push(self, branch: str, message: str) -> bool:
+    def commit_and_push(self, branch: str, message: str,
+                        allow_protected: bool = False) -> bool:
+        """Commit the working tree and push the agent branch.
+
+        ``allow_protected=True`` marks a push sanctioned by the OWNER (a task
+        carrying `agentics.cli allow-protected`): the P10 origin hook then lets
+        the branch through even if it touches protected paths. The flag travels
+        as an env var on this one push only — agent code cannot forge it
+        (git subprocesses run with a scrubbed environment)."""
         self._git("add", "-A")
         proc = self._git("status", "--porcelain", check=False)
         if not proc.stdout.strip():
@@ -231,7 +261,8 @@ class RepoWorkspace:
         if rebase.returncode != 0:
             self._git("rebase", "--abort", check=False)
             raise RuntimeError("rebase conflict — caller must yield (P3/P4)")
-        push = self._git("push", "-u", "origin", branch, check=False)
+        push = self._git("push", "-u", "origin", branch, check=False,
+                         extra_env={INTEGRATOR_MERGE_ENV: "1"} if allow_protected else None)
         if push.returncode != 0:
             raise RuntimeError(f"push failed: {push.stderr[:400]}")
         log.info("[%s] pushed branch %s", self.agent_id, branch)
@@ -252,7 +283,8 @@ class RepoWorkspace:
             if merge.returncode != 0:
                 self._git("merge", "--abort", check=False)
                 return False
-            push = self._git("push", "origin", "merge/tmp:main", check=False)
+            push = self._git("push", "origin", "merge/tmp:main", check=False,
+                             extra_env={INTEGRATOR_MERGE_ENV: "1"})
             if push.returncode != 0:
                 # someone moved main between fetch and push -> not a fast-forward
                 log.warning("[%s] push merge/tmp:main failed: %s",
