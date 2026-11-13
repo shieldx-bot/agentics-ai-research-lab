@@ -240,3 +240,33 @@ Pinned by `tests/test_replay.py` (engine), `tests/test_protocol_code.py`
 (storage precondition) and `tests/test_replay_wiring.py` (live-cycle wiring:
 on-schedule sweep, off-schedule skip, zero-off, drift falsification
 correcting verified_knowledge, and a broken protocol never breaking the scan).
+
+## 8. Re-verification (P23): settled claims must survive being re-run
+
+A ledger nobody re-checks is a diary. The replay layer lets the owner (or a
+supervisor sweep) re-run SETTLED claims from the protocol source stored with
+the hypothesis (`hypotheses.protocol_code`), in a fresh `owner-replay`
+workspace — so replication survives P21 workspace pruning:
+
+```bash
+python -m agentics.cli verify-all            # replicate newest settled claims
+```
+
+Each replay records fresh evidence (method='replay'), bumps the claim's
+`attempts`, and re-settles the hypothesis:
+
+| replay outcome | journal event | effect |
+| --- | --- | --- |
+| same verdict | `claim_reconfirmed` | attempts++ — the claim has survived N scrutinies |
+| supported → refuted | `claim_falsified` | drift: `verified_knowledge` is corrected automatically |
+| refuted → supported | `claim_overturned` | the original refutation was wrong (or the code improved) |
+| now inconclusive | `claim_unstable` | protocol no longer runs deterministically — reviewer decides |
+
+**Contradiction alerts:** when ANOTHER hypothesis with the SAME criterion
+settles to the OPPOSITE verdict, `update_hypothesis` journals
+`claim_contradiction` — the swarm disagreed with itself on a measurable fact
+and the owner/panel arbitrates. A replay flipping its own row is drift, not
+disagreement, and does not alert.
+
+Tests: `tests/test_protocol_code.py`, `tests/test_replay.py` (including a
+real bare-origin/clone integration run — the exact `verify-all` sequence).
