@@ -245,6 +245,23 @@ CREATE TABLE IF NOT EXISTS role_prompts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_role_prompts_active
     ON role_prompts(role, category) WHERE status='active';
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    purpose TEXT NOT NULL DEFAULT '',       -- research | plan | implement | review | ...
+    ok INTEGER NOT NULL DEFAULT 1,          -- 1 = answered, 0 = provider failure
+    duration_s REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts, agent);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    event TEXT NOT NULL,                    -- merge | mr_reject | task_exempt | ...
+    detail TEXT NOT NULL DEFAULT ''         -- JSON, never trimmed, never rewritten
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 """
 
 
@@ -252,6 +269,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_role_prompts_active
 # rows every N inserts (never on each write — trimming is a rare bulk DELETE).
 _JOURNAL_TRIM_EVERY = 500
 _JOURNAL_KEEP_ROWS = 5000
+
+# P18 — LLM usage ledger self-trims the same way (the budget window only
+# needs recent rows; fail-streak scans the newest 50 of whatever remains).
+_LLM_USAGE_KEEP_ROWS = 5000
 
 # Evidence rows (P16 records wired in for hypothesis 3) self-trim the same way.
 _EVIDENCE_TRIM_EVERY = 500
@@ -576,6 +597,92 @@ class SharedMemory:
                 "SELECT verdict, COUNT(*) FROM evidence GROUP BY verdict"
             ).fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------- llm_usage (P18, budget)
+    def record_llm_call(self, agent: str, purpose: str, ok: bool,
+                        duration_s: float = 0.0) -> None:
+        """One LLM request made by one agent (P18 budget ledger). Self-trims
+        like the journal: the budget window only needs recent rows."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO llm_usage (ts, agent, purpose, ok, duration_s)"
+                " VALUES (?,?,?,?,?)",
+                (time.time(), agent, purpose[:60], 1 if ok else 0,
+                 float(duration_s)),
+            )
+            self._conn.execute(
+                "DELETE FROM llm_usage WHERE id NOT IN"
+                " (SELECT id FROM llm_usage ORDER BY id DESC LIMIT ?)",
+                (_LLM_USAGE_KEEP_ROWS,),
+            )
+
+    def llm_calls_in_window(self, window_s: float = 3600.0,
+                            agent: str | None = None) -> int:
+        """Calls made lab-wide (or by one agent) inside the sliding window —
+        the shared pool is what gets capped: every agent drains the SAME
+        cookie/quota pool, so the cap must be pool-wide too."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM llm_usage WHERE ts > ?"
+                + (" AND agent=?" if agent else ""),
+                (time.time() - window_s, agent) if agent
+                else (time.time() - window_s,),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def llm_fail_streak(self, agent: str) -> int:
+        """Consecutive failed calls by one agent (newest backwards) — the
+        circuit breaker counts provider failures, not 'answered but slow'."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ok FROM llm_usage WHERE agent=? ORDER BY id DESC LIMIT 50",
+                (agent,),
+            ).fetchall()
+        streak = 0
+        for (ok,) in rows:
+            if ok:
+                break
+            streak += 1
+        return streak
+
+    def last_llm_ok_ts(self, agent: str) -> float | None:
+        """When the agent last got a real answer — breaker cooldown anchor."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) FROM llm_usage WHERE agent=? AND ok=1", (agent,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    # ------------------------------------------------- audit_log (P19, immutable)
+    def audit(self, agent: str, event: str, detail: dict | str = "") -> int:
+        """Append ONE row to the immutable audit log (P19).
+
+        Unlike the journal (trimmed feed) and evidence (trimmed ledger), this
+        table is NEVER trimmed and never updated in place: it is the lab's
+        compliance trail for the actions that change what gets merged, what
+        gets exempted, and what gets re-judged. Returns the row id."""
+        if isinstance(detail, dict):
+            detail = json.dumps(detail, ensure_ascii=False)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO audit_log (ts, agent, event, detail) VALUES (?,?,?,?)",
+                (time.time(), agent, event[:80], str(detail)[:2000]),
+            )
+            return int(cur.lastrowid or 0)
+
+    def audit_recent(self, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, agent, event, detail FROM audit_log"
+                " ORDER BY id DESC LIMIT ?", (int(limit),),
+            ).fetchall()
+        return [{"ts": r[0], "agent": r[1], "event": r[2], "detail": r[3]}
+                for r in rows]
+
+    def audit_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+        return int(row[0] if row else 0)
 
     # ------------------------------------------------- hypotheses (P16bis)
     def add_hypothesis(

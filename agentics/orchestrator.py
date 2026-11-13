@@ -24,6 +24,7 @@ from agentics.llm.errors import is_auth_failure
 from agentics.llm.session_host import BrowserSessionHost
 from agentics.local_ops import LocalClaimPolicy, LocalMergeQueue, LocalOps
 from agentics.memory.personal_memory import PersonalMemory
+from agentics.policies.budget import BudgetPolicy
 from agentics.memory.shared_memory import SharedMemory
 from agentics.memory.vector_store import VectorStore
 from agentics.policies.ownership import OwnershipPolicy
@@ -157,6 +158,13 @@ class Orchestrator:
                 claims=LocalClaimPolicy(self.memory, self.settings.claim_ttl_minutes),
                 merge_queue=LocalMergeQueue(
                     self.memory, self.settings.auto_merge, guard=self.local.guard),
+                budget=BudgetPolicy(
+                    self.memory,
+                    max_calls_per_hour=self.settings.llm_max_calls_per_hour,
+                    fail_streak_limit=self.settings.llm_fail_streak_limit,
+                    cooldown_s=self.settings.llm_breaker_cooldown_s,
+                    agent_id=agent_id,
+                ),
                 meta={"account": getattr(first, "name", "shared"), "personal": personal},
             )
             contexts.append(ctx)

@@ -12,6 +12,7 @@ import json
 import logging
 import shlex
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,18 +105,40 @@ async def _llm_ask(
     exhausted pool) must NOT kill the LangGraph task — it is recorded in
     ``state["error"]`` so the cycle degrades to `reflect` (claim released,
     trace + personal lesson written) and the swarm retries next cycle.
+
+    P18 — budget gate: every ask passes the shared BudgetPolicy (pool-wide
+    hourly cap + per-agent circuit breaker) and is recorded in `llm_usage`
+    either way, so a runaway agent is a bounded event, not an infinite burn.
     """
     if ctx.llm is None:
         if state is not None:
             state["error"] = "no LLM account available"
         return "", []
+    budget = getattr(ctx, "budget", None)
+    started = time.monotonic()
+    if budget is not None:
+        allowed, why = budget.can_ask(ctx.agent_id)
+        if not allowed:
+            log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
+            if state is not None and not state.get("error"):
+                state["error"] = f"P18 budget: {why}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "budget_blocked",
+                                   {"purpose": purpose, "why": why[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return "", []
     try:
         system = await resolve_system_prompt(ctx, state)
         resp = await ctx.llm.ask(
             prompt, mode=mode, purpose=purpose, system=system
         )
+        if budget is not None:
+            budget.record(ctx.agent_id, purpose, True, time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
+        if budget is not None:
+            budget.record(ctx.agent_id, purpose, False, time.monotonic() - started)
         if state is not None and not state.get("error"):
             state["error"] = f"llm {purpose} call failed: {exc}"
         return "", []
@@ -452,13 +475,35 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     if ctx.llm is None:
         return await _free_tools_fallback(ctx, state, topic,
                                           reason="no LLM account available")
+    # P19 — research calls bypass _llm_ask (provider routing differs), so the
+    # budget gate and the usage ledger are applied here as well. A BLOCKED ask
+    # still falls back to the free tools: the owner keeps getting research
+    # without burning a single budgeted call.
+    budget = getattr(ctx, "budget", None)
+    if budget is not None:
+        allowed, why = budget.can_ask(ctx.agent_id)
+        if not allowed:
+            log.warning("[%s] research blocked by budget: %s", ctx.agent_id, why)
+            try:
+                ctx.memory.journal(ctx.agent_id, "budget_blocked",
+                                   {"purpose": "research", "why": why[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return await _free_tools_fallback(ctx, state, topic,
+                                              reason=f"P19 budget: {why}")
+    import time as _time
+    _t0 = _time.monotonic()
     resp = None
     llm_error = ""
     try:
         resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
         log.warning("[%s] research llm call failed: %s", ctx.agent_id, exc)
+        if budget is not None:
+            budget.record(ctx.agent_id, "research", False, _time.monotonic() - _t0)
         llm_error = f"research llm call failed: {exc}"
+    if budget is not None and resp is not None and resp.ok:
+        budget.record(ctx.agent_id, "research", True, _time.monotonic() - _t0)
     if resp is None or not resp.ok:
         return await _free_tools_fallback(
             ctx, state, topic,

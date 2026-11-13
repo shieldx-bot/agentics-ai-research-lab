@@ -30,6 +30,7 @@ class AgentContext:
     gh: object | None = None               # legacy github-mode client (dormant)
     claims: object | None = None           # LocalClaimPolicy (or legacy ClaimPolicy)
     merge_queue: object | None = None      # LocalMergeQueue (or legacy MergeQueue)
+    budget: object | None = None           # P18 BudgetPolicy (LLM budget + breaker)
     cycle: int = 0
     meta: dict = field(default_factory=dict)
 
