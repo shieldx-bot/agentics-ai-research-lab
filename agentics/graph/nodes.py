@@ -718,9 +718,15 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     # H3: the research LLM must know what the swarm already PROVED by running
     # code — supported facts are common ground, refuted claims are dead ends.
     knowledge = verified_knowledge_text(ctx)
+    # The query carries the issue's own problem statement (bounded excerpt),
+    # not just the title + a fixed recipe — the body is where the concrete
+    # constraints live. Dedup still keys on the title-based topic, so this
+    # cannot weaken the P7 skip guard.
+    body = (state.get("issue_body") or "").strip()
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
+        + (f"\n\nProblem statement from the issue:\n{body[:400]}" if body else "")
         + (f"\n\n{knowledge}" if knowledge else "")
     )
     # P7: dedup — skip if the swarm already covered this. When the vector
@@ -1254,6 +1260,47 @@ def normalize_verify_cmds(cmds: list) -> list[list[str]]:
     return out[:5]
 
 
+def _implement_brief(state: ResearchState, plan: dict) -> str:
+    """The planner's OWN words, carried into every per-file implement ask.
+
+    The per-file prompt used to be a fixed minimal template: the implementer
+    wrote code without knowing why the plan exists or what will judge it.
+    Now the prompt is conditioned on the model's own proposal — the declared
+    approach, the P16 checks that will run against the code and the
+    pre-registered hypotheses — everything the planner itself wrote, bounded
+    by defensive caps. An empty brief (a minimal/legacy plan) reproduces the
+    old prompt byte for byte."""
+    parts: list[str] = []
+    approach = str(state.get("plan_approach")
+                   or plan.get("approach") or "").strip()
+    if approach:
+        parts.append(
+            "Your declared approach (from your own plan — follow it):\n"
+            + approach[:700])
+    cmds = [str(c) for c in (plan.get("verify_cmds") or [])
+            if str(c).strip()][:5]
+    if cmds:
+        parts.append(
+            "These checks WILL run against this code (P16 — the verdict "
+            "comes from their exit codes, so make them pass by doing the "
+            "real work, never by faking output):\n"
+            + "\n".join(f"- {c[:160]}" for c in cmds))
+    hyps = [h for h in (plan.get("hypotheses") or [])
+            if isinstance(h, dict)][:2]
+    if hyps:
+        lines = []
+        for h in hyps:
+            claim = str(h.get("claim", ""))[:200]
+            pred = str(h.get("prediction", ""))[:200]
+            lines.append(f"- claim: {claim}"
+                         + (f" | predicted: {pred}" if pred else ""))
+        parts.append(
+            "Hypotheses the lab will measure on this code (P16 protocol — "
+            "pre-registered criteria, run twice and re-adjudicated):\n"
+            + "\n".join(lines))
+    return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+
 async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: write code from plan into a local branch, run tests, push (P2/P3/P10)."""
     branch = state["branch"]
@@ -1265,6 +1312,10 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
     plan = json.loads(state.get("plan") or "{}")
+    # The implement prompt is conditioned on the model's OWN proposal, not a
+    # fixed template: every per-file ask carries the approach the planner
+    # declared and the P16 checks/hypotheses that will judge the code.
+    brief = _implement_brief(state, plan)
     for spec in plan.get("files", []):
         if state.get("error"):           # LLM died mid-plan: push nothing
             state["done"] = True
@@ -1280,6 +1331,7 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         prompt = (
             f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
+            f"{brief}"
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
