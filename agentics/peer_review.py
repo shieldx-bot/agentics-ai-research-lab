@@ -1,4 +1,4 @@
-"""P18 — the peer panel: agents evaluate each OTHER's work by vote.
+"""P19 — the peer panel: agents evaluate each OTHER's work by vote.
 
 Motivation (owner): "cải tiến cơ chế tự đánh giá lẫn nhau, nhằm cải thiện
 kết quả chung — nếu kết quả bỏ phiếu chỉ cần agent không chấp nhận, hoặc
@@ -119,7 +119,7 @@ class PeerPanel:
         if panel["state"] == DEFENSE and panel["due_ts"]:
             left = max(0, int(panel["due_ts"] - self._now()))
             due = f", defense due in {left // 60}m"
-        return (f"P18 panel !#{mr_id} r{panel['round']} {panel['state']} "
+        return (f"P19 panel !#{mr_id} r{panel['round']} {panel['state']} "
                 f"[{breakdown}]{due}")
 
     # ------------------------------------------------------------ voting
@@ -211,7 +211,7 @@ class PeerPanel:
 
     def _approve(self, mr_id: int, voters: list[str], note: str = "") -> PanelDecision:
         by = f"panel[{','.join(voters)[:200]}]"
-        comment = f"P18 unanimous panel: {voters}"
+        comment = f"P19 unanimous panel: {voters}"
         if note.strip():
             comment = f"{comment} — {note[:400]}"
         self.memory.set_review_verdict(mr_id, "approved", by, comment)
@@ -239,7 +239,7 @@ class PeerPanel:
                              "task": (mr or {}).get("task_id")})
         self.memory.post_message(
             by, "alert",
-            f"P18 panel REJECTED MR #{mr_id} (final): {reason[:200]}",
+            f"P19 panel REJECTED MR #{mr_id} (final): {reason[:200]}",
             (mr or {}).get("task_id"),
         )
         panel = self.memory.get_panel(mr_id)
@@ -290,7 +290,7 @@ class PeerPanel:
                             {"mr": mr_id, "covers": list(rebuttals)[:10]})
         self.memory.post_message(
             author, "broadcast",
-            f"P18 defense of MR #{mr_id} submitted — objectors {list(rebuttals)[:5]} "
+            f"P19 defense of MR #{mr_id} submitted — objectors {list(rebuttals)[:5]} "
             "re-vote now (one reject ends the MR).",
             mr.get("task_id"),
         )

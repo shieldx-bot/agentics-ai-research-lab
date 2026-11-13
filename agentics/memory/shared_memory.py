@@ -201,7 +201,7 @@ CREATE TABLE IF NOT EXISTS hypotheses (
     attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status);
--- P18 — peer panel review: agents evaluate each OTHER's MRs by vote. The
+-- P19 — peer panel review: agents evaluate each OTHER's MRs by vote. The
 -- panel state machine lives here so every thread (and the dashboard) reads
 -- the same truth: who voted, what was objected, what was defended.
 CREATE TABLE IF NOT EXISTS mr_panels (
@@ -1224,7 +1224,7 @@ class SharedMemory:
         fields are cleared so the (possibly different) reviewer starts fresh.
         The task goes back to in_review if it was parked elsewhere.
 
-        P18: an MR whose panel is in the defense round can NOT be reopened —
+        P19: an MR whose panel is in the defense round can NOT be reopened —
         the author must submit the defense (submit_defense); silently flipping
         the MR back to 'open' would bypass the panel's veto.
         """
@@ -1250,11 +1250,11 @@ class SharedMemory:
         self.journal(author, "mr_reopened", {"mr": mr_id, "task": task_id})
         return True
 
-    # ------------------------------------------------------------ P18 peer panels
+    # ------------------------------------------------------------ P19 peer panels
     def ensure_panel(self, mr_id: int, opened_ts: float | None = None) -> dict:
         """Create the panel row for an MR if missing (voting, round 1); return it.
 
-        Idempotent and lazy: legacy MRs opened before P18 get a panel the first
+        Idempotent and lazy: legacy MRs opened before P19 get a panel the first
         time any reviewer touches them, so no migration backfill is needed."""
         with self._lock, self._conn:
             self._conn.execute(

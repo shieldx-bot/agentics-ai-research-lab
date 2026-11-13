@@ -201,7 +201,7 @@ def test_reviewer_tier2_fail_rejects_without_llm(tmp_path, monkeypatch):
     assert out["mechanical_review"].startswith("fail")
     assert "Mechanical review failed" in out["review_comment"]
     assert prompts == []                       # zero LLM tokens spent
-    assert mem.get_panel(mr_id)["state"] == "defense"       # P18: author must defend
+    assert mem.get_panel(mr_id)["state"] == "defense"       # P19: author must defend
 
 
 def test_reviewer_tier2_pass_then_llm_approve_prefixes_comment(tmp_path, monkeypatch):

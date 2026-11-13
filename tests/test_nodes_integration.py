@@ -498,7 +498,7 @@ def test_reviewer_never_reviews_own_mr(mem):
 
 def test_reviewer_cannot_approve_mr_touching_protected_paths(mem, monkeypatch):
     """P10 layer 3 (review side): the reject vote opens the defense round —
-    the MR can never pass while the objection stands (P18)."""
+    the MR can never pass while the objection stands (P19)."""
     mr_id = _mr(mem, author="a04", files=("agentics/policies/claims.py",))
     _llm_json(monkeypatch, payload={"verdict": "approve", "comment": "ok"})
     state = asyncio.run(nodes.node_review(_ctx(mem, role=Role.REVIEWER, agent_id="a07"), {}))

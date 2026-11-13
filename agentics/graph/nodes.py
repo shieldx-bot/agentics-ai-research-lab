@@ -56,7 +56,7 @@ STOP_YIELD = "yield"
 
 
 def _panel_engine(ctx: AgentContext) -> PeerPanel:
-    """P18 engine wired from the ctx. The orchestrator injects ctx.panel;
+    """P19 engine wired from the ctx. The orchestrator injects ctx.panel;
     tests and older callers get one built on the fly (same rulebook)."""
     injected = getattr(ctx, "panel", None)
     if injected is not None:
@@ -190,7 +190,7 @@ def node_start(ctx: AgentContext, state: ResearchState) -> ResearchState:
         Role.REVIEWER: "review",
         Role.INTEGRATOR: "integrate",
     }.get(ctx.role, "idle")
-    # P18: defending my challenged MR outranks the default action — one
+    # P19: defending my challenged MR outranks the default action — one
     # unanswered objection rejects the MR for good, so the author goes first.
     try:
         if pending_defense(ctx) is not None:
@@ -216,7 +216,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # so expired leases released above count as repaired orphans)
     tasks_src = getattr(getattr(ctx, "local", None), "tasks", None)
     repaired = tasks_src.repair_orphan_tasks() if tasks_src is not None else []
-    # P18 hygiene: defense deadlines and vanished-MR panels are swept the way
+    # P19 hygiene: defense deadlines and vanished-MR panels are swept the way
     # stale leases are — an undefended MR dies here, the task returns to the
     # open pool, and every agent sees why.
     try:
@@ -242,7 +242,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + (f" Stale file locks freed: {stale_locks}." if stale_locks else "")
         + (f" Repaired stalled task(s): {repaired}." if repaired else "")
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
-        + (f" P18 panel events: {len(swept_panels)}." if swept_panels else "")
+        + (f" P19 panel events: {len(swept_panels)}." if swept_panels else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     state["summary"] = summary
@@ -1195,7 +1195,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     branch that was ACTUALLY pushed (in its own workspace) and hard-rejects
     any MR whose real diff touches protected paths — no matter what the file
     list recorded by the author's workspace claims."""
-    # P18 — panel review: an MR is judged by a PANEL of peers, not one
+    # P19 — panel review: an MR is judged by a PANEL of peers, not one
     # reviewer. This agent votes only when it is an eligible, not-yet-voted
     # member of the current round (round 2 belongs to the original objectors).
     engine = _panel_engine(ctx)
@@ -1440,7 +1440,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         # visibility: a green MR now says WHICH checks were reproduced)
         comment = f"{comment} {rerun_note}"
 
-    # P18 — the panel: this reviewer's verdict becomes ONE VOTE. One reject
+    # P19 — the panel: this reviewer's verdict becomes ONE VOTE. One reject
     # opens the defense round immediately; approval needs the panel's
     # unanimous accepts; after a defense, one objector still rejecting is
     # final (the engine handles every consequence).
@@ -1461,7 +1461,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
         due_s = int(max(0, (decision.panel.get("due_ts") or 0) - time.time()))
         ctx.memory.post_message(
             ctx.agent_id, "alert",
-            f"P18: MR #{mr_id} enters DEFENSE — author {candidate['author']} must "
+            f"P19: MR #{mr_id} enters DEFENSE — author {candidate['author']} must "
             f"answer EVERY objection within {due_s // 60}m or the MR is rejected "
             f"for good. Objections: {decision.reason[:300]}",
             candidate.get("task_id"),
@@ -1483,7 +1483,7 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
 
 def pending_defense(ctx: AgentContext) -> tuple[dict, dict] | None:
-    """My MR whose panel is in the defense round (P18 — I must defend it)."""
+    """My MR whose panel is in the defense round (P19 — I must defend it)."""
     try:
         for mr in ctx.memory.reviews_by_author(ctx.agent_id):
             panel = ctx.memory.get_panel(mr["id"])
@@ -1495,7 +1495,7 @@ def pending_defense(ctx: AgentContext) -> tuple[dict, dict] | None:
 
 
 async def node_defend(ctx: AgentContext, state: ResearchState) -> ResearchState:
-    """P18 — defend my MR: the panel raised objections, I answer EVERY one.
+    """P19 — defend my MR: the panel raised objections, I answer EVERY one.
 
     One shot per MR: the defense must cover each objection (keyed by the
     objector's id) and may attach fresh evidence from REAL runs; anything
@@ -1519,7 +1519,7 @@ async def node_defend(ctx: AgentContext, state: ResearchState) -> ResearchState:
     ctx.report(
         node="defend",
         intent={"goal": f"Defend MR #{mr_id} against {len(objections)} objection(s)",
-                "why": "P18: one unanswered objection rejects the MR for good",
+                "why": "P19: one unanswered objection rejects the MR for good",
                 "steps": []},
     )
     prompt = (

@@ -86,7 +86,7 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     g.set_entry_point("start")
 
     def route_from_start(state: ResearchState) -> str:
-        # P18: defending my challenged MR outranks every default role action —
+        # P19: defending my challenged MR outranks every default role action —
         # one unanswered objection rejects the MR, so the author goes first.
         try:
             if pending_defense(ctx) is not None:

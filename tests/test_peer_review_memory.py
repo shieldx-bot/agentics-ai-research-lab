@@ -1,4 +1,4 @@
-"""P18 — peer panel review: the shared-memory layer.
+"""P19 — peer panel review: the shared-memory layer.
 
 The panel state machine makes "agents evaluate each other" durable shared
 truth: every vote, objection and defense is a row every thread can read.
