@@ -383,9 +383,11 @@ class _FakeSessions:
         return _S()
 
     def list(self, _params):
-        class _R:
-            sessions = [type("D", (), {"id": sid, "status": "active"})()
-                        for sid in self.active_ids]
+        ids = list(self.active_ids)   # bind before the nested class (its
+        class _R:                     # self would be _R, not the fake)
+            def model_dump(self):     # their helper reads model_dump()
+                return {"sessions": [{"id": sid, "status": "active"}
+                                     for sid in ids]}
         return _R()
 
     def stop(self, sid):
@@ -451,18 +453,22 @@ def test_ensure_session_only_sweeps_on_the_session_cap_error(tmp_path, monkeypat
     assert fake.created == 1 and fake.stopped == []
 
 
-def test_ensure_session_raises_when_the_sweep_frees_nothing(tmp_path, monkeypatch):
+def test_ensure_session_retries_even_when_the_sweep_frees_nothing(tmp_path, monkeypatch):
+    """Their loop always retries once after the sweep — even when the server
+    lists no active sessions (a stop may still be propagating)."""
+    _stop_at_playwright(monkeypatch)
     fake = _FakeSessions(
         create_error=RuntimeError("Maximum number of active sessions (1) reached."),
         active_ids=(),                                # server lists nothing
     )
     client = _client_with(tmp_path, fake, monkeypatch)
-    with pytest.raises(RuntimeError, match="Maximum number of active sessions"):
+    with pytest.raises(RuntimeError, match="stop at playwright"):
         asyncio_run(client._ensure_session())
-    assert fake.created == 1
+    assert fake.created == 2                      # retried once regardless
 
 
 def test_sweep_tolerates_a_failing_stop(tmp_path, monkeypatch):
     fake = _FakeSessions(stop_ok=False, active_ids=("ghost",))
     client = _client_with(tmp_path, fake, monkeypatch)
-    assert asyncio_run(client._sweep_orphan_sessions()) == 0
+    assert asyncio_run(client._stop_leaked_sessions()) is None  # never raises
+    assert fake.stopped == []
