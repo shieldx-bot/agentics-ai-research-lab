@@ -25,6 +25,10 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
     ]))
     s = Settings()
     s.accounts_dir = acc
+    # Same isolation as test_session_host: the machine's .env/lab.yaml may
+    # run the lab on the hyperbrowser backend, but these unit tests assert
+    # raw-socket behaviour unless a case explicitly overrides it.
+    s.browser_backend = overrides.pop("browser_backend", "local")
     for k, v in overrides.items():
         setattr(s, k, v)
     return s

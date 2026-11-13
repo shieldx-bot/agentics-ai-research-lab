@@ -12,7 +12,8 @@ from pathlib import Path
 from agentics.memory.shared_memory import SharedMemory
 from agentics.peer_review import PeerPanel
 from agentics.swarm_eval import (_distinct_domains, attach_scalability,
-                                 evaluate_swarm, scalability_S, save_snapshot)
+                                 evaluate_swarm, percent_rows, scalability_S,
+                                 save_snapshot)
 
 
 def _seed_lab() -> SharedMemory:
@@ -203,6 +204,65 @@ def test_report_is_json_serializable_and_snapshots_roundtrip():
     assert snaps and snaps[0]["id"] == sid
     assert snaps[0]["agent_count"] == report["agents_active"]
     assert snaps[0]["report"]["groups"] == report["groups"]
+
+
+def test_percent_rows_map_to_percent_scale():
+    mem = _seed_lab()
+    rows = percent_rows(evaluate_swarm(mem))
+    by = {(r["group"], r["metric"]): r for r in rows}
+    # rate -> direct x100 (2 merged of 3 judged)
+    tc = by[(1, "Tỷ lệ hoàn thành nhiệm vụ")]
+    assert tc["pct"] == 66.7 and tc["raw"] == "2/3"
+    # mean panel rounds against the P19 cap of 2 (1.5/2)
+    assert by[(2, "Vòng vote trung bình (tối đa 2)")]["pct"] == 75.0
+    # rejected_why share of decided panels (1 objector_unmoved of 2)
+    why = by[(5, "Lý do reject: objector_unmoved")]
+    assert why["pct"] == 50.0 and why["raw"] == "1/2"
+    # no replications decided yet -> honest None, never a faked %
+    assert by[(4, "Replication kiểm chứng (P24)")]["pct"] is None
+    # count without a natural denominator keeps '—'
+    assert by[(1, "Số nhóm việc (category)")]["pct"] is None
+    # every row carries a reading guide and a health direction
+    assert all(r["hint"] and isinstance(r["good_high"], bool) for r in rows)
+
+
+def test_percent_rows_survive_empty_lab():
+    rows = percent_rows(evaluate_swarm(SharedMemory(Path(":memory:"))))
+    assert rows
+    # nothing measurable -> only the coverage/diversity guards yield 0.0,
+    # every other metric keeps the honest '—'
+    assert all(r["pct"] in (None, 0.0) for r in rows)
+
+
+def test_system_seeders_are_not_swarm_members():
+    mem = SharedMemory(Path(":memory:"))
+    mem.heartbeat("a01", "coder", 1, status="idle")
+    mem.journal("a01", "cycle_done",
+                {"cycle": 1, "summary": "s", "outcome": "merged"})
+    mem.journal("seed", "task_created", {"task": 1})
+    mem.journal("supervisor", "backlog_top_up", {"task": 2})
+    r = evaluate_swarm(mem)
+    assert r["agents_active"] == 1
+    assert r["agents_active_names"] == ["a01"]
+
+
+def test_cli_swarm_eval_percent_view(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+    from agentics import cli
+    from agentics.config import Settings
+
+    s = Settings(data_dir=tmp_path / "data")
+    s.ensure_dirs()
+    mem = SharedMemory(s.db_path)
+    _seed_into(mem)
+    mem.close()
+    monkeypatch.setattr(cli, "_settings", lambda: s)
+    result = CliRunner().invoke(
+        cli.app, ["swarm-eval", "--percent", "--no-save"])
+    assert result.exit_code == 0, result.output
+    assert "Bảng % tổng hợp" in result.output
+    assert "67%" in result.output          # 2/3 completion
+    assert "75%" in result.output          # 1.5 panel rounds / 2
 
 
 def test_cli_swarm_eval_renders_and_saves(monkeypatch, tmp_path):
