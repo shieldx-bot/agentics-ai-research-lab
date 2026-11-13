@@ -455,3 +455,42 @@ Test: `tests/test_peer_review.py` (18 kịch bản luật),
 `tests/test_peer_review_memory.py`, `tests/test_cli_panel.py` (lệnh owner),
 `tests/test_nodes_integration.py`
 (vote mở defense), `tests/test_dashboard_api.py` (owner nhìn thấy panel).
+
+## P24bis — Lặp lại độc lập (independent replication): claim 'supported' phải sống sót qua tay một agent KHÁC
+
+Một verdict 'supported' từng chỉ dựa trên MỘT agent chạy protocol: gate
+dedup (P16bis) khiến mọi agent khác CHỈ tái sử dụng kết quả đó, nên một
+protocol lỗi (hoặc bị gian lận) đầu độc `verified_knowledge` vĩnh viễn.
+Khoa học sửa điều này bằng replication — và replication phải ĐỘC LẬP:
+tác giả không thể tự xác nhận claim của chính mình (tinh thần P5, áp cho
+nghiên cứu).
+
+Bốn mảnh ghép trên CÙNG sổ cái (không tạo đường chấm điểm thứ hai):
+
+1. **Sổ cái chính tắc (P24)** — `hypotheses.replication` +
+   `hypotheses_needing_replication(agent)`: hàng đợi oldest-first, loại
+   tác giả, ngân sách thử lại 2 lần cho run flaky;
+   `record_replication(hyp_id, outcome)` ghi kết quả một lần/claim.
+2. **Provenance (P24bis)** — bảng `replications`:
+   AI lặp lại, đo được bao nhiêu, mỗi run thế nào, mất bao lâu — mỗi dòng
+   gắn với (evidence, replicator) duy nhất; một peer thứ hai được phép ghi
+   dòng của mình (đúng nghĩa ngân sách thử lại).
+3. **Engine** — `agentics/verify/replication.py`: peer dựng lại protocol
+   trong workspace CỦA MÌNH (không LLM), chạy đủ gate 2-run
+   (`verify_metrics.run_protocol`), máy chấm theo tiêu chí đóng băng.
+   Refuted → mở lại verdict evidence gốc + hạ claim xuống `refuted`
+   (mẫu P17); inconclusive → chỉ ghi chú, KHÔNG BAO GIỜ bác bỏ sai.
+4. **Chu kỳ sống** — `node_replicate` (route REVIEWER, ưu tiên sau
+   defense P19, trước review thường; knob `REPLICATION_LIMIT`, 0 = tắt) +
+   đường piggyback của researcher trong `node_verify`. Hai đường cùng ăn
+   một selector → đàn hội tụ về MỘT kết quả lặp lại/claim.
+
+Tiêu dùng (H3): `verified_knowledge()` gắn cờ `replicated` — prompt của
+mọi agent phân biệt `SUPPORTED` (tác giả xác nhận) với `SUPPORTED+`
+(independently replicated — loại mạnh nhất); dashboard có panel riêng
+(đếm + provenance); journal phát `replication_confirmed/_refuted/
+_inconclusive/_blocked`.
+
+Test: `tests/test_replication_memory.py`, `tests/test_replication_engine.py`,
+`tests/test_node_replicate.py`, `tests/test_replication_surfaces.py`
+(sổ cái chính tắc của P24: `tests/test_replication_ledger.py` — không đổi).

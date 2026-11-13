@@ -316,7 +316,19 @@ Composition with dedup (section 9): an agent that meets an already-settled
 claim replicates it once AND reuses the settled verdict — efficiency and
 trust do not compete.
 
+Consumption + routing (P24bis surfaces): `verified_knowledge()` carries a
+`replicated` flag — every agent's prompt annotates independently replicated
+claims as `SUPPORTED+ (independently replicated)`, the strongest kind of
+common ground; the dashboard has a Vietnamese "Lặp lại độc lập" panel
+(counts from the canonical ledger + provenance rows). Reviewers also carry
+a dedicated route (`node_replicate`, knob `REPLICATION_LIMIT`, default 1
+per reviewer cycle, 0 = off): pending replication outranks ordinary review
+(but never the P19 defense), so the trust work happens even when no new
+finding needs verifying.
+
 Tests: `tests/test_replication_ledger.py` (selection + bookkeeping),
 `tests/test_replication_memory.py`, `tests/test_replication_engine.py`,
-`tests/test_replication.py` (live node wiring, zero-LLM path), plus the
+`tests/test_replication.py` (live node wiring, zero-LLM path),
+`tests/test_node_replicate.py` (reviewer route + routing table),
+`tests/test_replication_surfaces.py` (prompt + dashboard), plus the
 dedup composition pinned in `tests/test_hypothesis_dedup.py`.

@@ -1166,6 +1166,22 @@ class SharedMemory:
                 "runs": json.loads(row[7] or "[]"), "note": row[8],
                 "duration_s": row[9]}
 
+    def recent_replications(self, limit: int = 12) -> list[dict]:
+        """Newest replication PROVENANCE rows (dashboard/CLI feed): who
+        independently re-ran which claim, what they measured, how long."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, evidence_id, hypothesis_id, replicator, verdict, "
+                "measured, runs, note, duration_s FROM replications "
+                "ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [{"id": r[0], "ts": r[1], "evidence_id": r[2],
+                 "hypothesis_id": r[3], "replicator": r[4], "verdict": r[5],
+                 "measured": json.loads(r[6] or "{}"),
+                 "runs": json.loads(r[7] or "[]"), "note": r[8],
+                 "duration_s": r[9]}
+                for r in rows]
+
     def replication_counts(self) -> dict[str, int]:
         """Swarm-wide replication stats for the dashboard/CLI (P24 ledger).
 

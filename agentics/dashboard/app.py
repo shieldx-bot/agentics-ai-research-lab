@@ -65,6 +65,13 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             "counts": memory.hypothesis_counts(),
             "recent": memory.list_hypotheses(limit=12),
         },
+        # P24bis — independent replication: who re-ran whose claim, machine
+        # verdict, measured metrics. The ledger counts follow the canonical
+        # hypotheses.replication column.
+        "replications": {
+            "counts": memory.replication_counts(),
+            "recent": memory.recent_replications(limit=12),
+        },
         # P21 — immutable trail (compliance) + P20 budget dial: how much of
         # the shared LLM pool the swarm has burned this hour.
         "audit": {"total": memory.audit_count(),
@@ -178,7 +185,10 @@ _HTML = """<!doctype html>
     <table id="evidence" style="margin-top:8px"><thead><tr><th>ID</th><th>Task</th><th>Agent</th><th>Verdict</th><th>Lệnh kiểm chứng</th><th>Exit</th></tr></thead><tbody></tbody></table></div>
   <div class="card" style="grid-column:1/-1"><h2>Giả thuyết đã đăng ký (P16bis — tiêu chí chốt TRƯỚC khi chạy, máy chấm sau khi đo)</h2>
     <div class="kv" id="hypcounts"></div>
-    <table id="hypotheses" style="margin-top:8px"><thead><tr><th>ID</th><th>Trạng thái</th><th>Giả thuyết</th><th>Tiêu chí</th><th>Đo được</th></tr></thead><tbody></tbody></table></div>
+    <table id="hypotheses" style="margin-top:8px"><thead><tr><th>ID</th><th>Trạng thái</th><th>Giả thuyết</th><th>Tiêu chí</th><th>Đo được</th><th>Lặp lại độc lập</th></tr></thead><tbody></tbody></table></div>
+  <div class="card" style="grid-column:1/-1"><h2>Lặp lại độc lập (P24bis — agent KHÁC tác giả chạy lại protocol, máy chấm, phát sóng cho cả đàn)</h2>
+    <div class="kv" id="repcounts"></div>
+    <table id="replications" style="margin-top:8px"><thead><tr><th>ID</th><th>H#</th><th>Agent lặp lại</th><th>Kết quả</th><th>Đo được</th><th>Thời gian (s)</th></tr></thead><tbody></tbody></table></div>
   <div class="card"><h2>Cảnh báo hệ thống (guard P10/P13/P14 · sửa chữa task · P16 nghi ngờ)</h2>
     <div class="acts" id="alerts"></div></div>
   <div class="card"><h2>Bộ nhớ (trí nhớ chung)</h2>
@@ -260,11 +270,26 @@ function render(s){
     const c = h.criterion || {};
     const crit = c.metric ? `${esc(c.metric)} ${esc(c.op)} ${c.target}` : '-';
     const measured = (h.verdict_note||'').replace(/^measured /,'');
+    const rep = h.replication || '';
     return `<tr><td>#${h.id}</td>
     <td><span class="pill ${h.status==='supported'?'merged':h.status==='refuted'?'failed':h.status==='proposed'?'open':'claimed'}">${esc(h.status)}</span></td>
     <td class="dt">${esc(h.claim)}</td><td class="dt">${crit}</td>
-    <td class="dt">${esc(measured||'-')}</td></tr>`;}).join("")
-    || '<tr><td colspan="5" class="kv">trống</td></tr>';
+    <td class="dt">${esc(measured||'-')}</td>
+    <td>${rep?`<span class="pill ${rep==='confirmed'?'merged':rep==='refuted'?'failed':'claimed'}">${esc(rep)}</span>`:'<span class="kv">chưa</span>'}</td></tr>`;}).join("")
+    || '<tr><td colspan="6" class="kv">trống</td></tr>';
+  const rep = s.replications || {counts:{}, recent:[]};
+  const rc = rep.counts || {};
+  document.getElementById("repcounts").innerHTML =
+    `<span class="pill merged">đã lặp lại: <b>${rc.replicated??0}</b></span> ` +
+    `<span class="pill failed">bị bác bỏ bởi peer: <b>${rc.refuted??0}</b></span> ` +
+    `<span class="pill claimed">đang chờ peer: <b>${rc.pending??0}</b></span>`;
+  document.querySelector("#replications tbody").innerHTML = (rep.recent||[]).map(r=>{
+    const m = r.measured && Object.keys(r.measured).length
+      ? JSON.stringify(r.measured) : '-';
+    return `<tr><td>#${r.id}</td><td>h#${r.hypothesis_id}</td><td>${esc(r.replicator)}</td>
+    <td><span class="pill ${r.verdict==='confirmed'?'merged':r.verdict==='refuted'?'failed':'claimed'}">${esc(r.verdict)}</span></td>
+    <td class="dt">${esc(m)}</td><td>${Number(r.duration_s).toFixed(1)}</td></tr>`;}).join("")
+    || '<tr><td colspan="6" class="kv">chưa có lần lặp lại độc lập nào — reviewer sẽ chạy lại claim cổ nhất còn thiếu peer (P24bis)</td></tr>';
   const alerts = s.alerts||[];
   document.getElementById("alerts").innerHTML = alerts.length
     ? alerts.slice().reverse().map(e=>`

@@ -18,6 +18,8 @@ agent chạy không giám sát dài ngày.
 | `INTEGRITY_INTERVAL_S` | `20` | P10 tầng 4b: chu kỳ watcher (0 = tắt) |
 | `PEER_PANEL_SIZE` | `2` | P18: số reviewer đồng thuận trước khi MR qua |
 | `PEER_DEFENSE_TTL_MINUTES` | `30` | P18: hạn tác giả bảo vệ MR bị phản đối |
+| `REPLAY_SWEEP_SIZE` | `2` | P23: số claim supervisor sweep chạy lại mỗi lần quét (0 = tắt) |
+| `REPLICATION_LIMIT` | `1` | P24bis: số claim reviewer lặp lại độc lập mỗi chu kỳ (0 = tắt) |
 
 Khuyến nghị production: giữ mặc định; hạ `LLM_MAX_CALLS_PER_HOUR` nếu pool
 cookie nhỏ; bật retention (mặc định đã bật).

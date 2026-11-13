@@ -165,13 +165,18 @@ def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
         return ""
     lines: list[str] = []
     for h in hyps:
-        mark = "SUPPORTED" if h["status"] == "supported" else "REFUTED"
+        # P24bis: an INDEPENDENTLY replicated claim is stronger common
+        # ground than an author-confirmed one — the prompt says so.
+        mark = ("SUPPORTED+ (independently replicated)"
+                if h["status"] == "supported" and h.get("replicated")
+                else "SUPPORTED" if h["status"] == "supported" else "REFUTED")
         note = f" — {h['note'][:110]}" if h.get("note") else ""
         lines.append(f"- [{mark}] {h['claim'][:180]} (h#{h['id']}{note})")
     if not lines:
         return ""
     return ("Empirically verified by this lab (exit-code verdicts, P16 — build on "
-            "SUPPORTED facts, never re-assert a REFUTED one):\n" + "\n".join(lines))[:1400]
+            "SUPPORTED facts, never re-assert a REFUTED one; SUPPORTED+ survived "
+            "an independent agent's re-run, the strongest kind):\n" + "\n".join(lines))[:1400]
 
 
 async def _llm_ask(
