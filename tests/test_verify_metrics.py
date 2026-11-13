@@ -95,7 +95,7 @@ def test_run_protocol_supported(tmp_path):
     script = _script(ws, f"print('running...')\nprint({RESULT_MARKER!r} "
                          "+ '{\"precision\": 0.93}')\n")
     ev = run_protocol(ws, script, Criterion("precision", ">=", 0.9))
-    assert ev.verdict == "supported" and ev.ok and ev.method == "protocol"
+    assert ev.verdict == "confirmed" and ev.ok and ev.method == "protocol"
     assert ev.meta["metrics"] == {"precision": 0.93}
     assert ev.meta["criterion"] == {"metric": "precision", "op": ">=", "target": 0.9}
     assert len(ev.meta["runs"]) == 2                      # rerun like a researcher
@@ -146,4 +146,4 @@ def test_run_protocol_single_run_when_repeat_one(tmp_path):
     ws = _workspace(tmp_path)
     script = _script(ws, f"print({RESULT_MARKER!r} + '{{\"f1\": 1.0}}')\n")
     ev = run_protocol(ws, script, Criterion("f1", "==", 1.0), repeat=1)
-    assert ev.verdict == "supported" and len(ev.meta["runs"]) == 1
+    assert ev.verdict == "confirmed" and len(ev.meta["runs"]) == 1

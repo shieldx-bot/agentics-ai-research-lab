@@ -208,15 +208,20 @@ def _protocol_evidence(script: str, exit_code: int, verdict: str, note: str,
                        runs: list[dict], metrics: dict,
                        output_parts: list[str], duration_s: float,
                        criterion: Criterion) -> Evidence:
-    """The combined Evidence row for one protocol verification (never raises)."""
+    """The combined Evidence row for one protocol verification (never raises).
+
+    Verdict vocabulary matches verify_ops (the EVIDENCE level: confirmed /
+    refuted / inconclusive); `supported` is the HYPOTHESIS level and is
+    derived from a confirmed criterion check by the caller."""
+    evidence_verdict = "confirmed" if verdict == "supported" else verdict
     combined = "\n---\n".join(output_parts)
     return Evidence(
         cmd=f"{script} ({criterion.describe()}; {len(runs)} run(s))",
         exit_code=int(exit_code),
-        verdict=verdict,
+        verdict=evidence_verdict,
         output=f"{combined}\n[{note}]"[-1500:],
         duration_s=duration_s,
-        ok=verdict == "supported",
+        ok=evidence_verdict == "confirmed",
         method="protocol",
         meta={"runs": runs, "metrics": metrics, "note": note,
               "criterion": criterion.as_dict()},

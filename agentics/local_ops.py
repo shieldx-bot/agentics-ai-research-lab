@@ -447,8 +447,10 @@ class LocalMergeQueue:
     performs the actual local merge into the bare repo's main. Both are
     supplied by the caller (node_integrate) because they need the Integrator's
     own workspace. When a P10 guard is provided, no MR whose diff touches
-    protected paths can ever leave this queue as "merged" — the last of the
-    three guard layers.
+    protected paths can ever leave this queue as "merged" — and with the
+    layer-4 `scan_branch` callback the verdict rests on the files the branch
+    actually changes (re-scanned in the Integrator's workspace), the last of
+    the four guard layers.
     """
 
     MAX_ATTEMPTS = 3
@@ -466,7 +468,16 @@ class LocalMergeQueue:
     def pending(self) -> list[dict]:
         return self.memory.mq_pending()
 
-    def drain(self, integrator_id: str, verify=None, merge=None) -> int:
+    def drain(self, integrator_id: str, verify=None, merge=None,
+              scan_branch=None) -> int:
+        """Drain pending MRs serially.
+
+        ``scan_branch(branch) -> list[str] | None`` (optional, P10 layer 4):
+        when supplied, the guard verdict rests on the files the branch
+        ACTUALLY changes (re-scanned in the Integrator's own workspace), not
+        on the file list recorded by the author's workspace at open_mr time.
+        Falls back to the recorded list when the callback returns None or
+        raises."""
         from agentics.memory import lifemem
 
         merged = 0
@@ -478,8 +489,17 @@ class LocalMergeQueue:
                 self._fail(item, integrator_id, "MR record vanished")
                 continue
             if self.guard is not None:
+                diff_files = review.get("files", [])
+                if scan_branch is not None:
+                    try:
+                        scanned = scan_branch(review["branch"])
+                        if scanned is not None:
+                            diff_files = scanned
+                    except RuntimeError as exc:
+                        log.warning("layer-4 re-scan of branch %s failed: %s",
+                                    review["branch"], exc)
                 violations = self.guard.check_task(
-                    self.memory, review.get("task_id"), review.get("files", []))
+                    self.memory, review.get("task_id"), diff_files)
                 if violations:
                     self._fail(
                         item, integrator_id,

@@ -78,10 +78,14 @@ class _FakeIssue:
 
 
 class _FakeRepo:
-    def __init__(self, issues, repo_id=701):
+    """Duck-typed repo WITH a stable identity — the only kind the shared
+    scan cache caches (see issue_ops.scan_open_issues: id()-keying poisons
+    the cache when CPython reuses a dead fake's address)."""
+
+    def __init__(self, issues, repo_id=42001):
         self._issues = issues
+        self.id = repo_id
         self.get_issues_calls = 0
-        self.id = repo_id          # stable identity -> the scan cache applies
 
     def get_issues(self, **kw):
         self.get_issues_calls += 1
@@ -89,8 +93,6 @@ class _FakeRepo:
 
 
 def test_scan_open_issues_cached_across_calls():
-    """Adapted to the stable-identity cache key (c90ded0): only objects with
-    a REAL ``repo.id`` are cached, so the fake carries one explicitly."""
     repo = _FakeRepo([_FakeIssue(1, "Fix a", labels=())])
     first = issue_ops.scan_open_issues(repo)
     second = issue_ops.scan_open_issues(repo)
@@ -99,11 +101,24 @@ def test_scan_open_issues_cached_across_calls():
 
 
 def test_scan_cache_distinguishes_repos_and_limits():
-    repo_a = _FakeRepo([_FakeIssue(1, "A")], repo_id=701)
-    repo_b = _FakeRepo([_FakeIssue(2, "B")], repo_id=702)
+    repo_a = _FakeRepo([_FakeIssue(1, "A")], repo_id=42002)
+    repo_b = _FakeRepo([_FakeIssue(2, "B")], repo_id=42003)
     assert issue_ops.scan_open_issues(repo_a)[0].number == 1
     assert issue_ops.scan_open_issues(repo_b)[0].number == 2
     assert repo_a.get_issues_calls == 1 and repo_b.get_issues_calls == 1
+
+
+def test_scan_cache_skips_identity_less_repos():
+    """Their c90ded0 contract: a duck-typed repo WITHOUT a stable id must NOT
+    poison the shared cache — every scan goes to the (fake) API."""
+    class NoIdRepo(_FakeRepo):
+        def __init__(self, issues):
+            super().__init__(issues)
+            del self.id
+    repo = NoIdRepo([_FakeIssue(1, "A")])
+    issue_ops.scan_open_issues(repo)
+    issue_ops.scan_open_issues(repo)
+    assert repo.get_issues_calls == 2
 
 
 def test_scan_cache_refresh_after_clear():
@@ -334,9 +349,7 @@ def _mem_ctx(tmp_path, role, llm):
         meta={"personal": FakePersonal()},
         settings=SimpleNamespace(research_topic="NFV automation"),
         heartbeat=lambda status="working": None,
-        # local-mode nodes publish live state via report(); a no-op keeps the
-        # resilience tests focused on the failure path
-        report=lambda *a, **k: None,
+        report=lambda **k: None,
     )
     return ctx, mem
 
@@ -361,22 +374,18 @@ def test_node_research_llm_failure_degrades_to_error_state(tmp_path):
 
 
 def test_node_review_llm_failure_skips_verdict(tmp_path):
-    """Local-mode review: the MR lives in the shared-memory reviews table.
-
-    Ported from the GitHub-PR fixture to the local MR flow (cd8b536): the
-    resilience contract is unchanged — a reviewer LLM failure must leave the
-    MR untouched (no verdict, nothing enqueued) and degrade to state["error"].
-    """
+    """Local-mode MR flow: reviewer's LLM dies -> no verdict, no enqueue,
+    the MR stays open for the next cycle (degrade, don't crash)."""
     ctx, mem = _mem_ctx(tmp_path, Role.REVIEWER, FlakyHost())
+    task_id = mem.create_task("work item", body="", category="code", agent="seed")
     mr_id = mem.open_review(
-        task_id=3, title="[a02] work (#3)", body="", author="shieldx-bot",
-        branch="agent/a02/task-3-work", files=[],
-    )
-    assert mr_id
+        task_id=task_id, title="[a02] work (#%d)" % task_id, body="",
+        author="a02", branch="agent/a02/task-%d-x" % task_id,
+        files=["docs/x.md"], verification="tier-1 passed")
     ctx.merge_queue = SimpleNamespace(
         enqueue=lambda *a, **k: pytest.fail("must not enqueue on failed review"))
     state = asyncio.run(nodes.node_review(ctx, {}))
     assert state["error"].startswith("llm review call failed:")
     assert state["done"] is True
     assert "review_verdict" not in state         # no verdict without the LLM
-    assert mem.get_review(mr_id)["status"] == "open"   # MR untouched, retried next cycle
+    assert mem.get_review(mr_id)["status"] == "open"

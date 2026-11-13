@@ -2,12 +2,17 @@
 
 Motivation (owner question 1): "Liệu các tác nhân có thể làm việc trực tiếp
 trong local mà không dẫn tới tình trạng AI sửa nhầm code agent?" — this guard
-is the answer's enforcement half. Four layers use it:
+is the answer's enforcement half. Five layers use it:
 
     1. RepoWorkspace.write_file  — a plan cannot even create/edit a protected file
     2. node_implement            — a diff that touches protected paths is yielded
-    3. LocalMergeQueue.drain     — a merge of a protected-path branch is refused
-    4. the bare origin's pre-receive hook (local_ops.origin_hook_script) — a
+    3. node_review               — the reviewer re-scans the pushed branch itself
+                                   and hard-rejects protected diffs before any
+                                   LLM cost is spent (see branch_files_vs_main)
+    4. LocalMergeQueue.drain     — the Integrator re-scans the pushed branch in
+                                   its own workspace; a merge of a protected-path
+                                   branch is refused
+    5. the bare origin's pre-receive hook (local_ops.origin_hook_script) — a
        raw push is judged at git receive-pack time by the same rulebook
 
 An exemption is granted ONLY by the owner, either per task

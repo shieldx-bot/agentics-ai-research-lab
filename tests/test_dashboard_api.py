@@ -128,3 +128,23 @@ def test_stop_button_present_in_dashboard_html(mem, settings):
 
     html = TestClient(create_app(mem, settings)).get("/").text
     assert "stopbtn" in html and "/stop" in html      # button + handler wired
+
+
+def test_state_includes_shared_evidence(mem, settings):
+    """P16 on the owner's dashboard: real runs, newest first, with histogram."""
+    mem.record_evidence("a02", 3, "python exp.py", 1, "refuted",
+                        hypothesis="linear beats quadratic")
+    mem.record_evidence("a04", 3, "python check.py", 0, "confirmed")
+    s = _state(mem, settings)
+    ev = s["evidence"]
+    assert ev["counts"] == {"refuted": 1, "confirmed": 1}
+    assert [r["id"] for r in ev["recent"]] == [2, 1]          # newest first
+    assert ev["recent"][0]["verdict"] == "confirmed"
+
+
+def test_evidence_card_present_in_dashboard_html(mem, settings):
+    from fastapi.testclient import TestClient
+
+    html = TestClient(create_app(mem, settings)).get("/").text
+    assert "Kiểm chứng thực nghiệm" in html
+    assert 'id="evidence"' in html and 'id="evcounts"' in html

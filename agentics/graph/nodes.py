@@ -10,23 +10,30 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, build_system_prompt, parse_json_block
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
-    EVOLUTION_ALLOWED_PATHS, build_evolution_issue, tool_context, trace_context,
-    evolution_path_allowed, valid_tool_name,
+    EVOLUTION_ALLOWED_PATHS,
+    build_evolution_issue,
+    evolution_path_allowed,
+    tool_context,
+    trace_context,
+    valid_tool_name,
 )
+from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
-from agentics.policies.intent import scope_violations
 from agentics.memory import lifemem
-from agentics.memory.vector_store import VectorStore
+from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
 from agentics.research import papers as papers_mod
-from agentics.graph.state import ResearchState
+from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
+from agentics.verify_ops import run_experiments, summarize
 
 log = logging.getLogger("graph.nodes")
 
@@ -44,7 +51,34 @@ def _memory_context(ctx: AgentContext) -> dict:
         "findings": "\n".join(
             f"- #{f['id']} {f['title']} (by {f['agent']})" for f in findings
         ) or "(empty)",
+        # H3: every agent's snapshot carries the swarm's settled knowledge —
+        # supported claims are reusable common ground, refuted ones are dead
+        # ends (rendered by verified_knowledge_text, below).
+        "verified": verified_knowledge_text(ctx) or "(nothing verified yet)",
     }
+
+
+def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
+    """H3 consumption side — the swarm's settled knowledge as prompt text.
+
+    Composes the memory layer's `verified_knowledge()` (settled hypotheses:
+    supported become reusable common ground, refuted stop being repeated)
+    with the newest evidence rows (real runs by real agents). Returns ""
+    when nothing has been verified yet, so prompts stay unchanged at cold
+    start. Bounded: a prompt must not drown in the lab's whole history."""
+    try:
+        hyps = ctx.memory.verified_knowledge(limit=limit)
+    except Exception:  # noqa: BLE001 — knowledge injection must never break a cycle
+        return ""
+    lines: list[str] = []
+    for h in hyps:
+        mark = "SUPPORTED" if h["status"] == "supported" else "REFUTED"
+        note = f" — {h['note'][:110]}" if h.get("note") else ""
+        lines.append(f"- [{mark}] {h['claim'][:180]} (h#{h['id']}{note})")
+    if not lines:
+        return ""
+    return ("Empirically verified by this lab (exit-code verdicts, P16 — build on "
+            "SUPPORTED facts, never re-assert a REFUTED one):\n" + "\n".join(lines))[:1400]
 
 
 async def _llm_ask(
@@ -310,9 +344,13 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         state["action"] = "plan"
         return state
     topic = state.get("issue_title") or ctx.settings.research_topic
+    # H3: the research LLM must know what the swarm already PROVED by running
+    # code — supported facts are common ground, refuted claims are dead ends.
+    knowledge = verified_knowledge_text(ctx)
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
+        + (f"\n\n{knowledge}" if knowledge else "")
     )
     # P7: dedup — skip if the swarm already covered this
     known = await papers_mod.dedup_query(ctx.vector, topic)
@@ -355,10 +393,130 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         state.get("issue_number"),
     )
     if ctx.role == Role.RESEARCHER:
-        state["done"] = True
-        state["summary"] = f"stored finding #{fid}"
+        # P16bis (H2): the finding's claims must be VERIFIED by running code,
+        # not trusted because an LLM wrote them — the cycle continues into
+        # node_verify, which pre-registers hypotheses and adjudicates.
+        state["finding_id"] = fid
+        state["finding_text"] = content[:4000]
+        state["action"] = "verify"
     else:
         state["action"] = "plan"
+    return state
+
+
+# ---------------------------------------------------------------- verify (P16bis)
+VERIFY_STATUS = {
+    "confirmed": "supported",
+    "refuted": "refuted",
+    "inconclusive": "inconclusive",
+}
+
+
+async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """Researcher (P16bis, H2): verify the finding's claims by RUNNING code.
+
+    Claims are pre-registered as hypotheses with a quantitative criterion
+    (metric/op/target); one self-contained protocol per claim is written into
+    experiments/ and executed twice through the guarded workspace runner;
+    the verdict is a machine comparison (measured vs criterion) — never an
+    LLM's opinion — and lands in shared evidence + verified knowledge (H3)."""
+    finding_text = state.get("finding_text") or ""
+    if not finding_text or ctx.llm is None:
+        state["summary"] = "verification skipped (no finding or no LLM)"
+        state["done"] = True
+        return state
+    ctx.report(
+        node="verify", task_id=state.get("issue_number"),
+        intent={
+            "goal": (f"Verify the claims of finding #{state.get('finding_id')} "
+                     "by running protocols"),
+            "why": "P16bis: verdicts from measurements, not model opinion",
+            "steps": ["extract claims", "register criteria", "run protocols",
+                      "record evidence"],
+            "expected_files": [],
+        },
+    )
+    prompt = (
+        f"Research finding to verify:\n{finding_text[:3000]}\n\n"
+        "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
+        "self-contained python simulation can check (simulate the method on "
+        "synthetic data, measure the metric). For each claim write its "
+        "protocol.\n\n"
+        f"{PROTOCOL_CONTRACT}\n"
+        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]}'
+    )
+    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    parsed = parse_json_block(answer)
+    specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:3]
+    if not specs:
+        state["summary"] = "no verifiable claim extracted; nothing verified this cycle"
+        state["done"] = True
+        return state
+
+    await asyncio.to_thread(ctx.workspace.sync_main)    # workspace must exist
+    results: list[dict] = []
+    for spec in specs:
+        claim = str(spec.get("claim", "")).strip()[:300]
+        criterion, malformed = None, ""
+        try:
+            criterion = Criterion.from_dict(spec)
+        except ValueError as exc:
+            malformed = str(exc)
+        protocol_code = str(spec.get("protocol", ""))
+        if not claim or criterion is None or not protocol_code.strip():
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": malformed or "malformed hypothesis spec"})
+            continue
+        hyp_id = await asyncio.to_thread(
+            ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
+            task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
+            status="testing")
+        path = f"experiments/verify_h{hyp_id}.py"
+        try:
+            await asyncio.to_thread(ctx.workspace.write_file, path, protocol_code)
+        except ValueError as exc:            # P10 layer 1: protected / traversal
+            await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                    "inconclusive", note=str(exc)[:300])
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": str(exc)[:200]})
+            continue
+        try:
+            ev = await asyncio.to_thread(run_protocol, ctx.workspace, path, criterion)
+        except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the cycle
+            await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                    "inconclusive", note=f"runner error: {exc}"[:300])
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": f"runner error: {exc}"[:200]})
+            continue
+        ev_id = await asyncio.to_thread(
+            ctx.memory.record_evidence, ctx.agent_id, state.get("issue_number"),
+            ev.cmd, ev.exit_code, ev.verdict,
+            hypothesis=claim, method=ev.method, output=ev.output,
+            duration_s=ev.duration_s, artifact=path)
+        await asyncio.to_thread(
+            ctx.memory.attach_protocol_outcome, ev_id,
+            ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
+        status = VERIFY_STATUS[ev.verdict]
+        note = str(ev.meta.get("note", ""))
+        await asyncio.to_thread(
+            ctx.memory.update_hypothesis, hyp_id, status,
+            evidence_id=ev_id, note=note, protocol_path=path)
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
+            {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
+             "note": note[:200], "evidence": ev_id,
+             "criterion": criterion.as_dict()},
+        )
+        results.append({"claim": claim, "status": status, "note": note,
+                        "hypothesis_id": hyp_id, "evidence_id": ev_id})
+    state["verifications"] = results
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+    state["summary"] = f"P16bis verified {len(results)} claim(s) [{breakdown}]"
+    state["done"] = True
     return state
 
 
@@ -373,6 +531,13 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         category=category)
     tools_txt = tool_context(
         ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}")
+    # H3: plans must stand on what the lab has PROVEN, not on fresh guesses —
+    # and the declared verify_cmds should re-check exactly the new claims.
+    knowledge_txt = verified_knowledge_text(ctx)
+    knowledge_rule = (f"\nVerified knowledge of this lab (P16, exit-code verdicts — "
+                      f"your plan must be consistent with these and your verify_cmds "
+                      f"must check the NEW claims):\n{knowledge_txt}\n"
+                      if knowledge_txt else "")
     evolution_rule = (
         "\nThis is a SELF-EVOLUTION issue: you may ONLY change these paths: "
         + ", ".join(EVOLUTION_ALLOWED_PATHS) + ".\n"
@@ -393,15 +558,24 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{evolution_rule}{rework_rule}\n"
+        f"{tools_txt}\n{evolution_rule}{rework_rule}{knowledge_rule}\n"
         "Propose a concrete implementation plan for this repo. Reply ONLY with "
         'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
         '"steps": ["..."], "commit_message": "...", '
-        '"reuses": ["<registered tool name you rely on>"], '
-        '"reusable_tools": [{"name": "snake_case_name", "path": "<file you create>", '
-        '"description": "what it does, in one line"}]} '
+        '"verify_cmds": ["<python -m pytest ... or python <workspace .py script> '
+        'that CHECKS the idea; exit 0 must mean the hypothesis holds>"], '
+        '"hypotheses": [{"hypothesis_id": "slug", "claim": "one testable claim", '
+        '"prediction": "what the measurement will show", '
+        '"metric": "snake_case_metric", "comparison": ">|>=|<|<=|==", '
+        '"threshold": 0.5, "code": "<FULL python source: writes '
+        'json.dumps({\\"value\\": <number>}) to '
+        'research_notes/experiments/results/<hypothesis_id>.json>"}]} '
         "('reuses' and 'reusable_tools' may be empty lists; only list a tool in "
-        "'reusable_tools' if it is a genuinely reusable utility.)"
+        "'reusable_tools' if it is a genuinely reusable utility. 'verify_cmds' "
+        "is how your idea gets VERIFIED by running real code instead of an LLM's "
+        "opinion — declare at least one check for a code task. 'hypotheses' "
+        "(optional, max 2) makes the claim MEASURABLE: the runner re-judges the "
+        "criterion from the result JSON, a lying script cannot pass.)"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
@@ -411,6 +585,10 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
     state["plan"] = json.dumps(parsed, ensure_ascii=False)[:8000]
     state["commit_message"] = parsed.get("commit_message", "update")
+    verify_cmds = [str(c) for c in (parsed.get("verify_cmds") or [])][:5]
+    state["verify_cmds"] = verify_cmds
+    hyp_raws = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:2]
+    state["hypotheses"] = hyp_raws
     reuses = [n for n in parsed.get("reuses", []) if isinstance(n, str)][:10]
     state["reuses"] = reuses
     for name in reuses:
@@ -424,6 +602,8 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
             "goal": f"Implement task #{state.get('issue_number')}: {state.get('issue_title', '')}",
             "steps": [str(s) for s in (parsed.get("steps") or [])][:8],
             "expected_files": expected_files,
+            "verify_cmds": verify_cmds,
+            "hypotheses": [str(h.get("claim", ""))[:120] for h in hyp_raws],
             "why": f"category={state.get('category', 'other')}",
         },
     )
@@ -473,6 +653,37 @@ def _tier1(ctx: AgentContext, changed: list[str]) -> tuple[bool, str]:
     if code not in (0, 5):             # 5 = no tests collected
         return False, f"tier-1 tests failed (exit {code}): {out[-400:]}"
     return True, f"tier-1 passed: compiled {len(py_files)} file(s), pytest exit {code}"
+
+
+# ---------------------------------------------------------------- P16 wiring
+def normalize_verify_cmds(cmds: list) -> list[list[str]]:
+    """Turn the plan's declared hypothesis checks into safe argv lists.
+
+    The plan LLM writes commands like ``"python -m pytest tests/x.py -q"``;
+    run_command only ever executes the ACTIVE interpreter, so ``python`` /
+    ``python3`` / ``<sys.executable>`` are all rewritten to ``sys.executable``
+    and anything else is dropped (a blocked command would only burn the run).
+    At most 5 checks, 12 argv words each."""
+    out: list[list[str]] = []
+    for raw in (cmds or [])[:8]:
+        try:
+            argv = shlex.split(raw) if isinstance(raw, str) else [str(a) for a in raw]
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        exe = argv[0]
+        if exe in ("python", "python3") or Path(exe).resolve() == Path(sys.executable):
+            argv[0] = sys.executable
+        elif exe == sys.executable:
+            pass
+        else:
+            continue                  # only the active interpreter is runnable
+        if len(argv) > 12:
+            argv = argv[:12]
+        if argv not in out:
+            out.append(argv)
+    return out[:5]
 
 
 async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
@@ -584,6 +795,91 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         state["error"] = verification
         state["done"] = True
         return state
+
+    # P16 — empirical evidence: run the plan's declared verification commands
+    # and record their REAL outcomes as shared evidence (owner hypotheses 1-3).
+    # The verdict comes from exit codes, never from an LLM's self-assessment.
+    # `refuted` blocks the push (the hypothesis did not hold under test);
+    # `inconclusive` (blocked/timeout) journals a warning and proceeds — the
+    # reviewer sees the evidence and decides, the pipeline never livelocks.
+    # normalize_verify_cmds rewrites "python ..." to the ACTIVE interpreter
+    # and drops anything run_command would refuse: a raw "/bin/sh -c" wrap
+    # would be rejected by the guard (exit 126) and every check would sit at
+    # "inconclusive" forever — the plan's strings must become real argv first.
+    verify_cmds = normalize_verify_cmds(state.get("verify_cmds") or [])
+    if verify_cmds:
+        evs = await asyncio.to_thread(
+            run_experiments, ctx.workspace, verify_cmds, timeout=300)
+        task_id = state.get("issue_number")
+        for ev in evs:
+            await asyncio.to_thread(
+                ctx.memory.record_evidence, ctx.agent_id, task_id,
+                ev.cmd, ev.exit_code, ev.verdict,
+                hypothesis=state.get("issue_title", ""),
+                method=ev.method, output=ev.output,
+                duration_s=ev.duration_s)
+        digest = summarize(evs)
+        state["verification"] = f"{verification} | {digest}"[:500]
+        refuted = [e for e in evs if e.verdict == "refuted"]
+        if refuted:
+            return await _yield(
+                ctx, state,
+                f"P16 hypothesis refuted by experiment: {digest} "
+                f"(exit codes {[e.exit_code for e in refuted][:5]}) "
+                "— fix the code or re-plan",
+            )
+        inconclusive = [e for e in evs if e.verdict == "inconclusive"]
+        if inconclusive:
+            ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
+                "task": task_id,
+                "cmds": [e.cmd[:120] for e in inconclusive][:5]})
+
+    # P16 (hypothesis contract) — the richer experiment form: the plan may
+    # declare MEASURABLE hypotheses (metric + threshold + experiment code).
+    # The measurement is judged by the shared machine adjudicator
+    # (verify_metrics.adjudicate), so a lying script cannot claim success.
+    # Every verdict lands in the same shared evidence table (H3) the
+    # reviewer, dashboard and CLI read, and settles the pre-registered
+    # hypothesis with the evidence row id (H2/H3 loop closed).
+    hyp_raws = state.get("hypotheses") or []
+    if hyp_raws:
+        from agentics.verify.experiment import (
+            register_hypothesis, run_hypothesis, settle_hypothesis,
+        )
+        from agentics.verify.hypothesis import parse_hypothesis
+
+        hyp_task = state.get("issue_number")
+        for raw in hyp_raws:
+            hyp, reason = parse_hypothesis(raw)
+            if hyp is None:                     # malformed proposal: never guessed through
+                ctx.memory.journal(ctx.agent_id, "p16_hypothesis_invalid",
+                                   {"task": hyp_task, "reason": reason[:200]})
+                continue
+            # the plan's hypothesis payload does not know the task id — the
+            # state does; stamp it so the evidence settles onto the task
+            if hyp.task is None and hyp_task is not None:
+                hyp.task = int(hyp_task)
+            # pre-registration: the hypothesis enters the settlement table
+            # BEFORE the run, acceptance criterion frozen — the goalposts
+            # cannot move after the measurement is in.
+            hyp_id = await asyncio.to_thread(
+                register_hypothesis, ctx.memory, ctx.agent_id, hyp)
+            evidence = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
+            ev_id = await asyncio.to_thread(
+                settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, evidence)
+            note = (evidence.meta or {}).get("note", "") or evidence.output[:300]
+            # settlement: supported claims become reusable common ground,
+            # refuted claims stop being repeated (verified_knowledge -> prompts)
+            if evidence.verdict == "refuted":
+                return await _yield(
+                    ctx, state,
+                    f"P16 hypothesis '{hyp.hypothesis_id}' REFUTED by measurement: "
+                    f"{note} — the idea did not hold; fix the code or re-plan",
+                )
+            if evidence.verdict == "inconclusive":
+                ctx.memory.journal(ctx.agent_id, "p16_inconclusive", {
+                    "task": hyp_task, "hypothesis": hyp.hypothesis_id,
+                    "evidence": ev_id, "reason": note[:200]})
 
     try:
         pushed = await asyncio.to_thread(
@@ -703,8 +999,10 @@ def node_open_pr(ctx: AgentContext, state: ResearchState) -> ResearchState:
 async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Reviewer: pick an open MR not authored by me, review it (P5).
 
-    P10 layer 3: an MR whose diff touches protected paths can never be
-    approved, no matter what the reviewing LLM says."""
+    P10 layers 3+4: before any LLM cost is spent, the reviewer re-scans the
+    branch that was ACTUALLY pushed (in its own workspace) and hard-rejects
+    any MR whose real diff touches protected paths — no matter what the file
+    list recorded by the author's workspace claims."""
     candidate = None
     for mr in ctx.memory.open_reviews():
         if mr["author"] == ctx.agent_id:
@@ -724,31 +1022,66 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 "why": "P5: no self-approval", "steps": []},
     )
 
-    files_desc = "\n".join(f"- {f}" for f in candidate.get("files", [])[:30])
-    prompt = (
-        f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
-        f"Files:\n{files_desc}\n\n"
-        f"Verification recorded by the author: {candidate.get('verification') or '(none)'}\n\n"
-        'Reply ONLY JSON: {"verdict": "approve|request_changes", '
-        '"comment": "..."}'
-    )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
-    if state.get("error"):                 # reviewer unreachable — retry next cycle
-        state["done"] = True
-        return state
-    parsed = parse_json_block(answer)
-    verdict = parsed.get("verdict", "request_changes")
-    comment = parsed.get("comment", "auto review")
+    # P10 layer 4 (defense in depth): each workspace is a separate trust
+    # domain, so the reviewer re-scans the pushed branch itself instead of
+    # trusting the file list the author's workspace recorded at open_mr time.
+    diff_files = candidate.get("files", [])
+    scan = getattr(getattr(ctx, "workspace", None), "branch_files_vs_main", None)
+    if scan is not None:
+        try:
+            scanned = await asyncio.to_thread(scan, candidate["branch"])
+            if scanned:
+                diff_files = scanned
+        except RuntimeError as exc:
+            log.warning("[%s] layer-4 re-scan of %s failed: %s",
+                        ctx.agent_id, candidate["branch"], exc)
 
-    # P10 layer 3: protected paths never reach main via any MR.
+    # P16: show the reviewer the REAL runs recorded for this task (shared
+    # evidence), so the verdict weighs measurements, not just author claims.
+    ev_rows = ctx.memory.evidence_for_task(candidate.get("task_id"))
+
+    # P10 layers 3+4: protected paths never reach main via any MR — rejected
+    # here, before the LLM is even asked.
     guard = getattr(getattr(ctx, "local", None), "guard", None)
-    if guard is not None and verdict == "approve":
-        violations = guard.check_task(ctx.memory, candidate.get("task_id"),
-                                      candidate.get("files", []))
-        if violations:
-            verdict = "request_changes"
-            comment = (f"P10 protected paths in diff: {violations[:5]} "
-                       "— cannot be approved (owner-only code)")
+    violations = (
+        guard.check_task(ctx.memory, candidate.get("task_id"), diff_files)
+        if guard is not None else []
+    )
+    if violations:
+        verdict = "request_changes"
+        comment = (f"P10 protected paths in diff (branch re-scan): {violations[:5]} "
+                   "— cannot be approved (owner-only code)")
+    else:
+        files_desc = "\n".join(f"- {f}" for f in diff_files[:30])
+        ev_desc = ""
+        if ev_rows:
+            ev_lines = [
+                f"- [{e['verdict']}] `{e['cmd'][:100]}` (exit {e['exit_code']}, "
+                f"by {e['agent']}{', note: ' + e['note'][:120] if e['note'] else ''})"
+                for e in ev_rows[-6:]
+            ]
+            ev_desc = ("\n\nEmpirical evidence recorded for this task (P16):\n"
+                       + "\n".join(ev_lines))
+        prompt = (
+            f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
+            f"Files:\n{files_desc}\n\n"
+            f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
+            f"{ev_desc}\n\n"
+            'Reply ONLY JSON: {"verdict": "approve|request_changes", '
+            '"comment": "..."}'
+        )
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
+        if state.get("error"):             # reviewer unreachable — retry next cycle
+            state["done"] = True
+            return state
+        parsed = parse_json_block(answer)
+        verdict = parsed.get("verdict", "request_changes")
+        comment = parsed.get("comment", "auto review")
+        if ev_rows:                        # P16: make the evidence trail explicit
+            counts: dict[str, int] = {}
+            for e in ev_rows:
+                counts[e["verdict"]] = counts.get(e["verdict"], 0) + 1
+            comment = f"{comment} [P16 evidence: {len(ev_rows)} run(s) {counts}]"
 
     if verdict == "approve":
         await asyncio.to_thread(
@@ -799,9 +1132,18 @@ def node_integrate(ctx: AgentContext, state: ResearchState) -> ResearchState:
             f"merge MR #{mr_id} ({review['author']}) — task #{review.get('task_id')}",
         )
 
+    def _scan_branch(branch: str) -> list[str]:
+        # P10 layer 4: the Integrator re-scans the pushed branch in its own
+        # workspace — the queue's guard verdict then rests on the real diff,
+        # not on the file list the author's workspace recorded.
+        return ctx.workspace.branch_files_vs_main(branch)
+
     ctx.report(node="integrate",
                intent={"goal": "Drain the merge queue (serial, tier-2 first)", "steps": []})
-    merged = ctx.merge_queue.drain(ctx.agent_id, verify=_verify, merge=_merge)
+    scan = getattr(ctx.workspace, "branch_files_vs_main", None)
+    merged = ctx.merge_queue.drain(
+        ctx.agent_id, verify=_verify, merge=_merge,
+        scan_branch=_scan_branch if scan is not None else None)
     state["summary"] = f"merged {merged} MR(s)"
     state["done"] = True
     return state
@@ -894,6 +1236,7 @@ NODES = {
     "scan": node_scan,
     "claim": node_claim,
     "research": node_research,
+    "verify": node_verify,
     "plan": node_plan,
     "implement": node_implement,
     "open_pr": node_open_pr,

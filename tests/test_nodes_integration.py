@@ -301,7 +301,10 @@ class FakeWorkspace:
 
     def run_command(self, cmd, timeout=120):
         self.cmds.append(cmd)
-        key = "pytest" if "pytest" in cmd else "compile"
+        if len(cmd) >= 3 and cmd[1] == "-m":
+            key = {"py_compile": "compile"}.get(cmd[2], cmd[2])   # pytest/py_compile
+        else:
+            key = "script"                     # python <workspace .py> (P16 experiment)
         return self.results.get(key, (0, "ok"))
 
     def commit_and_push(self, branch, msg, allow_protected=False):
@@ -575,3 +578,73 @@ def test_implement_survives_a_hallucinated_edit_path(mem, tmp_path, monkeypatch)
     ))
     assert state.get("error") is None, state
     assert ws.pushed and state["action"] == "open_pr"
+
+
+# ------------------------------------------------------------ P16 empirical evidence
+import sys as _sys
+
+_PY = _sys.executable
+
+
+def _with_cmds(state, cmds):
+    state["verify_cmds"] = cmds
+    return state
+
+
+def test_p16_confirmed_evidence_is_recorded_and_pushed(mem, tmp_path):
+    """H1+H2: the agent RUNS its declared check; exit 0 -> shared evidence."""
+    ws = FakeWorkspace(tmp_path, ["experiments/a.py"])
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws), _with_cmds(_impl_state(), [[_PY, "exp.py"]])))
+    assert ws.pushed and state["action"] == "open_pr"
+    rows = mem.evidence_for_task(1)
+    assert len(rows) == 1 and rows[0]["verdict"] == "confirmed"
+    assert rows[0]["agent"] == mem.evidence_for_task(1)[0]["agent"]
+    assert "P16" in state["verification"]
+    assert any(c[:2] == [_PY, "exp.py"] for c in ws.cmds)      # really ran
+    assert any(m["kind"] == "evidence" for m in mem.recent_messages())   # H3 broadcast
+
+
+def test_p16_refuted_blocks_the_push(mem, tmp_path):
+    """A nonzero exit is REAL evidence against the hypothesis: no push."""
+    ws = FakeWorkspace(tmp_path, ["experiments/a.py"], {"script": (1, "boom")})
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws), _with_cmds(_impl_state(), [[_PY, "exp.py"]])))
+    assert not ws.pushed and "refuted" in state.get("yield_reason", "")
+    assert mem.evidence_for_task(1)[0]["verdict"] == "refuted"
+
+
+def test_p16_inconclusive_warns_but_does_not_block(mem, tmp_path):
+    """Blocked/timeout (exit 124/126) -> inconclusive: reviewer decides,
+    pipeline never livelocks on a command the allowlist rejects."""
+    ws = FakeWorkspace(tmp_path, ["experiments/a.py"], {"script": (126, "command rejected")})
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws), _with_cmds(_impl_state(), [[_PY, "exp.py"]])))
+    assert ws.pushed
+    assert mem.evidence_for_task(1)[0]["verdict"] == "inconclusive"
+    assert any(j["event"] == "p16_inconclusive" for j in mem.recent_journal(limit=20))
+
+
+def test_p16_no_declared_check_keeps_old_behavior(mem, tmp_path):
+    """Backward compatible: plans without verify_cmds behave exactly as before."""
+    ws = FakeWorkspace(tmp_path, ["experiments/a.py"])
+    state = asyncio.run(nodes.node_implement(_impl_ctx(mem, ws), _impl_state()))
+    assert ws.pushed and mem.latest_evidence() == []
+
+
+def test_reviewer_sees_the_recorded_evidence(mem, monkeypatch):
+    """H3: the reviewer weighs REAL runs, and its comment cites them."""
+    mr_id = _mr(mem, author="a04")
+    mem.record_evidence("a04", mem.get_review(mr_id)["task_id"],
+                        "python -m pytest exp.py", 0, "confirmed",
+                        hypothesis="t holds")
+    mem.record_evidence("a04", mem.get_review(mr_id)["task_id"],
+                        "python flaky.py", 124, "inconclusive")
+    _llm_json(monkeypatch, payload={"verdict": "approve", "comment": "lgtm"})
+    ctx = _ctx(mem, role=Role.REVIEWER, agent_id="a07")
+    ctx.merge_queue = SimpleNamespace(enqueue=lambda mr, author: None)
+    state = asyncio.run(nodes.node_review(ctx, {}))
+    assert state["review_verdict"] == "approve"
+    review = mem.get_review(mr_id)
+    assert "P16 evidence: 2 run(s)" in review["verdict_comment"]
+    assert "confirmed" in review["verdict_comment"]

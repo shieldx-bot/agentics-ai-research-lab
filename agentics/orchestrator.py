@@ -15,6 +15,9 @@ import random
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, assign_roles
 from agentics.config import Settings, load_yaml_overrides, PROJECT_ROOT
+# NOTE: github_ops stays dormant in local mode, but the process still
+# configures its shared scan cache so a re-enabled GitHub mode inherits the
+# production pacing settings (port of 408e7a5).
 from agentics.github_ops import issue_ops
 from agentics.github_ops.repo_workspace import RepoWorkspace
 from agentics.llm.errors import is_auth_failure

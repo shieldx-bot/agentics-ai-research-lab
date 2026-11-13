@@ -19,8 +19,11 @@ Design:
 """
 from __future__ import annotations
 
+import shlex
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # run_command exit codes with a special meaning (see repo_workspace.run_command)
 EXIT_TIMEOUT = 124
@@ -63,7 +66,45 @@ def _verdict_for(exit_code: int) -> str:
     return _VERDICT_BY_EXIT.get(exit_code, "refuted" if exit_code != 0 else "confirmed")
 
 
-def run_experiment(workspace, cmd: list[str], timeout: int = 300) -> Evidence:
+# interpreter aliases a plan JSON may use for the same runtime we run in
+_PYTHON_ALIASES = {"python", "python3", Path(sys.executable).name, sys.executable}
+
+
+def coerce_cmd(cmd: str | list[str]) -> tuple[list[str] | None, str]:
+    """Normalize a declared verification command to an allowlisted argv.
+
+    Plans come from LLM JSON, so `verify_cmds` entries are STRINGS like
+    ``"python -m pytest tests/x.py"`` or ``"python experiments/check.py"``.
+    RepoWorkspace.run_command permits ONLY the active interpreter (no
+    shells), so a string must be parsed into argv — never wrapped in
+    ``/bin/sh -c`` (which the allowlist would reject, silently turning
+    every declared check into `inconclusive`).
+
+    Returns (argv, "") on success or (None, reason) when the command can
+    never satisfy the sandbox contract (rejected without running)."""
+    if isinstance(cmd, str):
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as exc:
+            return None, f"unparsable command: {exc}"
+    elif isinstance(cmd, (list, tuple)):
+        argv = [str(a) for a in cmd]
+    else:
+        return None, "command must be text or a list of arguments"
+    if not argv:
+        return None, "empty command"
+    head = argv[0]
+    if head == "pytest":                       # "pytest tests/x.py" -> -m form
+        return [sys.executable, "-m", "pytest", *argv[1:]], ""
+    if head in _PYTHON_ALIASES:                # same runtime, exact path
+        return [sys.executable, *argv[1:]], ""
+    return None, (
+        "verify_cmds must invoke python or pytest (the workspace allowlist "
+        f"runs no shells and no other binaries); got {head!r}"
+    )
+
+
+def run_experiment(workspace, cmd: list[str] | str, timeout: int = 300) -> Evidence:
     """Run one verification command in the agent workspace; return evidence.
 
     Verdict comes from the process exit code, NOT from any model:
@@ -72,14 +113,21 @@ def run_experiment(workspace, cmd: list[str], timeout: int = 300) -> Evidence:
       * 126  -> inconclusive (command rejected by the guard — e.g. protected
                 path; the agent must re-plan, never "believes" success)
       * else -> refuted (the hypothesis did not hold under test)
-    """
-    if isinstance(cmd, str):
-        cmd = ["/bin/sh", "-c", cmd]
+
+    String commands are parsed to argv (see coerce_cmd) — a shell is never
+    involved, so a declared check either really runs or is recorded as
+    inconclusive with the reason."""
+    argv, reason = coerce_cmd(cmd)
+    if argv is None:
+        return Evidence(
+            cmd=str(cmd)[:400], exit_code=EXIT_BLOCKED, verdict="inconclusive",
+            output=f"command rejected: {reason}",
+        )
     started = time.monotonic()
-    exit_code, output = workspace.run_command([str(c) for c in cmd], timeout=timeout)
+    exit_code, output = workspace.run_command(argv, timeout=timeout)
     duration = time.monotonic() - started
     return Evidence(
-        cmd=" ".join(str(c) for c in cmd),
+        cmd=" ".join(argv),
         exit_code=int(exit_code),
         verdict=_verdict_for(int(exit_code)),
         output=output,
@@ -88,11 +136,12 @@ def run_experiment(workspace, cmd: list[str], timeout: int = 300) -> Evidence:
     )
 
 
-def run_experiments(workspace, cmds: list[list[str]], timeout: int = 300) -> list[Evidence]:
+def run_experiments(workspace, cmds: list, timeout: int = 300) -> list[Evidence]:
     """Run every declared verification command; never raises.
 
-    One blocked/timeout experiment does not abort the rest — the verdict set
-    is what the reviewer (and every other agent) will see."""
+    Entries may be argv lists or plan-JSON strings ("python -m pytest ...");
+    see coerce_cmd. One blocked/timeout experiment does not abort the rest —
+    the verdict set is what the reviewer (and every other agent) will see."""
     out: list[Evidence] = []
     for cmd in cmds or []:
         try:

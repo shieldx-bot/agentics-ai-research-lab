@@ -1,6 +1,7 @@
 """LangGraph research cycle — the heart of every agent thread.
 
     start → scan | claim → research → plan → implement → open_pr → reflect
+    start → research (researcher) → verify → reflect          # P16bis
     start → review → reflect
     start → integrate → reflect
     (no-LLM / trivial cycles skip straight to reflect)
@@ -27,6 +28,7 @@ from agentics.graph.nodes import (
     node_review,
     node_scan,
     node_start,
+    node_verify,
 )
 from agentics.graph.state import ResearchState
 
@@ -57,7 +59,11 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     async def implement_node(state: ResearchState) -> ResearchState:
         return await node_implement(ctx, state)
 
+    async def verify_node(state: ResearchState) -> ResearchState:
+        return await node_verify(ctx, state)
+
     g.add_node("research", research_node)
+    g.add_node("verify", verify_node)
     g.add_node("plan", plan_node)
     g.add_node("implement", implement_node)
     g.add_node("open_pr", lambda s: node_open_pr(ctx, s))
@@ -89,9 +95,22 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     # A node that sets `done` (nothing to do, lost a race, yielded) or `error` must
     # short-circuit to reflect; unconditional edges used to push such cycles into
     # plan/implement/open_pr with missing state.
-    for src, dst in (("claim", "research"), ("research", "plan"),
+    for src, dst in (("claim", "research"),
                      ("plan", "implement"), ("implement", "open_pr")):
         g.add_conditional_edges(src, continue_or_reflect(dst), {dst: dst, "reflect": "reflect"})
+
+    def route_after_research(state: ResearchState) -> str:
+        """P16bis: a researcher cycle holding a fresh finding goes to `verify`
+        (claims checked by RUNNING code before they become common knowledge);
+        coder/writer cycles continue into plan."""
+        if state.get("done") or state.get("error"):
+            return "reflect"
+        return "verify" if state.get("action") == "verify" else "plan"
+
+    g.add_conditional_edges("research", route_after_research,
+                            {"verify": "verify", "plan": "plan",
+                             "reflect": "reflect"})
+    g.add_edge("verify", "reflect")
     g.add_edge("open_pr", "reflect")
     g.add_edge("review", "reflect")
     g.add_edge("integrate", "reflect")
