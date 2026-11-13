@@ -34,7 +34,7 @@ import math
 import re
 import zlib
 from collections import Counter
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 from agentics.memory.shared_memory import SharedMemory
 

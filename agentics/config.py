@@ -55,6 +55,18 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _hb_api_keys() -> list[str]:
+    """Hyperbrowser token pool: HB_API_KEYS (comma-separated) wins, then the
+    single HB_API_KEY. Empty list = no tokens (session creation will fail
+    with the SDK's own clear error, same as before)."""
+    raw = _env("HB_API_KEYS", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        single = _env("HB_API_KEY", "")
+        keys = [single] if single else []
+    return keys
+
+
 def _env_int(key: str, default: int) -> int:
     _load_dotenv()
     try:
@@ -69,6 +81,14 @@ def _env_bool(key: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(key: str, default: float) -> float:
+    _load_dotenv()
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -106,9 +126,74 @@ class Settings:
             "AI/ML for Network Function Virtualization (NFV) and 5G core automation",
         )
     )
+    # GitHub rate-limit safety: process-wide minimum interval between API
+    # calls (all agent threads share one PAT) and TTL for the shared issue
+    # scan cache. 0 disables pacing (not recommended for >2 agents).
+    gh_min_api_interval: float = field(
+        default_factory=lambda: _env_float("GH_MIN_API_INTERVAL", 1.0)
+    )
+    gh_scan_cache_ttl: float = field(
+        default_factory=lambda: _env_float("GH_SCAN_CACHE_TTL", 60)
+    )
     # Paths
     data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
     accounts_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "accounts")
+    # P10 — the lab's own code that agents must never modify. Owner can extend
+    # via configs/lab.yaml (protected_paths:) or ALLOW_PROTECTED_PATHS=1 env
+    # to grant a run-wide override (see agentics/policies/guard.py).
+    protected_paths: list[str] = field(default_factory=lambda: [
+        p for p in _env("PROTECTED_PATHS",
+                        "agentics/,configs/,accounts/,scripts/,.github/").split(",")
+        if p.strip()
+    ])
+    # P14 — optional whitelist ring ("cấm tuyệt đối"): when non-empty, ANY
+    # file outside these roots is refused for every agent (owner exemption
+    # per task still lifts it; credentials are never writable). Empty = off.
+    # Default lives in configs/lab.yaml as the union of the ownership surfaces.
+    writable_roots: list[str] = field(default_factory=lambda: [
+        p for p in _env("WRITABLE_ROOTS", "").split(",") if p.strip()
+    ])
+    # P13 — per-file lock TTL in the swarm (anti "hai agent đè tay nhau").
+    file_lock_ttl_minutes: int = field(
+        default_factory=lambda: _env_int("FILE_LOCK_TTL_MINUTES", 30))
+    # P19 — peer panel review (đánh giá lẫn nhau): how many cross-reviewers
+    # must unanimously accept before an MR passes, and how long the author has
+    # to defend their point once ONE reject vote opens the defense round.
+    peer_panel_size: int = field(
+        default_factory=lambda: _env_int("PEER_PANEL_SIZE", 2))
+    peer_defense_ttl_minutes: int = field(
+        default_factory=lambda: _env_int("PEER_DEFENSE_TTL_MINUTES", 30))
+    # P20 — LLM budget: pool-wide hourly cap (0 = off) + per-agent circuit
+    # breaker after N consecutive provider failures. Defaults bound a
+    # runaway agent without throttling a healthy swarm of 10.
+    llm_max_calls_per_hour: int = field(
+        default_factory=lambda: _env_int("LLM_MAX_CALLS_PER_HOUR", 120))
+    llm_fail_streak_limit: int = field(
+        default_factory=lambda: _env_int("LLM_FAIL_STREAK_LIMIT", 5))
+    llm_breaker_cooldown_s: int = field(
+        default_factory=lambda: _env_int("LLM_BREAKER_COOLDOWN_S", 900))
+    # P22 — retention: workspaces of agents inactive longer than this AND
+    # with a clean git tree get pruned by the supervisor sweep (0 = off).
+    workspace_retention_minutes: int = field(
+        default_factory=lambda: _env_int("WORKSPACE_RETENTION_MINUTES", 240))
+    # P10 layer 4 — integrity self-healing sweep interval (0 = off).
+    integrity_interval_s: int = field(
+        default_factory=lambda: _env_int("INTEGRITY_INTERVAL_S", 20))
+    # P23 — replay: settled claims are periodically re-run from their stored
+    # protocol source by the supervisor sweep. replay_sweep_size caps how many
+    # claims one sweep replays (0 = off); replay_every_n_cycles gates how
+    # often the sweep runs. Every outcome lands in shared evidence
+    # (method='replay') so the whole swarm sees replication results (H3).
+    replay_sweep_size: int = field(
+        default_factory=lambda: _env_int("REPLAY_SWEEP_SIZE", 2))
+    replay_every_n_cycles: int = field(
+        default_factory=lambda: _env_int("REPLAY_EVERY_N_CYCLES", 3))
+    # P24bis — independent replication: reviewers re-run settled claims from
+    # their stored protocols in their own workspaces. replication_limit caps
+    # how many claims ONE reviewer cycle replicates (0 = off). No LLM is
+    # involved: the criterion is frozen data and the verdict is machine-made.
+    replication_limit: int = field(
+        default_factory=lambda: _env_int("REPLICATION_LIMIT", 1))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(
@@ -126,10 +211,52 @@ class Settings:
     #   residential proxy) via Playwright CDP; works from any VPS.
     browser_backend: str = field(default_factory=lambda: _env("BROWSER_BACKEND", "local"))
     hyperbrowser_api_key: str = field(default_factory=lambda: _env("HB_API_KEY"))
+    # HB_API_KEYS: comma-separated Hyperbrowser tokens. Each token owns ONE
+    # cloud session, so K tokens scale the swarm to K truly parallel agents
+    # (per-token session locks replace the old global single-session lock).
+    # Falls back to [hyperbrowser_api_key]; secrets.yaml may override with a
+    # YAML list.
+    hyperbrowser_api_keys: list[str] = field(default_factory=lambda: _hb_api_keys())
     hyperbrowser_proxy_country: str = field(
         default_factory=lambda: _env("HB_PROXY_COUNTRY", "US"))
     hyperbrowser_timeout: int = field(
         default_factory=lambda: _env_int("HB_TIMEOUT", 900))
+    # How long the cloud browser waits for the Perplexity composer to become
+    # visible before failing an ask with a diagnostic error (challenge page,
+    # logged-out wall, or a UI markup change).
+    hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
+
+    # --- Adaptive planning & role prompts (LLM-authored) ---------------------
+    # Role missions are WRITTEN by the LLM (shared swarm-wide via the
+    # role_prompts table, reworked after repeated failures, conditioned on
+    # recent traces); plans are PROPOSED by the LLM (approach-first) on top
+    # of the minimal machine contract. False = the static pre-adaptive lab.
+    adaptive_prompts: bool = field(
+        default_factory=lambda: _env_bool("ADAPTIVE_PROMPTS", True))
+    role_prompt_ttl_hours: float = field(
+        default_factory=lambda: _env_float("ROLE_PROMPT_TTL_HOURS", 24.0))
+    role_prompt_max_chars: int = field(
+        default_factory=lambda: _env_int("ROLE_PROMPT_MAX_CHARS", 1600))
+    role_prompt_rework_failures: int = field(
+        default_factory=lambda: _env_int("ROLE_PROMPT_REWORK_FAILURES", 2))
+    # Free keyless research tools (docs/FREE_TOOLS.md): arXiv / OpenAlex /
+    # Crossref / HuggingFace datasets / Wikipedia / DuckDuckGo. They ground
+    # research in real publisher metadata and keep node_research alive when
+    # every LLM cookie is dead. No account or token required for any source.
+    free_tools_enabled: bool = field(default_factory=lambda: _env_bool("FREE_TOOLS_ENABLED", True))
+    free_tools_timeout: float = field(
+        default_factory=lambda: _env_float("FREE_TOOLS_TIMEOUT", 15.0)
+    )
+    # Optional polite-pool contact for OpenAlex/Crossref (a plain email).
+    # Not required, but it puts the calls in the friendlier rate-limit tier.
+    free_tools_mailto: str = field(default_factory=lambda: _env("FREE_TOOLS_MAILTO"))
+    # P18b research fan-out: when > 1, node_research asks complementary
+    # angles (survey / benchmarks / open problems) IN PARALLEL — each extra
+    # angle runs on a different Hyperbrowser token of the pool (or a
+    # different cookie account on the local backend). Results merge into one
+    # finding; every angle still passes the P20 budget gate and the fan-out
+    # is journalled. 1 keeps the single-ask behaviour.
+    research_fanout: int = field(default_factory=lambda: _env_int("RESEARCH_FANOUT", 1))
 
     @property
     def owner(self) -> str:
@@ -154,6 +281,20 @@ class Settings:
     @property
     def workspaces_dir(self) -> Path:
         return self.data_dir / "workspaces"
+
+    @property
+    def local_repo_path(self) -> Path:
+        """The bare repo that plays the role of "origin" in local-only mode."""
+        return self.data_dir / "lab.git"
+
+    @property
+    def integrity_path(self) -> Path:
+        """Baseline of the runtime tree's hashes (`agentics verify`, layer 4)."""
+        return self.data_dir / "integrity" / "baseline.json"
+
+    @property
+    def dashboard_port(self) -> int:
+        return _env_int("DASHBOARD_PORT", 8080)
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.chroma_path, self.workspaces_dir):

@@ -30,7 +30,8 @@ def test_existing_clone_remote_is_normalized_before_reuse(tmp_path, monkeypatch)
     calls = []
     monkeypatch.setattr(workspace, "_git", lambda *args, **kwargs: calls.append(args))
     workspace.ensure_cloned()
-    assert calls == [("remote", "set-url", "origin", "https://github.com/owner/repo.git")]
+    # local-only mode: origin is always the on-disk bare repo (data/lab.git)
+    assert calls == [("remote", "set-url", "origin", str(tmp_path / "lab.git"))]
 
 
 def test_command_allowlist_accepts_only_project_validation_commands(tmp_path):

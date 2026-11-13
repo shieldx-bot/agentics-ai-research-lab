@@ -240,3 +240,122 @@ def test_provider_ui_outage_does_not_cool_down_cookie_account(tmp_path, monkeypa
         asyncio_run(host.ask("test", purpose="research"))
     assert calls == []
     assert not pool.health[account.name].in_cooldown()
+
+
+# ------------------------------------------------------ composer self-recovery
+def test_composer_recovers_after_one_reload(tmp_path, monkeypatch):
+    """A slow SPA hydration must not open the shared circuit breaker: one
+    in-place reload + re-wait heals the transient miss (2026-11-12 incident
+    class: composer TimeoutError killed the whole swarm's availability)."""
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path, hb_input_timeout=5),
+    )
+
+    class FlakyComposer:
+        def __init__(self):
+            self.calls = 0
+
+        def locator(self, _selector):
+            locator = self
+
+            class Locator:
+                @property
+                def first(self):
+                    return self
+
+                async def wait_for(self, **_kwargs):
+                    locator.calls += 1
+                    if locator.calls == 1:
+                        raise TimeoutError("not hydrated yet")
+
+            return Locator()
+
+    client._page = FlakyComposer()
+    reloads = []
+
+    async def fake_goto_home():
+        reloads.append(1)
+
+    monkeypatch.setattr(client, "_goto_home", fake_goto_home)
+    box = asyncio_run(client._wait_for_composer())
+    assert box is not None
+    assert len(reloads) == 1
+    assert hb._BACKEND_COOLDOWN_UNTIL == 0.0      # no circuit opened
+
+
+def test_composer_failure_after_reload_still_classifies(tmp_path, monkeypatch):
+    """Recovery is one-shot: a page that fails twice still reaches the
+    predecessor's diagnostics (challenge -> backend circuit, sign-in -> auth
+    error, generic miss -> UI error)."""
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path, hb_input_timeout=5),
+    )
+
+    class MissingComposer:
+        def locator(self, _selector):
+            class Locator:
+                @property
+                def first(self):
+                    return self
+
+                async def wait_for(self, **_kwargs):
+                    raise TimeoutError("no composer")
+            return Locator()
+
+    client._page = MissingComposer()
+
+    async def diagnostics():
+        return {"url": "u", "title": "t", "body": "some text"}
+
+    async def failing_goto_home():
+        raise TimeoutError("reload also failed")
+
+    monkeypatch.setattr(client, "_page_diagnostics", diagnostics)
+    monkeypatch.setattr(client, "_goto_home", failing_goto_home)
+    with pytest.raises(hb.HyperbrowserUIError):
+        asyncio_run(client._wait_for_composer())
+    assert hb._BACKEND_COOLDOWN_UNTIL > 0
+
+
+# ------------------------------------------------------------ empty-answer guard
+def test_ask_raises_ui_error_on_silent_empty_answer(tmp_path, monkeypatch):
+    """A submit that silently produces NO answer must raise a UI outage, not
+    return LLMResponse(answer='') that crashes node_plan's json.loads."""
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path),
+    )
+
+    async def ok(*_args, **_kwargs):
+        return None
+
+    async def empty_answer():
+        return ("", [])
+
+    monkeypatch.setattr(client, "_ensure_session", ok)
+    monkeypatch.setattr(client, "_goto_home", ok)
+    monkeypatch.setattr(client, "_submit", ok)
+    monkeypatch.setattr(client, "_collect_answer", empty_answer)
+    torn_down = []
+
+    async def fake_teardown():
+        torn_down.append(1)
+
+    monkeypatch.setattr(client, "_teardown", fake_teardown)
+    with pytest.raises(hb.HyperbrowserUIError, match="no answer text"):
+        asyncio_run(client.ask("hello"))
+    assert torn_down == [1]           # session rebuilt on the next ask

@@ -19,8 +19,12 @@ Lifecycle: one Hyperbrowser session per client, created lazily on the first
 navigating to the Perplexity home page). ``close()`` stops the session —
 call it on shutdown; sessions also die by their own timeout.
 
-Free Hyperbrowser plans allow ONE active session at a time: run with
-``MAX_AGENTS=1``, or use one account per lab run.
+Token pool (P18): sessions are registered PER TOKEN (``_ACTIVE_BY_KEY``).
+Each Hyperbrowser token owns exactly one session slot; clients on the same
+token queue and evict each other, clients on different tokens run in
+parallel. Give the swarm K tokens via ``HB_API_KEYS=tk1,tk2,...`` and run K
+agents (the orchestrator sizes the pool for you). A single ``HB_API_KEY``
+keeps the old free-plan behavior (one session, agents queue).
 """
 from __future__ import annotations
 
@@ -38,13 +42,22 @@ from agentics.llm.perplexity_client import CookieAccount, LLMResponse
 
 log = logging.getLogger("llm.hyperbrowser")
 
-# Serialize session creation across all clients (free plan: 1 active session).
-_SESSION_LOCK = asyncio.Lock()
-# The client that currently owns the single cloud session. Free plans allow
-# exactly ONE active session, so when a different client needs the slot, the
-# current holder is torn down first. Swap to per-client sessions when the
-# plan allows N>1 concurrent sessions.
-_ACTIVE_HOLDER: "HyperbrowserClient | None" = None
+# Per-token session registries (P18 token pool): each Hyperbrowser token
+# owns ONE session slot. Clients sharing a token queue behind that token's
+# lock and evict each other (free-plan semantics on a shared token);
+# clients on DIFFERENT tokens run fully parallel — this is what scales the
+# swarm from one agent to the whole token pool.
+_KEY_LOCKS: dict[str, asyncio.Lock] = {}
+_ACTIVE_BY_KEY: dict[str, "HyperbrowserClient"] = {}
+
+
+def _key_lock(api_key: str) -> asyncio.Lock:
+    """One lock per Hyperbrowser token (created lazily, process-wide)."""
+    lock = _KEY_LOCKS.get(api_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _KEY_LOCKS[api_key] = lock
+    return lock
 
 _HOME = "https://www.perplexity.ai"
 _ACADEMIC_PREFIX = "[Prefer peer-reviewed academic sources: arXiv, IEEE, ACM, Springer.] "
@@ -155,10 +168,19 @@ class HyperbrowserClient:
         account: CookieAccount,
         settings: Settings,
         answer_wait_s: int = 120,
+        api_key: str | None = None,
     ) -> None:
         self.account = account
         self.settings = settings
         self.answer_wait_s = answer_wait_s
+        # This client's Hyperbrowser token. The session host pins agent i to
+        # token i of the pool (settings.hyperbrowser_api_keys); without a
+        # pool it falls back to the legacy single HB_API_KEY.
+        self.api_key = (
+            api_key
+            or getattr(settings, "hyperbrowser_api_key", "")
+            or (getattr(settings, "hyperbrowser_api_keys", None) or [""])[0]
+        )
         self._session_id: str | None = None
         self._pw: Any = None
         self._browser: Any = None
@@ -179,17 +201,17 @@ class HyperbrowserClient:
         }
 
     async def _ensure_session(self) -> None:
-        """Caller must hold _SESSION_LOCK (non-reentrant asyncio.Lock)."""
-        global _ACTIVE_HOLDER
+        """Caller must hold this token's lock (see _key_lock, non-reentrant)."""
         if self._page is not None:
             return
         from hyperbrowser import Hyperbrowser
 
-        self._hb = Hyperbrowser(api_key=self.settings.hyperbrowser_api_key)
-        if _ACTIVE_HOLDER is not None and _ACTIVE_HOLDER is not self:
-            # single-session plan: evict the current holder's session
-            await _ACTIVE_HOLDER._teardown()
-            _ACTIVE_HOLDER = None
+        self._hb = Hyperbrowser(api_key=self.api_key)
+        holder = _ACTIVE_BY_KEY.get(self.api_key)
+        if holder is not None and holder is not self:
+            # one session per token: evict the current holder of THIS token
+            # (holders on other tokens keep their sessions — that is the pool)
+            await holder._teardown()
         sess = await asyncio.to_thread(self._hb.sessions.create, self._session_params())
         self._session_id = sess.id
         log.info("hyperbrowser session %s created for %s", sess.id, self.account.name)
@@ -205,10 +227,9 @@ class HyperbrowserClient:
         except Exception:
             await self._teardown()
             raise
-        _ACTIVE_HOLDER = self
+        _ACTIVE_BY_KEY[self.api_key] = self
 
     async def _teardown(self) -> None:
-        global _ACTIVE_HOLDER
         self._page = None
         if self._browser is not None:
             try:
@@ -228,8 +249,8 @@ class HyperbrowserClient:
             except Exception:  # noqa: BLE001
                 pass
             self._hb = None
-        if _ACTIVE_HOLDER is self:
-            _ACTIVE_HOLDER = None
+        if _ACTIVE_BY_KEY.get(self.api_key) is self:
+            _ACTIVE_BY_KEY.pop(self.api_key, None)
         self._session_id = None
 
     async def close(self) -> None:
@@ -284,10 +305,24 @@ class HyperbrowserClient:
             "[role='textbox']:visible"
         )
         box = self._page.locator(selectors).first
+        timeout_s = max(5, int(getattr(self.settings, "hb_input_timeout", 45) or 45))
         try:
-            await box.wait_for(state="visible", timeout=45000)
+            await box.wait_for(state="visible", timeout=timeout_s * 1000)
             return box
-        except Exception as exc:  # noqa: BLE001
+        except Exception as first_exc:  # noqa: BLE001
+            # One in-place recovery BEFORE escalating: a slow SPA hydration or
+            # a late frontend deploy often renders the composer a beat after
+            # the first wait gives up. Escalating straight to the shared
+            # circuit breaker used to stall EVERY agent for minutes on what a
+            # simple reload heals — the 25s-timeout failure class from the
+            # 2026-11-12 incident, now self-healing instead of circuit-opening.
+            try:
+                await self._goto_home()
+                await box.wait_for(state="visible", timeout=timeout_s * 1000)
+                log.info("composer recovered after one reload (%s)", self.account.name)
+                return box
+            except Exception:  # noqa: BLE001 — fall through to the diagnostics
+                exc = first_exc
             diag = await self._page_diagnostics()
             combined = " ".join(diag.values())
             if self._challenge_text(combined):
@@ -304,7 +339,7 @@ class HyperbrowserClient:
                     f"(title={diag['title']!r}, url={diag['url']!r})"
                 ) from exc
             reason = (
-                f"Perplexity composer unavailable after 45s "
+                f"Perplexity composer unavailable after {timeout_s}s "
                 f"(title={diag['title']!r}, url={diag['url']!r})"
             )
             _open_backend_circuit(reason, cooldown_s=180)
@@ -382,10 +417,10 @@ class HyperbrowserClient:
         accepted for interface parity and ignored.
         """
         started = time.monotonic()
-        # One UI conversation at a time — globally, not per client: the free
-        # Hyperbrowser plan runs a single session, so cross-account asks must
-        # queue behind each other (and may evict the previous holder's session).
-        async with _SESSION_LOCK:
+        # One UI conversation at a time PER TOKEN: the token's session slot is
+        # exclusive, so same-token asks queue behind each other (and may evict
+        # the previous holder). Different tokens run in parallel — the pool.
+        async with _key_lock(self.api_key):
             if time.monotonic() < _BACKEND_COOLDOWN_UNTIL:
                 remaining = int(_BACKEND_COOLDOWN_UNTIL - time.monotonic())
                 raise HyperbrowserBackendUnavailable(
@@ -400,6 +435,16 @@ class HyperbrowserClient:
                     prefix += "[Instructions] " + system.strip()[:800] + " "
                 await self._submit(prefix + query)
                 answer, citations = await self._collect_answer()
+                if not answer:
+                    # A silent submit failure (Enter swallowed, answer markup
+                    # moved) must not masquerade as an LLM answer: downstream
+                    # nodes would parse "" into a JSON crash (node_plan) or a
+                    # wasted cycle (node_verify). Raised as a UI outage so the
+                    # session host fails over without cooling the account.
+                    raise HyperbrowserUIError(
+                        "Perplexity produced no answer text after "
+                        f"{self.answer_wait_s}s (submit may have failed silently)"
+                    )
             except Exception:
                 await self._teardown()               # next ask rebuilds cleanly
                 raise

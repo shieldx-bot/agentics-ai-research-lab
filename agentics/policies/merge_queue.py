@@ -79,6 +79,14 @@ class MergeQueue:
                                 item.pr_number, exc)
                 self.memory.add_decision(
                     integrator_id, f"merge PR #{item.pr_number} by {item.author}", "merged")
+                # P21 — immutable audit: a merge is the single most consequential
+                # action in the lab; the trail outlives the trimmed journal.
+                try:
+                    self.memory.audit(integrator_id, "merge", {
+                        "pr": item.pr_number, "author": item.author,
+                        "auto_merge": self.auto_merge})
+                except Exception:  # noqa: BLE001 — audit must never block the merge
+                    pass
                 merged += 1
             elif item.attempts + 1 >= self.MAX_ATTEMPTS:
                 self._fail(item, integrator_id,
@@ -96,6 +104,11 @@ class MergeQueue:
         self.memory.drop_tools(item.pr_number)
         self.memory.add_decision(
             integrator_id, f"reject merge of PR #{item.pr_number} by {item.author}", reason[:200])
+        try:
+            self.memory.audit(integrator_id, "mr_reject", {
+                "pr": item.pr_number, "author": item.author, "reason": reason[:300]})
+        except Exception:  # noqa: BLE001 — audit must never block the rejection
+            pass
         try:
             self.repo.get_pull(item.pr_number).create_issue_comment(
                 f"Integrator ({integrator_id}): {reason}")

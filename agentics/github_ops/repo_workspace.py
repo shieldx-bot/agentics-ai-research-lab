@@ -1,4 +1,9 @@
-"""Local git workspace per agent — clone once, sync per cycle, push to own branch."""
+"""Local git workspace per agent — clone once, sync per cycle, push to own branch.
+
+Local-only mode: "origin" is the shared bare repo at data/lab.git (seeded from
+this checkout by the orchestrator) — no credentials, no network. All git ops
+via subprocess so credentials never enter the repo config.
+"""
 from __future__ import annotations
 
 import base64
@@ -8,9 +13,11 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from agentics.config import Settings
+from agentics.policies.guard import INTEGRATOR_MERGE_ENV, ProtectedPathsGuard
 
 log = logging.getLogger("gh.workspace")
 
@@ -19,15 +26,18 @@ class RepoWorkspace:
     """A local clone owned by exactly one agent. All git ops via subprocess so
     credentials never enter the repo config."""
 
-    def __init__(self, agent_id: str, settings: Settings) -> None:
+    def __init__(
+        self, agent_id: str, settings: Settings,
+        guard: ProtectedPathsGuard | None = None,
+    ) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", agent_id):
             raise ValueError("agent_id must be a simple 1-64 character identifier")
         self.agent_id = agent_id
         self.settings = settings
+        self.guard = guard
         self.path = settings.workspaces_dir / agent_id
-        # Keep credentials out of the remote URL and .git/config. Git receives
-        # the authorization header through a child-process environment variable.
-        self._remote = f"https://github.com/{settings.github_repo}.git"
+        # Local-only mode: origin is the on-disk bare repo. No token, no network.
+        self._remote = str(settings.local_repo_path)
 
     # ------------------------------------------------------------ plumbing
     def _git_env(self) -> dict[str, str]:
@@ -50,13 +60,17 @@ class RepoWorkspace:
             env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {basic}"
         return env
 
-    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _git(self, *args: str, check: bool = True,
+             extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         # Only network operations receive the credential. Local commands (especially
         # commit hooks) must not inherit a token they do not need.
         network_ops = {"fetch", "push", "pull", "ls-remote"}
         env = self._git_env() if args and args[0] in network_ops else self._command_environment()
+        if extra_env:
+            env = {**env, **extra_env}
         proc = subprocess.run(
             ["git", *args], cwd=self.path, capture_output=True, text=True, env=env,
+            check=False,
         )
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args[:3])}… failed: {proc.stderr[:400]}")
@@ -64,13 +78,12 @@ class RepoWorkspace:
 
     def ensure_cloned(self) -> None:
         if (self.path / ".git").exists():
-            # Repair legacy clones that may have stored credentials in origin.
             self._git("remote", "set-url", "origin", self._remote)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        log.info("[%s] cloning repo…", self.agent_id)
+        log.info("[%s] cloning workspace from %s", self.agent_id, self._remote)
         subprocess.run(
-            ["git", "clone", "--filter=blob:none", self._remote, str(self.path)],
+            ["git", "clone", str(self._remote), str(self.path)],
             check=True, capture_output=True, text=True, env=self._git_env(),
         )
         self._git("config", "user.name", f"agentics[{self.agent_id}]")
@@ -84,6 +97,24 @@ class RepoWorkspace:
 
     def checkout_new_branch(self, branch: str) -> None:
         self._git("checkout", "-B", branch)
+
+    def checkout_branch_from_origin(self, branch: str) -> None:
+        """Rework: resume a previously pushed branch instead of resetting to main.
+
+        The branch restarts from its origin head, so the already-reviewed work
+        is kept and the author only adds the fixes the review asked for. A
+        branch that was never pushed (or was deleted) falls back to a fresh one.
+        """
+        self.ensure_cloned()
+        fetch = self._git("fetch", "origin", branch, check=False)
+        verified = (
+            self._git("rev-parse", "--verify", f"origin/{branch}", check=False)
+            if fetch.returncode == 0 else None
+        )
+        if verified is not None and verified.returncode == 0:
+            self._git("checkout", "-B", branch, f"origin/{branch}")
+        else:
+            self._git("checkout", "-B", branch)
 
     # ------------------------------------------------------------ content
     def _resolve_workspace_path(self, rel_path: str) -> Path:
@@ -99,7 +130,17 @@ class RepoWorkspace:
             raise ValueError("path escapes the agent workspace") from exc
         return target
 
-    def write_file(self, rel_path: str, content: str) -> None:
+    def write_file(self, rel_path: str, content: str, allow: bool = False) -> None:
+        # P10 layer 1: the lab's own code cannot even be written into a
+        # workspace (regardless of what the plan says). `allow=True` opens the
+        # supervised evolution lane ONLY — node_implement passes it for lane
+        # files of an owner-exempt task (checked per file: lane path, not a
+        # credential). The diff gate (layer 2) re-verifies the whole set.
+        if self.guard is not None and self.guard.is_protected(rel_path) and not allow:
+            raise ValueError(
+                f"P10 protected path: '{rel_path}' is lab code — agents must "
+                "not modify it (owner can exempt a task: agentics.cli allow-protected)"
+            )
         target = self._resolve_workspace_path(rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         # Re-resolve after mkdir to catch a symlink introduced in a parent path.
@@ -203,7 +244,15 @@ class RepoWorkspace:
         return files
 
     # ------------------------------------------------------------ push
-    def commit_and_push(self, branch: str, message: str) -> bool:
+    def commit_and_push(self, branch: str, message: str,
+                        allow_protected: bool = False) -> bool:
+        """Commit the working tree and push the agent branch.
+
+        ``allow_protected=True`` marks a push sanctioned by the OWNER (a task
+        carrying `agentics.cli allow-protected`): the P10 origin hook then lets
+        the branch through even if it touches protected paths. The flag travels
+        as an env var on this one push only — agent code cannot forge it
+        (git subprocesses run with a scrubbed environment)."""
         self._git("add", "-A")
         proc = self._git("status", "--porcelain", check=False)
         if not proc.stdout.strip():
@@ -216,14 +265,60 @@ class RepoWorkspace:
         if rebase.returncode != 0:
             self._git("rebase", "--abort", check=False)
             raise RuntimeError("rebase conflict — caller must yield (P3/P4)")
-        push = self._git("push", "-u", "origin", branch, check=False)
+        push = self._git("push", "-u", "origin", branch, check=False,
+                         extra_env={INTEGRATOR_MERGE_ENV: "1"} if allow_protected else None)
         if push.returncode != 0:
             raise RuntimeError(f"push failed: {push.stderr[:400]}")
         log.info("[%s] pushed branch %s", self.agent_id, branch)
         return True
 
+    def merge_branch_to_main(self, branch: str, message: str) -> bool:
+        """Local replacement for GitHub's rebase-merge (P4, Integrator only).
+
+        Merges origin/<branch> into a throw-away branch based on origin/main,
+        then pushes that as a fast-forward of main on the shared bare repo.
+        Returns False when the merge is not possible (conflict)."""
+        self.sync_main()
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "merge/tmp", "origin/main")
+            merge = self._git("merge", "--no-edit", "--no-ff", f"origin/{branch}",
+                              "-m", message, check=False)
+            if merge.returncode != 0:
+                self._git("merge", "--abort", check=False)
+                return False
+            push = self._git("push", "origin", "merge/tmp:main", check=False,
+                             extra_env={INTEGRATOR_MERGE_ENV: "1"})
+            if push.returncode != 0:
+                # someone moved main between fetch and push -> not a fast-forward
+                log.warning("[%s] push merge/tmp:main failed: %s",
+                            self.agent_id, push.stderr[:200])
+                return False
+            return True
+        except RuntimeError as exc:
+            log.warning("[%s] local merge failed: %s", self.agent_id, exc)
+            return False
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "merge/tmp", check=False)
+
     def diff_files_vs_main(self) -> list[str]:
         proc = self._git("diff", "--name-only", "origin/main...HEAD", check=False)
+        return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+
+    def branch_files_vs_main(self, branch: str) -> list[str]:
+        """Files a pushed branch ACTUALLY changes relative to origin/main.
+
+        P10 layer 4 helper (defense in depth): each agent's workspace is a
+        separate trust domain, so the Reviewer and the Integrator re-scan the
+        branch themselves instead of trusting the file list the author's
+        workspace recorded at open_pr time. Returns [] when the branch cannot
+        be fetched (missing ref, network-free bare repo race)."""
+        self.sync_main()
+        self._git("fetch", "origin", branch, check=False)
+        proc = self._git(
+            "diff", "--name-only",
+            f"origin/main...origin/{branch}", check=False)
         return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
 
     # ------------------------------------------------------------ verification
@@ -251,3 +346,63 @@ class RepoWorkspace:
         finally:
             self.sync_main()
             self._git("branch", "-D", "verify/tmp", check=False)
+
+    def run_checks_on_branch(
+        self, branch: str, cmds: list[list[str]], timeout: int = 300,
+    ) -> list[tuple[list[str], int, str, float]]:
+        """Reviewer-side independent re-run (P16 / hypothesis 1): check out
+        origin/<branch> into a throw-away branch and run the author's declared
+        checks HERE, in this reviewer's workspace — a real reviewer runs the
+        paper's code instead of trusting the recorded output. Always restores
+        a clean main. Returns [(argv, exit_code, output, seconds)]."""
+        self.sync_main()
+        results: list[tuple[list[str], int, str, float]] = []
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "review/tmp", f"origin/{branch}")
+            for cmd in cmds:
+                started = time.monotonic()
+                code, out = self.run_command(cmd, timeout=timeout)
+                results.append((cmd, int(code), out, time.monotonic() - started))
+        except RuntimeError as exc:
+            results.append((cmds[0] if cmds else [], 128, str(exc), 0.0))
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "review/tmp", check=False)
+        return results
+
+    def run_protocols_on_branch(self, branch: str, protocols, timeout: int = 300):
+        """Reviewer-side protocol reproduction (P17): check out origin/<branch>
+        into a throw-away branch and re-run each (script, Criterion) through
+        the FULL two-run adjudication.
+
+        An exit-code re-run cannot judge a quantitative claim — a protocol
+        always exits 0; the frozen criterion is the verdict. This method
+        re-measures: a script that still prints AGENTICS_RESULT but misses
+        the criterion is REFUTED here. Always restores a clean main; never
+        raises (a failed checkout yields one inconclusive Evidence per
+        protocol). Returns a list of verify_ops.Evidence."""
+        from agentics.verify_metrics import run_protocol
+        from agentics.verify_ops import Evidence
+
+        self.sync_main()
+        try:
+            self._git("fetch", "origin", branch)
+            self._git("checkout", "-B", "review/tmp", f"origin/{branch}")
+        except RuntimeError as exc:
+            return [Evidence(cmd=str(script), exit_code=128, verdict="inconclusive",
+                             output=f"checkout failed: {exc}")
+                    for script, _criterion in protocols]
+        out = []
+        try:
+            for script, criterion in protocols:
+                try:
+                    out.append(run_protocol(self, script, criterion, timeout=timeout))
+                except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the rest
+                    out.append(Evidence(cmd=str(script), exit_code=-1,
+                                        verdict="inconclusive",
+                                        output=f"reproduction error: {exc}"))
+        finally:
+            self.sync_main()
+            self._git("branch", "-D", "review/tmp", check=False)
+        return out

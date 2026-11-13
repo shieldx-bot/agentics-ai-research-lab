@@ -78,6 +78,14 @@ Chính sách chống xung đột: [docs/POLICIES.md](docs/POLICIES.md)
 
 ## 3. Cài đặt nhanh
 
+> **Chế độ LOCAL-ONLY (nhánh `update_interactive_local`):** lab chạy hoàn toàn
+> trên máy của bạn — không cần `GITHUB_TOKEN`, không gọi GitHub. "origin" của
+> agent là bare repo tự seed tại `data/lab.git`; tasks/MR/review/merge đều
+> nằm trong SQLite. Owner theo dõi qua web dashboard (`agentics dashboard`),
+> terminal live view (`agentics watch`) hoặc stream sự kiện (`agentics events -f`).
+> Chi tiết kiến trúc + nhật ký tích
+> hợp: [docs/LOCAL_MODE.md](docs/LOCAL_MODE.md).
+
 ```bash
 git clone https://github.com/shieldx-bot/agentics-ai-research-lab.git
 cd agentics-ai-research-lab
@@ -85,9 +93,8 @@ cd agentics-ai-research-lab
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1) Token GitHub (chỉ cần quyền repo) — KHÔNG commit token vào repo
-cp .env.example .env
-#    sửa .env: GITHUB_TOKEN=ghp_xxx  GITHUB_REPO=shieldx-bot/agentics-ai-research-lab
+# 1) Không cần token gì cả — chỉ còn cookie LLM
+cp .env.example .env             # tuỳ chỉnh RESEARCH_TOPIC / MAX_AGENTS
 #    LƯU Ý: agentics/config.py TỰ NẠP .env khi khởi động (không cần `source .env`
 #    hay export tay). Biến môi trường thật trong shell vẫn luôn thắng file .env.
 
@@ -99,16 +106,80 @@ python scripts/setup_accounts.py            # chuẩn hoá + kiểm tra độ t�
 # 3) Kiểm tra 1 account có "sống" không
 python -m agentics.cli test-llm --account 1
 
-# 4) KHỞI CHẠY ĐÀN AGENT (vòng lặp vô tận)
+# 4) KHỞI CHẠY ĐÀN AGENT (vòng lặp vô tận, local 100%)
 python -m agentics.cli run
 
-# 5) DỪNG an toàn (owner quyết định)
+# 5) MẮT OWNER — xem agents đang làm gì, mục đích gì, realtime
+python -m agentics.cli dashboard     # → http://127.0.0.1:8080
+python -m agentics.cli watch        # terminal live view (SSH-friendly)
+
+# 6) Thêm việc cho đàn agent / sửa backlog
+python -m agentics.cli task "Nghiên cứu thuật toán X" --category research
+python -m agentics.cli task --list
+
+# 6b) CỔNG MERGE (khi AUTO_MERGE=false — mặc định): owner giữ chốt
+python -m agentics.cli mr list          # pipeline MR: ai làm, ai duyệt
+python -m agentics.cli mr approve 3     # owner duyệt thay/ thêm cross-review
+python -m agentics.cli mr merge 3       # owner merge (P10 + tier-2 vẫn chạy)
+
+# 7) DỪNG an toàn (owner quyết định)
 python -m agentics.cli stop          # hoặc: touch STOP
 ```
 
 Xem trạng thái trực tiếp: `python -m agentics.cli status`  
 Đo tiến hóa của lab (tỉ lệ merge theo loại việc): `python -m agentics.cli metrics` — xem [docs/EVOLUTION.md](docs/EVOLUTION.md)  
 Sức khỏe bộ nhớ LifeMem (trace, cụm workflow, skill đã chưng cất): `python -m agentics.cli memory-stats` — xem [docs/MEMORY.md](docs/MEMORY.md)
+
+**P10 — code lab là của owner:** mọi diff đụng `agentics/`, `configs/`,
+`accounts/`, `scripts/`, `.github/` bị chặn ở 3 tầng (ghi file, diff trước
+push, cửa merge). Exception DUY NHẤT là owner chạy
+`python -m agentics.cli allow-protected <task_id>` (coi `accounts/` và
+`configs/secrets.yaml` không bao giờ được miễn).
+
+**Các lớp bổ sung trên nhánh này (P13/P14 + integrity):** danh sách file dự
+kiến ở bước plan được **khóa toàn cục** (P13 — agent khác đụng trúng bị dừng
+trước khi đốt chu kỳ); diff ở bước implement phải nằm trong **phạm vi intent
+đã tuyên bố** (P14 — lệch phạm vi bị yield + báo dashboard); và một
+**IntegrityWatcher** quét định kỳ (~20s) tự hoàn tác mọi thay đổi vùng cấm
+bị script lạc ghi đè trong workspace — `INTEGRITY_INTERVAL_S=0` để tắt.
+Chi tiết: `docs/POLICIES.md` (P10 bổ sung, P13, P14).
+
+**P16/P16bis — agent tự kiểm chứng ý tưởng bằng code chạy thật:** một ý tưởng
+không được đánh giá bằng lời kết luận của LLM mà bằng **bằng chứng thực
+nghiệm** — plan khai báo `verify_cmds`/`hypotheses` (chốt tiêu chí định lượng
+TRƯỚC khi chạy, như pre-registration), protocol được viết và chạy 2 lần trong
+workspace có guard, máy so sánh số đo với tiêu chí để phán
+`confirmed/refuted/inconclusive` (protocol không tái lập được → inconclusive,
+không bao giờ đếm là thành công), và mọi verdict được broadcast cho cả đàn +
+inject vào prompt của từng agent (`verified_knowledge` — claim bị phản chứng
+sẽ không ai lặp lại). Owner xem bằng `agentics evidence` /
+`agentics hypotheses` và 2 panel trên dashboard. Chi tiết:
+[docs/VERIFICATION.md](docs/VERIFICATION.md). Reviewer **tự chạy lại check của tác giả trên nhánh thật + full test suite (tier-2) trước khi hỏi LLM** — MR không qua được test bị từ chối với 0 token LLM.
+
+**Free research tools — nguồn bằng chứng thật, không cần API key:** node
+research không còn phụ thuộc mạng sống/chết của cookie LLM. Khi LLM fail,
+finding được dựng từ metadata thật của **arXiv / OpenAlex / Crossref /
+Semantic Scholar / Europe PMC** (tác giả, năm, abstract, số trích dẫn —
+fetch từ API chính thức, không phải LLM đẻ ra) và BibTeX được làm giàu bằng
+metadata nhà xuất bản thay vì scrape thẻ title. `search_all` chạy 3 nguồn
+song song trên 3 budget rate-limit độc lập rồi lấp chỗ trống theo tầng —
+OpenAlex bị 429 trên IP datacenter không còn làm rỗng finding. Kèm
+**verification toolkit**: HuggingFace datasets + models (dữ liệu và weights
+thật cho protocol), GitHub repo search (ý tưởng đã có code chưa? repo tham
+chiếu để clone vào sandbox) và PyPI package lookup (version thật để pin vào
+`verify_cmds` — tái lập P16) — tất cả keyless, degrade graceful, tôn trọng
+rate limit. Owner dùng trực tiếp:
+
+```bash
+python -m agentics.cli papers "ML for NFV"                       # bảng bài báo + BibTeX thật
+python -m agentics.cli papers --doi 10.1109/netsoft48620.2020.9165348
+python -m agentics.cli papers "intrusion detection" --datasets
+python -m agentics.cli papers "nfv scheduler" --github            # repo tham chiếu
+python -m agentics.cli papers --pypi scikit-learn                 # version thật để pin
+```
+
+Chi tiết: [docs/FREE_TOOLS.md](docs/FREE_TOOLS.md).
+
 
 ---
 
@@ -169,10 +240,11 @@ nhánh riêng, module ownership rõ ràng, PR phải qua cross-review.
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # fill GITHUB_TOKEN + GITHUB_REPO
+cp .env.example .env          # optional tuning; no GITHUB_TOKEN needed (local-only)
 python scripts/setup_accounts.py
-python -m agentics.cli run    # infinite research loop
-python -m agentics.cli stop   # owner presses the brakes
+python -m agentics.cli run        # infinite research loop — 100% local
+python -m agentics.cli dashboard  # owner's live view (http://127.0.0.1:8080)
+python -m agentics.cli stop       # owner presses the brakes
 ```
 
 ## License

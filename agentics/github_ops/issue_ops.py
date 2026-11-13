@@ -14,6 +14,11 @@ log = logging.getLogger("gh.issue")
 CLAIM_PREFIX = "/claim"
 CLAIMED_LABEL_RE = re.compile(r"^claimed/(\S+)$")
 
+# Extra claim-label attempts after PyGithub's own retry pool gave up (5xx
+# incidents). A missed claim label would let a second agent double-claim the
+# issue, so the add is retried before the claim is given up entirely.
+CLAIM_LABEL_RETRY_DELAYS: tuple[float, ...] = (3.0, 10.0)
+
 
 # All agents share one process. Cache the expensive GitHub issue scan so
 # synchronized agent loops do not issue identical paginated requests.
@@ -22,39 +27,61 @@ _SCAN_CACHE_LOCK = threading.Lock()
 _SCAN_CACHE: dict[tuple[int, int], tuple[float, list[Issue]]] = {}
 
 
+def set_scan_cache_ttl(ttl_seconds: float) -> None:
+    """Override the scan TTL at runtime (orchestrator applies the Settings
+    value, which honors configs/lab.yaml)."""
+    global _SCAN_CACHE_TTL_S
+    if ttl_seconds and ttl_seconds > 0:
+        _SCAN_CACHE_TTL_S = float(ttl_seconds)
+
+
+def clear_scan_cache() -> None:
+    """Drop all cached scans — claim/release invalidate the cache so the next
+    scan sees the fresh claim labels immediately."""
+    with _SCAN_CACHE_LOCK:
+        _SCAN_CACHE.clear()
+
+
 def scan_open_issues(repo: Repository, limit: int = 30) -> list[Issue]:
     """Open, unclaimed issues; a short shared cache limits API polling.
 
     The cache is only a discovery optimization. Claim acquisition must still
     re-read the target issue and atomically verify its current claim labels.
+    Only objects with a REAL stable identity (PyGithub ``repo.id``) are cached —
+    keying on ``id(obj)`` poisons the cache when CPython reuses the address of
+    a garbage-collected duck-typed fake (observed as cross-test flakiness: a
+    later test's repo resurrects an earlier test's cached issue list).
     """
-    # Duck-typed repo id: real Repository objects always have `.id`; fakes and
-    # thin wrappers may not — fall back to object identity for the cache key.
-    key = (getattr(repo, "id", id(repo)), int(limit))
+    stable_id = getattr(repo, "id", None)
+    cacheable = stable_id is not None
+    key = (stable_id, int(limit))
     now = time.monotonic()
-    with _SCAN_CACHE_LOCK:
-        cached = _SCAN_CACHE.get(key)
-        if cached and now - cached[0] < _SCAN_CACHE_TTL_S:
-            return list(cached[1])
+    if cacheable:
+        with _SCAN_CACHE_LOCK:
+            cached = _SCAN_CACHE.get(key)
+            if cached and now - cached[0] < _SCAN_CACHE_TTL_S:
+                return list(cached[1])
 
-        issues: list[Issue] = []
-        for issue in repo.get_issues(state="open", sort="created", direction="asc"):
-            if issue.pull_request is not None:
-                continue
-            labels = {lb.name for lb in issue.labels}
-            if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
-                continue
-            if "blocked" in labels:
-                continue
-            issues.append(issue)
-            if len(issues) >= limit:
-                break
-        _SCAN_CACHE[key] = (time.monotonic(), list(issues))
-        # Keep the cache bounded if a process watches several repositories.
-        if len(_SCAN_CACHE) > 32:
-            oldest = min(_SCAN_CACHE, key=lambda k: _SCAN_CACHE[k][0])
-            _SCAN_CACHE.pop(oldest, None)
-        return issues
+    issues: list[Issue] = []
+    for issue in repo.get_issues(state="open", sort="created", direction="asc"):
+        if issue.pull_request is not None:
+            continue
+        labels = {lb.name for lb in issue.labels}
+        if any(CLAIMED_LABEL_RE.match(lb) for lb in labels):
+            continue
+        if "blocked" in labels:
+            continue
+        issues.append(issue)
+        if len(issues) >= limit:
+            break
+    if cacheable:
+        with _SCAN_CACHE_LOCK:
+            _SCAN_CACHE[key] = (time.monotonic(), list(issues))
+            # Keep the cache bounded if a process watches several repositories.
+            if len(_SCAN_CACHE) > 32:
+                oldest = min(_SCAN_CACHE, key=lambda k: _SCAN_CACHE[k][0])
+                _SCAN_CACHE.pop(oldest, None)
+    return issues
 
 
 def issue_holders(repo: Repository, issue_number: int) -> list[str]:
@@ -76,11 +103,22 @@ def claim_issue(repo: Repository, issue_number: int, agent_id: str, ttl_minutes:
     if holders and agent_id not in holders:
         return False
     label = f"claimed/{agent_id}"
-    try:
-        issue.add_to_labels(label)
-    except Exception as exc:  # noqa: BLE001
-        log.error("cannot add label on #%s: %s", issue_number, exc)
+    last_exc: Exception | None = None
+    for attempt in range(1 + len(CLAIM_LABEL_RETRY_DELAYS)):
+        try:
+            issue.add_to_labels(label)
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001 — 5xx storms / rate limits
+            last_exc = exc
+            log.warning("label add on #%s attempt %d/%d failed: %s",
+                        issue_number, attempt + 1, 1 + len(CLAIM_LABEL_RETRY_DELAYS), exc)
+            if attempt < len(CLAIM_LABEL_RETRY_DELAYS):
+                time.sleep(CLAIM_LABEL_RETRY_DELAYS[attempt])
+    if last_exc is not None:
+        log.error("cannot add label on #%s after retries: %s", issue_number, last_exc)
         return False
+    clear_scan_cache()                      # next scan must see the new claim
     # The label is the authoritative cross-process lock. A claim comment is
     # informational: if it fails (e.g. transient network drop) do NOT roll the
     # claim back — a failed rollback here could orphan the label and lock the
@@ -104,7 +142,11 @@ def release_issue(repo: Repository, issue_number: int, agent_id: str, reason: st
         issue.remove_from_labels(f"claimed/{agent_id}")
     except Exception:  # noqa: BLE001
         pass
-    issue.create_comment(f"/release @{agent_id}\n\nReason: {reason or 'released'}")
+    clear_scan_cache()
+    try:
+        issue.create_comment(f"/release @{agent_id}\n\nReason: {reason or 'released'}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("release comment on #%s failed: %s", issue_number, exc)
 
 
 def close_issue_with_summary(repo: Repository, issue_number: int, summary: str) -> None:
@@ -121,4 +163,6 @@ def create_issue_if_absent(
     for issue in repo.get_issues(state="open"):
         if issue.pull_request is None and issue.title == title:
             return None
-    return repo.create_issue(title=title, body=body, labels=labels or [])
+    issue = repo.create_issue(title=title, body=body, labels=labels or [])
+    clear_scan_cache()
+    return issue

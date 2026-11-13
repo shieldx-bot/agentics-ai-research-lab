@@ -127,10 +127,21 @@ class BrowserSessionHost:
             ):
                 from agentics.llm.hyperbrowser_client import HyperbrowserClient
 
-                self._clients[key] = HyperbrowserClient(account, self.settings)
+                # P18 token pool: agent i (prefer_index) is pinned to token i
+                # of settings.hyperbrowser_api_keys — one cloud session per
+                # token, agents on different tokens run fully parallel.
+                self._clients[key] = HyperbrowserClient(
+                    account, self.settings, api_key=self._pinned_hb_key())
             else:
                 self._clients[key] = self._pool(provider).client_for(account)
         return self._clients[key]
+
+    def _pinned_hb_key(self) -> str | None:
+        keys = getattr(self.settings, "hyperbrowser_api_keys", None) or []
+        if not keys:
+            return None                      # client falls back to legacy key
+        idx = self.prefer_index if self.prefer_index is not None else 0
+        return keys[idx % len(keys)]
 
     def _lease(self, purpose: str) -> tuple[str, Any] | tuple[None, None]:
         """Lease a client for a purpose; falls back to the other provider
@@ -172,7 +183,9 @@ class BrowserSessionHost:
             # the cookie identity. The Hyperbrowser circuit breaker prevents
             # every agent from rotating through accounts against the same
             # unavailable page. Only account-specific auth failures cool an
-            # individual account.
+            # individual account: transient non-auth failures from the LOCAL
+            # websocket backend (read timeouts, dropped sockets) are NOT dead
+            # cookies either — classify by message before cooling down.
             try:
                 from agentics.llm.hyperbrowser_client import (
                     HyperbrowserBackendUnavailable,
@@ -183,13 +196,22 @@ class BrowserSessionHost:
                 )
             except ImportError:  # pragma: no cover - optional backend
                 provider_outage = False
+            from agentics.llm.errors import is_auth_failure
+
             acc = getattr(client, "account", None)
-            if acc is not None and not provider_outage:
-                self._pool(provider).mark_failed(acc, str(exc)[:200])
-            elif provider_outage:
+            if provider_outage:
                 log.warning(
                     "provider %s temporarily unavailable; account %s was not "
                     "cooled down: %s",
+                    provider, getattr(acc, "name", "unknown"), str(exc)[:200],
+                )
+            elif acc is not None and is_auth_failure(exc):
+                self._pool(provider).mark_failed(acc, str(exc)[:200])
+            else:
+                # transient, non-auth: keep the account healthy so the next
+                # cycle (or the client's own retry) can recover it
+                log.warning(
+                    "transient non-auth failure on %s/%s; account not cooled: %s",
                     provider, getattr(acc, "name", "unknown"), str(exc)[:200],
                 )
             raise

@@ -9,6 +9,11 @@ evolution_every_n_cycles: 10   # 0 = never open self-evolution issues
 
 # --- Research ------------------------------------------------------------
 research_topic: "AI/ML for Network Function Virtualization (NFV) and 5G core automation"
+# P18b research fan-out (agentics/graph/nodes.py): > 1 asks complementary
+# angles (benchmarks / open problems) IN PARALLEL on other Hyperbrowser
+# tokens of the pool — 2 = survey + 1 angle, 3 = all three. Every angle
+# passes the P20 budget gate; 1 disables the fan-out entirely.
+research_fanout: 2
 
 # --- Role assignment ------------------------------------------------------
 # Fixed mapping account index (1-based) -> role.
@@ -26,15 +31,68 @@ role_map:
   # 10: auto
 
 # --- Ownership matrix (P3 in docs/POLICIES.md) -----------------------------
+# Writable research surface per role. The lab's own code (agentics/, configs/,
+# accounts/, scripts/, .github/) is OUT OF BOUNDS for every role — see
+# protected_paths below (P10).
 ownership:
-  coder:    ["agentics/", "tests/", "scripts/"]
+  coder:    ["experiments/", "tests/", "benchmarks/"]
   researcher: ["research_notes/"]
   writer:   ["docs/", "README.md", "README*"]
-  integrator: [".github/"]
-  supervisor: ["configs/"]
+  integrator: ["reports/"]
+  supervisor: []
+
+# --- P10 protected paths (anti "AI sửa nhầm code agent") --------------------
+# Hard-blocked for ALL agents at write time, diff time and merge time.
+# Owner exception per task: python -m agentics.cli allow-protected <task_id>
+# Run-wide emergency switch: ALLOW_PROTECTED_PATHS=1 (still blocks accounts/
+# and configs/secrets.yaml — credentials are never writable).
+protected_paths:
+  - agentics/
+  - configs/
+  - accounts/
+  - scripts/
+  - .github/
+
+# --- P14 whitelist ring ("cấm tuyệt đối" — vòng ngoài của ownership) ----------
+# Khi được đặt, MỌI file ngoài các gốc này bị từ chối với mọi agent (lớp
+# ownership P3 phân vai bên trong; vòng này chặn toàn bộ phần còn lại).
+# Owner exemption theo task vẫn nâng được vòng này, nhưng accounts/ và
+# configs/secrets.yaml không bao giờ được chạm. Bỏ trống ([]) để tắt.
+# Mặc định = hợp của các vùng ownership phía trên.
+writable_roots:
+  - research_notes/
+  - experiments/
+  - benchmarks/
+  - tests/
+  - docs/
+  - reports/
+  - README.md
+
+# --- P13 file locks (anti "hai agent đè tay nhau") ----------------------------
+# Khóa khai báo ở bước plan, TTL tự hết hạn khi agent chết.
+file_lock_ttl_minutes: 30
+
+# --- P10 lớp 4 — integrity self-healing ---------------------------------------
+# Re-hash cây protected trong mỗi workspace rồi tự phục hồi từ git nếu bị
+# một script lạc ghi đè. 0 = tắt.
+integrity_interval_s: 20
 
 # --- Perplexity ------------------------------------------------------------
 pplx_timeout: 180
+
+# --- Free keyless research tools (docs/FREE_TOOLS.md) -------------------------
+# Official publisher APIs (arXiv / OpenAlex / Crossref / Semantic Scholar /
+# Europe PMC / GitHub / PyPI / HuggingFace / Wikipedia / DuckDuckGo): real
+# metadata, no key. node_research falls back to them when the LLM pools are
+# dead; search_all runs three scholarly budgets in parallel and the
+# verification toolkit (repos / PyPI pins / datasets / models) grounds every
+# finding in real code + data instead of scraped <title> tags.
+free_tools_enabled: true
+free_tools_timeout: 15
+# Optional polite-pool email for OpenAlex/Crossref (recommended in prod).
+# Keep it commented unless you want YAML to win over FREE_TOOLS_MAILTO in
+# .env — an empty string here would clear the env value.
+# free_tools_mailto: "you@example.org"
 
 # --- Browser backend --------------------------------------------------------
 # "hyperbrowser" = Perplexity cookie sessions run on a Hyperbrowser cloud
@@ -47,3 +105,14 @@ hyperbrowser_timeout: 900
 # The API key lives in configs/secrets.yaml (gitignored) as
 #   hyperbrowser_api_key: hb_...
 # or in the HB_API_KEY environment variable. It is NEVER committed here.
+
+# --- Adaptive planning & role prompts (LLM-authored) -------------------------
+# The LLM writes its own role missions (cached swarm-wide in the role_prompts
+# table, reworked after repeated failures, conditioned on recent traces) and
+# PROPOSES each plan itself (approach-first, extra fields of its own naming)
+# on top of the minimal machine contract. The immutable collaboration rules
+# are appended by code to every prompt and cannot be rewritten by the model.
+adaptive_prompts: true
+role_prompt_ttl_hours: 24      # re-synthesize a mission after this many hours
+role_prompt_max_chars: 1600    # hard cap for a synthesized mission
+role_prompt_rework_failures: 2 # consecutive failed cycles trigger a rework

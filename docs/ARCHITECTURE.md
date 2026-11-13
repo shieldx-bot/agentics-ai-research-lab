@@ -27,6 +27,7 @@ agentics/
 │   └── merge_queue.py         # Hàng đợi merge tuần tự
 ├── research/
 │   ├── papers.py              # Search paper qua Perplexity academic mode
+│   ├── free_tools.py          # Tool miễn phí keyless: arXiv/OpenAlex/Crossref/HF/Wikipedia/DDG
 │   └── citations.py           # Trích dẫn chuẩn: BibTeX, APA
 ├── agents/
 │   ├── roles.py               # Role enum + prompt templates
@@ -75,6 +76,11 @@ agentics/
   cho tới khi có câu trả lời cuối kèm `citations`.
 - `mode="academic"` ưu tiên nguồn học thuật → dùng cho search paper; citations được
   `research/citations.py` chuyển thành BibTeX/APA chuẩn.
+- **Fallback miễn phí keyless:** khi pool LLM chết/trả về rỗng, `node_research`
+  dựng finding từ metadata thật của arXiv/OpenAlex/Crossref
+  (`research/free_tools.py`) — chu kỳ không chết cùng cookie. BibTeX mọi finding
+  được làm giàu bằng metadata nhà xuất bản (`enriched_bibtex`). Chi tiết:
+  [FREE_TOOLS.md](FREE_TOOLS.md).
 - Endpoint nội bộ của Perplexity **có thể đổi bất cứ lúc nào**; client được thiết kế
   để sửa 1 chỗ (`ASK_EVENT` / URL) khi cần. `test-llm` CLI để kiểm tra nhanh.
 - Cookie chết/429 → pool đánh dấu `cooldown`, agent tạm nghỉ và báo cáo vào shared
