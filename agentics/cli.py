@@ -467,6 +467,7 @@ def metrics(
 def swarm_eval(
     days: int = typer.Option(0, "--days", help="chỉ đánh giá N ngày gần nhất (0 = toàn bộ)"),
     as_json: bool = typer.Option(False, "--json", help="in toàn bộ report dạng JSON"),
+    as_percent: bool = typer.Option(False, "--percent", help="bảng % tổng hợp — mọi chỉ số quy về phần trăm cho dễ nắm"),
     no_save: bool = typer.Option(False, "--no-save", help="không lưu snapshot vào DB"),
 ) -> None:
     """Đánh giá bầy đàn AS A SWARM — quỹ đạo, cộng tác, hội tụ, chịu lỗi, chi phí.
@@ -481,7 +482,7 @@ def swarm_eval(
     setup_logging("ERROR")
     from agentics.memory.shared_memory import SharedMemory
     from agentics.swarm_eval import (attach_scalability, evaluate_swarm,
-                                     save_snapshot)
+                                     percent_rows, save_snapshot)
 
     settings.ensure_dirs()
     memory = SharedMemory(settings.db_path)
@@ -493,7 +494,12 @@ def swarm_eval(
             snap_id = save_snapshot(memory, report)
             report["snapshot_id"] = snap_id
         if as_json:
+            if as_percent:
+                report["percent_rows"] = percent_rows(report)
             console.print_json(json.dumps(report, ensure_ascii=False))
+            return
+        if as_percent:
+            _print_percent_rows(percent_rows(report))
             return
         _print_swarm_eval(report, memory)
     finally:
@@ -612,6 +618,39 @@ def _print_swarm_eval(report: dict, memory) -> None:
                       f"{len(snaps)} snapshot cũ trong DB[/]")
     console.print("[dim]So sánh theo thời gian: python -m agentics.cli swarm-eval "
                   "--days 7 --json | jq .groups[/]")
+
+
+_GROUP_NAMES = {1: "1 phối hợp", 2: "2 hội tụ", 3: "3 quỹ đạo",
+                4: "4 chịu lỗi", 5: "5 quản trị"}
+
+
+def _pct_cell(row: dict) -> str:
+    """Colour the percentage by health direction; '—' when not convertible."""
+    pct, good = row.get("pct"), row.get("good_high", True)
+    if pct is None:
+        return "[dim]—[/]"
+    ok = pct >= 70 if good else pct <= 30
+    warn = (pct >= 40 if good else pct <= 60) and not ok
+    colour = "green" if ok else ("yellow" if warn else "red")
+    return f"[{colour}]{pct:.0f}%[/]"
+
+
+def _print_percent_rows(rows: list[dict]) -> None:
+    """One unified table: every metric normalised to a percentage share."""
+    t = Table(title="Bảng % tổng hợp — quy đổi mọi chỉ số swarm về phần trăm")
+    t.add_column("nhóm", style="cyan", no_wrap=True)
+    t.add_column("chỉ số", overflow="fold")
+    t.add_column("giá trị gốc", overflow="fold")
+    t.add_column("%", justify="right", no_wrap=True)
+    t.add_column("cách đọc", overflow="fold")
+    for row in rows:
+        t.add_row(_GROUP_NAMES.get(row["group"], str(row["group"])),
+                  row["metric"], row["raw"], _pct_cell(row), row["hint"])
+    console.print(t)
+    console.print("[dim]Quy ước: % = tỉ lệ phần trăm theo mẫu số tự nhiên của "
+                  "từng chỉ số; '—' = không có mẫu số trung thực để quy đổi. "
+                  "Màu: xanh ≥ ngưỡng khỏe, vàng = trung gian, đỏ = cần nhìn "
+                  "lại (theo hướng tốt của từng chỉ số).[/]")
 
 
 @app.command("memory-stats")

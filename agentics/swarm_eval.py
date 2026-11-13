@@ -33,8 +33,10 @@ from typing import Any
 
 from agentics.memory.shared_memory import SharedMemory
 
-# journal writers that are machinery, not swarm members
-_SYSTEM_AGENTS = {"orchestrator", "owner", "guard", "peer-panel"}
+# journal writers that are machinery, not swarm members ("seed"/"supervisor"
+# are the startup task seeder and backlog top-up, not the a01 supervisor role)
+_SYSTEM_AGENTS = {"orchestrator", "owner", "guard", "peer-panel", "seed",
+                  "supervisor"}
 
 # cycle_done outcomes that mean "this cycle moved the lab forward"
 _PRODUCTIVE_OUTCOMES = {"merged", "rejected", "failed", "yield", "rework"}
@@ -232,6 +234,164 @@ def _incoherence_rate(rejected_why: dict, decided: int | None) -> float | None:
     substantive = rejected_why.get("objector_unmoved", 0) \
         + rejected_why.get("conceded", 0)
     return substantive / decided
+
+
+# --------------------------------------------------------------- percent view
+_MAX_PANEL_ROUNDS = 2  # P19: round-1 voting + at most one defense round
+
+
+def _pct(x: float | int | None) -> float | None:
+    return None if x is None else round(float(x) * 100, 1)
+
+
+def _frac(num: float | int | None, den: float | int | None) -> str:
+    """Compact 'num/den' raw cell; honest '—' when either side is missing."""
+    if num is None or not den:
+        return "—"
+    return f"{num:g}/{den:g}"
+
+
+def percent_rows(report: dict) -> list[dict]:
+    """Every swarm metric on ONE percentage scale for a quick read.
+
+    The raw report mixes rates (0..1), counts, means and the elasticity S —
+    hard to glance at. Conversion rules, kept auditable on purpose:
+    - a rate (0..1) maps directly: 0.62 -> 62%;
+    - a count maps to its share of the metric's natural total;
+    - the elasticity S maps so 100% == linear scaling (S=1);
+    - mean panel rounds map against the P19 round cap (2 rounds);
+    - a metric with no honest denominator keeps ``pct=None`` ('—') —
+      never faked into a percentage.
+    ``good_high`` says whether a HIGHER percentage is the healthy direction,
+    so the CLI can colour the cell without re-encoding policy."""
+    g = report["groups"]
+    c, d = g["coordination_task"], g["convergence_dynamics"]
+    h, r, v = g["trajectory_handoff"], g["resilience_scalability"], \
+        g["governance_cost"]
+    judged = c.get("judged_outcomes") or 0
+    decided = c.get("panels_decided") or 0
+    defended = d.get("panels_defended")
+    n_defended = (sum(defended.values()) if isinstance(defended, dict)
+                  else (defended or 0))
+    repl = r.get("replication_counts") or {}
+    repl_total = sum(repl.values())
+    rows: list[dict] = []
+
+    def add(group: int, label: str, raw: str, pct: float | None,
+            good_high: bool, hint: str) -> None:
+        rows.append({"group": group, "metric": label, "raw": raw, "pct": pct,
+                     "good_high": good_high, "hint": hint})
+
+    # --- G1 coordination & task ------------------------------------------
+    rate = c.get("task_completion_rate")
+    add(1, "Tỷ lệ hoàn thành nhiệm vụ",
+        _frac(round(rate * judged) if rate is not None and judged else None,
+              judged or None),
+        _pct(rate), True, "≥70%: bầy hoàn thành tốt khối việc được giao")
+    rate = c.get("coordination_effectiveness")
+    add(1, "Hiệu quả phối hợp (≥2 reviewer độc lập)",
+        _frac(c.get("panels_with_cross_review"), decided), _pct(rate), True,
+        "100%: không kết quả nào do một agent tự chấm tự duyệt")
+    rate = c.get("exploration_coverage")
+    add(1, "Độ bao phủ tìm kiếm",
+        _frac(c.get("citation_domains"), None) if c.get("findings") else "—",
+        _pct(rate), True,
+        "100%: các trích dẫn không dồn vào một nguồn duy nhất")
+    rate = c.get("solution_diversity")
+    add(1, "Độ đa dạng giải pháp", _frac(None, report.get("agents_active")),
+        _pct(rate), True,
+        "100%: mọi agent đều có kết quả — không hội tụ sớm quanh một hướng")
+    add(1, "Số nhóm việc (category)", str(c.get("category_spread") or 0),
+        None, True, "bầy tự chia bao nhiêu loại công việc")
+
+    # --- G2 convergence & dynamics ----------------------------------------
+    rate = d.get("convergence_correctness")
+    add(2, "Hội tụ đúng (panel approve)",
+        _frac(round(rate * decided) if rate is not None and decided else None,
+              decided or None),
+        _pct(rate), True, "cao: ít tài liệu lỗi lọt qua vòng hội tụ")
+    rounds = d.get("mean_panel_rounds")
+    add(2, "Vòng vote trung bình (tối đa 2)",
+        f"{rounds:.1f}/{_MAX_PANEL_ROUNDS}" if rounds is not None else "—",
+        _pct(rounds / _MAX_PANEL_ROUNDS) if rounds is not None else None,
+        False, "100%: mọi phán quyết đều phải đi qua defense — tranh luận nhiều")
+    rate = d.get("defense_save_rate")
+    add(2, "Defense cứu được MR",
+        _frac(round(rate * n_defended) if rate is not None and n_defended
+              else 0, n_defended or None),
+        _pct(rate), True,
+        "vừa phải là tốt — quá cao: lỗi lặp lại, 0%: phản biện hình thức")
+    add(2, "Chu kỳ trung bình của kết quả",
+        f"{d['mean_trace_cycle']:.1f}" if d.get("mean_trace_cycle")
+        is not None else "—", None, False,
+        "số chu kỳ để bầy cho ra một kết quả được chấm")
+
+    # --- G3 trajectory & handoff ------------------------------------------
+    rate = h.get("productive_vs_looping")
+    add(3, "Chu kỳ sinh sản lượng",
+        _frac(h.get("productive_cycles"), h.get("total_cycles")),
+        _pct(rate), True, "≥50%: đa số chu kỳ tạo giá trị, không kẹt vòng lặp")
+    rate = h.get("handoff_churn")
+    add(3, "Churn chuyển giao (release/claim)",
+        f"{rate:.2f}x" if rate is not None else "—", _pct(rate), False,
+        ">100%: nhả claim nhiều hơn nhận — bầy đang xoay vòng không ăn khớp")
+    rate = h.get("cycle_error_share")
+    add(3, "Chu kỳ lỗi", f"{rate:.2f}" if rate is not None else "—",
+        _pct(rate), False, "thấp: quỹ đạo xử lý ổn định, ít vỡ chu kỳ")
+    add(3, "Độ dài quỹ đạo (node/chu kỳ)",
+        f"{h['trajectory_length_nodes']:.1f}"
+        if h.get("trajectory_length_nodes") is not None else "—",
+        None, False, "3-5 node/chu kỳ là mức tự nhiên của research graph")
+    add(3, "Ma sát claim", str(h.get("claim_friction_events") or 0),
+        None, False, "lock conflict / claim không ổn định / replay bị chặn")
+
+    # --- G4 resilience & scalability ---------------------------------------
+    rate = r.get("llm_ok_rate")
+    add(4, "LLM ok-rate", "—", _pct(rate), True,
+        "≥90%: phiên browser/LLM ổn định giữa chừng run")
+    rate = r.get("error_recovery_rate")
+    add(4, "Phục hồi sau lỗi chu kỳ",
+        _frac(None, None), _pct(rate), True,
+        "100%: không agent nào chết một chiều sau một lần lỗi")
+    repl_ok = repl.get("replicated")
+    add(4, "Replication kiểm chứng (P24)",
+        _frac(repl_ok, repl_total or None),
+        _pct(repl_ok / repl_total) if repl_total else None, True,
+        "kiến thức được tái lập độc lập — cao: bền vững trước ảo giác")
+    s = r.get("scalability_S")
+    add(4, "Độ co giãn S (100% = tuyến tính)",
+        f"{s:.2f}" if s is not None else "—",
+        _pct(s) if s is not None else None, True,
+        ">100%: siêu tuyến (thêm agent được giá); <0%: thêm agent gây hại")
+    add(4, "Budget breaker mở", str(r.get("budget_breaker_opens") or 0),
+        None, False, "số lần ngắt khẩn khi vượt ngân sách LLM")
+    add(4, "plan_retry_recovered / rework_start",
+        f"{r.get('plan_retry_recovered') or 0} / "
+        f"{r.get('rework_starts') or 0}", None, False,
+        "tự chữa kế hoạch / làm lại có chủ đích")
+
+    # --- G5 governance & cost ----------------------------------------------
+    rate = v.get("incoherence_rate")
+    add(5, "Incoherence (bị peer bắt lỗi thực chất)", "—", _pct(rate), False,
+        "thấp: bầy tự lọc tri thức rác hiệu quả trước khi ghi sổ")
+    why = v.get("rejected_why") or {}
+    for reason, cnt in sorted(why.items()):
+        add(5, f"Lý do reject: {reason}", _frac(cnt, decided or None),
+            _pct(cnt / decided) if decided else None, False,
+            "phân bố lý do từ chối trên tổng panel đã quyết")
+    gap = v.get("quality_gap_objectors")
+    add(5, "Quality gap (objectors: rejected − approved)",
+        f"{gap:+.2f}" if gap is not None else "—", None, True,
+        ">0: panel bắt lỗi đúng chỗ hỏng, không bắt vì mood")
+    cpm = v.get("llm_calls_per_merged")
+    add(5, "LLM calls / mỗi MR merge",
+        f"{cpm:.1f}" if cpm is not None else "—", None, False,
+        "chi phí điều phối tính trên một kết quả được merge")
+    spm = v.get("llm_seconds_per_merged")
+    add(5, "Thời gian LLM / mỗi MR merge",
+        f"{spm:.0f}s" if spm is not None else "—", None, False,
+        "chi phí thời gian đồng hồ tính trên một kết quả được merge")
+    return rows
 
 
 # ------------------------------------------------------------------ history
