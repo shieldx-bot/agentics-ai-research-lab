@@ -16,6 +16,8 @@ uvicorn>=0.30.0
 # VPS). Missing SDK = every LLM ask dies with ModuleNotFoundError; tests pass
 # because they stub the client, so this MUST stay a hard requirement.
 hyperbrowser>=1.15
+# The client drives the cloud session over Playwright CDP (docs/LLM_PROVIDERS.md).
+playwright>=1.45
 
 # Vector memory (optional but recommended)
 chromadb>=0.5.0

@@ -212,7 +212,26 @@ class HyperbrowserClient:
             # one session per token: evict the current holder of THIS token
             # (holders on other tokens keep their sessions — that is the pool)
             await holder._teardown()
-        sess = await asyncio.to_thread(self._hb.sessions.create, self._session_params())
+        sess = None
+        for attempt in (1, 2):
+            try:
+                sess = await asyncio.to_thread(
+                    self._hb.sessions.create, self._session_params())
+                break
+            except Exception as exc:
+                if "Maximum number of active sessions" not in str(exc) or attempt == 2:
+                    raise
+                # A cap-sized token (1 session) hits 429 when a previous ask's
+                # session is still propagating its stop() on HB's side, or a
+                # crashed run leaked one. Sessions on THIS key can only be
+                # ours — one session per token by design (_ACTIVE_BY_KEY) —
+                # so stopping them is self-healing, never disruptive.
+                log.warning(
+                    "hyperbrowser session cap hit for this token; "
+                    "stopping leaked session(s) and retrying once")
+                await self._stop_leaked_sessions()
+        if sess is None:
+            raise RuntimeError("hyperbrowser session creation failed")
         self._session_id = sess.id
         log.info("hyperbrowser session %s created for %s", sess.id, self.account.name)
         try:
@@ -228,6 +247,23 @@ class HyperbrowserClient:
             await self._teardown()
             raise
         _ACTIVE_BY_KEY[self.api_key] = self
+
+    async def _stop_leaked_sessions(self) -> None:
+        """Stop every session still active on THIS token, then give HB's
+        active-session counter a few seconds to reflect the stops."""
+        try:
+            resp = await asyncio.to_thread(self._hb.sessions.list, None)
+            dump = resp.model_dump() if hasattr(resp, "model_dump") else {}
+            for s in dump.get("sessions", []) or []:
+                status = str(s.get("status") or "").lower()
+                if status in ("active", "running", "state_active"):
+                    try:
+                        await asyncio.to_thread(self._hb.sessions.stop, s["id"])
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(5)
 
     async def _teardown(self) -> None:
         self._page = None

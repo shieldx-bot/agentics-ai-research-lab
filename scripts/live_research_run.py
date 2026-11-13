@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from agentics.agents.roles import Role  # noqa: E402
-from agentics.config import Settings  # noqa: E402
+from agentics.config import get_settings  # noqa: E402
 from agentics.graph import nodes  # noqa: E402
 from agentics.llm.session_host import BrowserSessionHost  # noqa: E402
 from agentics.memory.shared_memory import SharedMemory  # noqa: E402
@@ -87,7 +87,10 @@ def build_ctx(settings: Settings, host: BrowserSessionHost, mem: SharedMemory):
 
 
 async def main() -> None:
-    settings = Settings()
+    # get_settings() (not bare Settings()) so configs/lab.yaml AND the
+    # gitignored configs/secrets.yaml apply — the same pipeline production
+    # uses. secrets.yaml is where hyperbrowser_api_key lives.
+    settings = get_settings()
     hb_key = os.environ.get("HB_API_KEY", "") or settings.hyperbrowser_api_key
     backend = os.environ.get("LIVE_BACKEND", "").lower() or (
         "hyperbrowser" if hb_key else "local")
@@ -105,8 +108,18 @@ async def main() -> None:
     settings.ensure_dirs()
 
     scratch = Path(tempfile.mkdtemp(prefix="live-run-"))
+    # Hermetic run: memory AND the vector store live in the scratch dir so a
+    # repeat run on the same topic is not skipped by the P7 dedup gate via
+    # findings persisted by earlier runs (and the repo data/ stays clean).
+    settings.data_dir = scratch / "data"
+    settings.chroma_path = scratch / "data" / "chroma"
+    settings.workspaces_dir = scratch / "data" / "workspaces"
+    settings.ensure_dirs()
     mem = SharedMemory(scratch / "memory.db")
-    host = BrowserSessionHost.from_settings(settings)
+    # Pin to ONE pool identity (production does the same per agent thread):
+    # research and plan then reuse the SAME client/cloud session instead of
+    # churning sessions per node — the cap-sized single-token case needs it.
+    host = BrowserSessionHost.from_settings(settings).view(prefer_index=0)
     ctx = build_ctx(settings, host, mem)
     report = {"topic": settings.research_topic, "backend": backend}
 
@@ -116,7 +129,9 @@ async def main() -> None:
     state = nodes.node_start(ctx, state)
     print(f"[{time.monotonic() - t0:6.1f}s] node_research (topic: {settings.research_topic[:70]}…)")
     state = await nodes.node_research(ctx, state)
-    answer = state.get("papers", [{}])[0].get("answer", "")
+    # node_research may legitimately return WITHOUT papers (P7 dedup skip,
+    # budget-blocked run) — never assume a finding exists.
+    answer = (state.get("papers") or [{}])[0].get("answer", "")
     report["research"] = {
         "done": state.get("done"), "error": state.get("error", ""),
         "citations": state.get("citations", []),
@@ -159,7 +174,13 @@ async def main() -> None:
     print(f"[{time.monotonic() - t0:6.1f}s] memory: {len(findings)} finding(s) persisted")
 
     for client in list(host._clients.values()):
-        await client.close()
+        closer = getattr(client, "close", None)
+        if closer is None:
+            continue  # local PerplexityClient keeps no session to tear down
+        try:
+            await closer()
+        except Exception as exc:  # noqa: BLE001
+            print(f"client teardown warning: {exc}")
     mem.close()
 
     out = Path(os.environ.get(
