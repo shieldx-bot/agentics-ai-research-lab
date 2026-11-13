@@ -193,6 +193,41 @@ under a live swarm would corrupt sessions; stop the lab first
 (`configs/lab.yaml` wins over `RESEARCH_TOPIC` in `.env`) and start the lab
 again — schema, bare origin and vector store are rebuilt empty.
 
+### 4c. Grading the swarm itself — `agentics swarm-eval`
+
+Output quality alone cannot judge a multi-agent lab: one lucky answer can
+come from premature convergence or a single agent carrying the rest
+(swarm-intelligence evaluation literature calls for trajectory,
+collaboration and hierarchy metrics, not just per-answer scores).
+`agentics swarm-eval` (`agentics/swarm_eval.py`) grades the lab AS A SWARM
+from its own immutable traces — no LLM, read-only — in five groups:
+
+1. **Coordination & task** — merge rate (judged traces), share of decided
+   panels that had >= 2 distinct reviewers (cross-agent verification),
+   citation-domain coverage of findings, share of active agents that ever
+   produced a terminal outcome;
+2. **Convergence & dynamics** — panel approval rate (converged to correct),
+   mean vote rounds and mean cycle to a verdict, defense save rate;
+3. **Trajectory & handoff** — productive-vs-looping cycle ratio
+   (`cycle_done` outcomes vs `no_change`), node events per cycle
+   (trajectory length), claim churn and lock friction, cycle-error share;
+4. **Resilience & scale** — LLM ok-rate, budget-breaker trips, error
+   recovery (a `cycle error` followed by that agent's next `cycle_done`),
+   plan-retry/rework recovery, replication counts, and the scalability
+   elasticity **S = %ΔP / %ΔN** across persisted snapshots at different
+   swarm sizes (S > 1 → superlinear);
+5. **Governance & cost** — quality gap (distinct objectors on rejected vs
+   approved panels), peer-substantiated incoherence rate (objection stood
+   after defense / author conceded), LLM calls + wall-clock seconds per
+   merged MR (cookie providers expose no token counts — the ledger's
+   honest units).
+
+Flags: `--days N` (window), `--json` (full machine-readable report),
+`--no-save` (don't persist). Every real evaluation appends one row to
+`swarm_eval_snapshots` — the history that makes S and trend reading
+possible. Missing data renders as an honest `n/a`, never a fabricated
+number. Tests: `tests/test_swarm_eval.py`.
+
 ---
 
 ## 5. Testing
@@ -215,6 +250,10 @@ again — schema, bare origin and vector store are rebuilt empty.
 - `tests/test_reset_memory.py` — topic reset: dry-run deletes nothing,
   running-agent guard, complete wipe (DB/WAL/chroma/personal/workspaces/
   origin), `--keep-repo`, cold lab, CLI paths.
+- `tests/test_swarm_eval.py` — the five swarm-metric groups over a seeded
+  history (panels with defense, findings, LLM ledger, error recovery),
+  scalability elasticity S across snapshots, honest `None` on empty data,
+  CLI rendering + snapshot persistence.
 
 ---
 

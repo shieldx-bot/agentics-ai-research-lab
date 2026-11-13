@@ -463,6 +463,157 @@ def metrics(
     memory.close()
 
 
+@app.command("swarm-eval")
+def swarm_eval(
+    days: int = typer.Option(0, "--days", help="chỉ đánh giá N ngày gần nhất (0 = toàn bộ)"),
+    as_json: bool = typer.Option(False, "--json", help="in toàn bộ report dạng JSON"),
+    no_save: bool = typer.Option(False, "--no-save", help="không lưu snapshot vào DB"),
+) -> None:
+    """Đánh giá bầy đàn AS A SWARM — quỹ đạo, cộng tác, hội tụ, chịu lỗi, chi phí.
+
+    Tổng hợp 5 nhóm chỉ số swarm-intelligence từ chính vết tích của lab
+    (journal, tasks, MR, panel P19, ledger LLM): hiệu quả phối hợp & nhiệm
+    vụ, hành vi hội tụ, quỹ đạo & chuyển giao, khả năng chịu lỗi & mở rộng
+    (độ co giãn S qua các snapshot), quản trị & chi phí. Không dùng LLM,
+    chỉ đọc — mỗi lần chạy lưu 1 snapshot để so sánh giữa các quy mô đàn."""
+    import time as _t
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.swarm_eval import (attach_scalability, evaluate_swarm,
+                                     save_snapshot)
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        since = _t.time() - days * 86400 if days > 0 else 0.0
+        report = evaluate_swarm(memory, since_ts=since)
+        report = attach_scalability(memory, report)
+        if not no_save:
+            snap_id = save_snapshot(memory, report)
+            report["snapshot_id"] = snap_id
+        if as_json:
+            console.print_json(json.dumps(report, ensure_ascii=False))
+            return
+        _print_swarm_eval(report, memory)
+    finally:
+        memory.close()
+
+
+def _fmt(v, pct: bool = False) -> str:
+    """One metric cell — honest 'n/a' when the lab lacks the data."""
+    if v is None:
+        return "[dim]n/a (chưa đủ dữ liệu)[/]"
+    if pct:
+        return f"{v:.0%}"
+    if isinstance(v, float):
+        return f"{v:.2f}"
+    return str(v)
+
+
+def _print_swarm_eval(report: dict, memory) -> None:
+    """Rich rendering: one table per metric group, snapshot footer."""
+    g = report["groups"]
+    n = report["agents_active"]
+    console.print(f"[bold]Swarm evaluation[/] — {n} agent hoạt động "
+                  f"({report['generated'][:16]}Z)")
+    if n == 0:
+        console.print("[yellow]Không có hoạt động agent nào trong cửa sổ "
+                      "này — hãy để lab chạy vài chu kỳ rồi đánh giá lại.[/]")
+
+    t1 = Table(title="1. Hiệu quả phối hợp & nhiệm vụ (Coordination & Task)")
+    t1.add_column("chỉ số", overflow="fold")
+    t1.add_column("giá trị")
+    c = g["coordination_task"]
+    t1.add_row("Tỷ lệ hoàn thành (merge/judged)", _fmt(c["task_completion_rate"], pct=True))
+    t1.add_row("Hiệu quả phối hợp (panel có >=2 reviewer độc lập)",
+               _fmt(c["coordination_effectiveness"], pct=True))
+    t1.add_row(f"  panel đã quyết / có cross-review",
+               f"{c['panels_decided']} / {c['panels_with_cross_review']}")
+    t1.add_row("Độ bao phủ tìm kiếm (domain citation khác nhau)",
+               _fmt(c["exploration_coverage"], pct=True))
+    t1.add_row("  findings / domains", f"{c['findings']} / {c['citation_domains']}")
+    t1.add_row("Độ đa dạng giải pháp (tác giả có kết quả / agent)",
+               _fmt(c["solution_diversity"], pct=True))
+    t1.add_row("  số nhóm công việc (category)", str(c["category_spread"]))
+    console.print(t1)
+
+    t2 = Table(title="2. Động lực học & hội tụ (Convergence & Dynamics)")
+    t2.add_column("chỉ số", overflow="fold")
+    t2.add_column("giá trị")
+    d = g["convergence_dynamics"]
+    t2.add_row("Hội tụ đúng (tỷ lệ panel approve)", _fmt(d["convergence_correctness"], pct=True))
+    t2.add_row("Số vòng vote trung bình tới phán quyết", _fmt(d["mean_panel_rounds"]))
+    t2.add_row("Chu kỳ trung bình của kết quả đầu ra", _fmt(d["mean_trace_cycle"]))
+    t2.add_row("Tỷ lệ defense cứu được MR", _fmt(d["defense_save_rate"], pct=True))
+    t2.add_row("  panel có bảo vệ (round 2)", str(d["panels_defended"]))
+    console.print(t2)
+
+    t3 = Table(title="3. Quỹ đạo & luồng thông tin (Trajectory & Handoff)")
+    t3.add_column("chỉ số", overflow="fold")
+    t3.add_column("giá trị")
+    h = g["trajectory_handoff"]
+    t3.add_row("Tỷ lệ chu kỳ sinh sản lượng (vs kẹt vòng lặp)",
+               _fmt(h["productive_vs_looping"], pct=True))
+    t3.add_row("  chu kỳ sinh sản lượng / tổng",
+               f"{h['productive_cycles']} / {h['total_cycles']}")
+    t3.add_row("Độ dài quỹ đạo (node/chu kỳ)", _fmt(h["trajectory_length_nodes"]))
+    t3.add_row("Churn chuyển giao (release/claim)", _fmt(h["handoff_churn"]))
+    t3.add_row("Ma sát claim (lock conflict/unstable/replay)", str(h["claim_friction_events"]))
+    t3.add_row("Tỷ lệ chu kỳ lỗi", _fmt(h["cycle_error_share"], pct=True))
+    console.print(t3)
+
+    t4 = Table(title="4. Chịu lỗi & mở rộng (Resilience & Scalability)")
+    t4.add_column("chỉ số", overflow="fold")
+    t4.add_column("giá trị")
+    r = g["resilience_scalability"]
+    repl = ", ".join(f"{k}={n}" for k, n in (r["replication_counts"] or {}).items())
+    t4.add_row("LLM ok-rate", _fmt(r["llm_ok_rate"], pct=True))
+    t4.add_row("Budget breaker mở", str(r["budget_breaker_opens"]))
+    t4.add_row("Phục hồi sau lỗi chu kỳ", _fmt(r["error_recovery_rate"], pct=True))
+    t4.add_row("plan_retry_recovered / rework_start",
+               f"{r['plan_retry_recovered']} / {r['rework_starts']}")
+    t4.add_row("Replication (P24)", repl or _fmt(None))
+    t4.add_row("Độ co giãn quy mô S = %ΔP/%ΔN", _fmt(r.get("scalability_S")))
+    note = r.get("scalability_note") or ""
+    if note:
+        t4.add_row("  ghi chú S", f"[dim]{note}[/]")
+    console.print(t4)
+
+    t5 = Table(title="5. Quản trị & chi phí (Governance & Cost)")
+    t5.add_column("chỉ số", overflow="fold")
+    t5.add_column("giá trị")
+    v = g["governance_cost"]
+    why = ", ".join(f"{k}={n}" for k, n in (v["rejected_why"] or {}).items())
+    mean_dur = (f"{v['llm_mean_duration_s']:.1f}s"
+                if v["llm_mean_duration_s"] else _fmt(None))
+    per_merged_calls = _fmt(v["llm_calls_per_merged"])
+    per_merged_secs = (f"{v['llm_seconds_per_merged']:.0f}s"
+                       if v["llm_seconds_per_merged"] else _fmt(None))
+    t5.add_row("Quality gap (objectors: rejected − approved)", _fmt(v["quality_gap_objectors"]))
+    t5.add_row("Incoherence (bị peer bắt lỗi thực chất)",
+               _fmt(v["incoherence_rate"], pct=True))
+    t5.add_row("Lý do reject", why or _fmt(None))
+    t5.add_row("LLM calls / mean duration", f"{v['llm_calls']} / {mean_dur}")
+    t5.add_row("Chi phí mỗi MR merge (calls / giây)",
+               f"{per_merged_calls} / {per_merged_secs}")
+    t5.add_row("  đơn vị đo", f"[dim]{v['cost_unit_note']}[/]")
+    console.print(t5)
+
+    snaps = memory.list_eval_snapshots(limit=3)
+    if report.get("snapshot_id") is not None:
+        foot = f"snapshot #{report['snapshot_id']} đã lưu — " \
+               f"{len(snaps)} snapshot gần nhất: "
+        foot += ", ".join(f"#{s['id']}({s['agent_count']} agent)"
+                          for s in snaps)
+        console.print(f"[dim]{foot}[/]")
+    else:
+        console.print(f"[dim]không lưu snapshot (--no-save) — "
+                      f"{len(snaps)} snapshot cũ trong DB[/]")
+    console.print("[dim]So sánh theo thời gian: python -m agentics.cli swarm-eval "
+                  "--days 7 --json | jq .groups[/]")
+
+
 @app.command("memory-stats")
 def memory_stats() -> None:
     """Memory health: LifeMem traces/clusters/skills + bounded tables + personal lessons."""

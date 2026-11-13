@@ -295,6 +295,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail TEXT NOT NULL DEFAULT ''         -- JSON, never trimmed, never rewritten
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+CREATE TABLE IF NOT EXISTS swarm_eval_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent_count INTEGER NOT NULL DEFAULT 0, -- distinct agents seen in the window
+    report TEXT NOT NULL DEFAULT '{}'       -- full JSON report of that evaluation
+);
+CREATE INDEX IF NOT EXISTS idx_swarm_eval_ts ON swarm_eval_snapshots(ts);
 """
 
 
@@ -809,6 +816,35 @@ class SharedMemory:
         return row[0] if row and row[0] else None
 
     # ------------------------------------------------- audit_log (P21, immutable)
+    def llm_usage_stats(self, since_ts: float = 0.0) -> dict:
+        """Aggregate cost/health view of the LLM ledger (swarm evaluation).
+
+        The cookie providers expose no token counts, so cost is measured in
+        the honest units the ledger actually has: calls, failures and
+        wall-clock seconds per purpose."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ok, duration_s, purpose FROM llm_usage WHERE ts>=?",
+                (since_ts,),
+            ).fetchall()
+        calls = len(rows)
+        ok_calls = sum(1 for ok, _d, _p in rows if ok)
+        total_s = sum(d for _ok, d, _p in rows)
+        by_purpose: dict[str, dict[str, float]] = {}
+        for ok, duration, purpose in rows:
+            slot = by_purpose.setdefault(
+                purpose or "other", {"calls": 0, "fails": 0, "duration_s": 0.0})
+            slot["calls"] += 1
+            slot["fails"] += 0 if ok else 1
+            slot["duration_s"] += duration
+        return {
+            "calls": calls,
+            "ok_rate": (ok_calls / calls) if calls else None,
+            "mean_duration_s": (total_s / calls) if calls else None,
+            "total_duration_s": total_s,
+            "by_purpose": by_purpose,
+        }
+
     def audit(self, agent: str, event: str, detail: dict | str = "") -> int:
         """Append ONE row to the immutable audit log (P21).
 
@@ -1397,6 +1433,28 @@ class SharedMemory:
             for r in reversed(rows)
         ]
 
+    def journal_events(self, since_ts: float = 0.0) -> list[dict]:
+        """Every kept journal row since a timestamp, detail parsed as JSON.
+
+        The journal is bounded (_JOURNAL_KEEP_ROWS), so this is the full
+        retained window — the raw material of the swarm evaluation."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, agent, event, detail FROM journal WHERE ts>=? "
+                "ORDER BY id", (since_ts,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                detail = json.loads(r[4]) if r[4] else {}
+                if not isinstance(detail, dict):
+                    detail = {"raw": str(detail)[:200]}
+            except json.JSONDecodeError:
+                detail = {"raw": str(r[4])[:200]}
+            out.append({"id": r[0], "ts": r[1], "agent": r[2],
+                        "event": r[3], "detail": detail})
+        return out
+
     # ------------------------------------------------------------ tasks (local issue queue)
     def create_task(
         self, title: str, body: str = "", category: str = "research",
@@ -1858,6 +1916,35 @@ class SharedMemory:
             "top_objectors": [{"voter": v, "objections": n} for v, n in obj_rows[:5]],
             "votes": {k: n for k, n in vote_rows},
         }
+
+    # ------------------------------------------------------------ swarm evaluation snapshots
+    def save_eval_snapshot(self, agent_count: int, report: dict) -> int:
+        """Persist one swarm-evaluation report (the history that makes the
+        scalability elasticity S computable across different swarm sizes)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO swarm_eval_snapshots (ts, agent_count, report) "
+                "VALUES (?,?,?)",
+                (time.time(), int(agent_count),
+                 json.dumps(report, ensure_ascii=False)[:60000]),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_eval_snapshots(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, agent_count, report FROM swarm_eval_snapshots "
+                "ORDER BY id DESC LIMIT ?", (int(limit),),
+            ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                report = json.loads(r[3])
+            except json.JSONDecodeError:
+                report = {}
+            out.append({"id": r[0], "ts": r[1], "agent_count": r[2],
+                        "report": report})
+        return out
 
     # ------------------------------------------------------------ traces (GEA)
     def add_trace(
