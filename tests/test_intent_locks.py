@@ -161,7 +161,7 @@ class FakeWS:
     def read_file(self, path):
         return ""
 
-    def write_file(self, path, content):
+    def write_file(self, path, content, allow=False):
         pass
 
     def changed_files(self):

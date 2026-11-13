@@ -28,6 +28,7 @@ from agentics.evolution.traces import (
 )
 from agentics.graph.state import ResearchState
 from agentics.local_ops import branch_name
+from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
@@ -744,7 +745,13 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         content = answer.strip().removeprefix("```").removesuffix("```")
         if content.strip():
             try:
-                await asyncio.to_thread(ctx.workspace.write_file, path, content)
+                # owner-exempt task ('agentics allow-protected'): the write
+                # gate opens for the task's agent-code files — credentials
+                # (.env, STOP, accounts/, configs/secrets.yaml) stay blocked.
+                # The diff gate (layer 2) re-verifies the whole set after.
+                allow = (bool(state.get("task_exempt"))
+                         and not is_credential_path(path))
+                await asyncio.to_thread(ctx.workspace.write_file, path, content, allow)
             except ValueError as exc:      # P10 layer 1: protected path / traversal
                 return await _yield(ctx, state, str(exc))
 

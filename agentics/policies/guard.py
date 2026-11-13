@@ -41,10 +41,24 @@ DEFAULT_PROTECTED_PATHS: tuple[str, ...] = (
 )
 
 # Files agents may never touch even when a task carries an exemption.
+# .env holds tokens, STOP is the owner's only kill switch — both join
+# accounts/ and configs/secrets.yaml in the never-exemptable set (a task
+# exemption may not exfiltrate credentials or halt the swarm).
 ALWAYS_PROTECTED: tuple[str, ...] = (
     "accounts/",          # cookies / credentials
     "configs/secrets.yaml",
+    ".env",
+    "STOP",
 )
+
+def is_credential_path(path: str) -> bool:
+    """True for cookie/secret paths — blocked even with an exemption."""
+    norm = (path or "").strip()
+    while norm.startswith("./"):
+        norm = norm[2:]
+    norm = norm.lstrip("/")
+    return any(norm == p or norm.startswith(p) for p in ALWAYS_PROTECTED)
+
 
 # Env var marking the ONLY sanctioned pushes that may move main / carry
 # owner-exempt protected paths (Integrator merge, owner-exempted task).
@@ -119,7 +133,10 @@ class ProtectedPathsGuard:
         )
 
     def _always_protected(self, path: str) -> bool:
-        norm = (path or "").strip().lstrip("./")
+        norm = (path or "").strip()
+        while norm.startswith("./"):       # strip "./" noise, never a real dot
+            norm = norm[2:]
+        norm = norm.lstrip("/")
         return any(norm == p or norm.startswith(p) for p in ALWAYS_PROTECTED)
 
     def check_task(

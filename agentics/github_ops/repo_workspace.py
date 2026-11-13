@@ -130,10 +130,13 @@ class RepoWorkspace:
             raise ValueError("path escapes the agent workspace") from exc
         return target
 
-    def write_file(self, rel_path: str, content: str) -> None:
+    def write_file(self, rel_path: str, content: str, allow: bool = False) -> None:
         # P10 layer 1: the lab's own code cannot even be written into a
-        # workspace (regardless of what the plan says).
-        if self.guard is not None and self.guard.is_protected(rel_path):
+        # workspace (regardless of what the plan says). `allow=True` opens the
+        # supervised evolution lane ONLY — node_implement passes it for lane
+        # files of an owner-exempt task (checked per file: lane path, not a
+        # credential). The diff gate (layer 2) re-verifies the whole set.
+        if self.guard is not None and self.guard.is_protected(rel_path) and not allow:
             raise ValueError(
                 f"P10 protected path: '{rel_path}' is lab code — agents must "
                 "not modify it (owner can exempt a task: agentics.cli allow-protected)"
