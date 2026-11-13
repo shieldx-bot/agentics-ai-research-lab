@@ -309,7 +309,20 @@ class HyperbrowserClient:
         try:
             await box.wait_for(state="visible", timeout=timeout_s * 1000)
             return box
-        except Exception as exc:  # noqa: BLE001
+        except Exception as first_exc:  # noqa: BLE001
+            # One in-place recovery BEFORE escalating: a slow SPA hydration or
+            # a late frontend deploy often renders the composer a beat after
+            # the first wait gives up. Escalating straight to the shared
+            # circuit breaker used to stall EVERY agent for minutes on what a
+            # simple reload heals — the 25s-timeout failure class from the
+            # 2026-11-12 incident, now self-healing instead of circuit-opening.
+            try:
+                await self._goto_home()
+                await box.wait_for(state="visible", timeout=timeout_s * 1000)
+                log.info("composer recovered after one reload (%s)", self.account.name)
+                return box
+            except Exception:  # noqa: BLE001 — fall through to the diagnostics
+                exc = first_exc
             diag = await self._page_diagnostics()
             combined = " ".join(diag.values())
             if self._challenge_text(combined):
@@ -422,6 +435,16 @@ class HyperbrowserClient:
                     prefix += "[Instructions] " + system.strip()[:800] + " "
                 await self._submit(prefix + query)
                 answer, citations = await self._collect_answer()
+                if not answer:
+                    # A silent submit failure (Enter swallowed, answer markup
+                    # moved) must not masquerade as an LLM answer: downstream
+                    # nodes would parse "" into a JSON crash (node_plan) or a
+                    # wasted cycle (node_verify). Raised as a UI outage so the
+                    # session host fails over without cooling the account.
+                    raise HyperbrowserUIError(
+                        "Perplexity produced no answer text after "
+                        f"{self.answer_wait_s}s (submit may have failed silently)"
+                    )
             except Exception:
                 await self._teardown()               # next ask rebuilds cleanly
                 raise
