@@ -50,6 +50,29 @@ def _memory_context(ctx: AgentContext) -> dict:
     }
 
 
+def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
+    """H3 consumption side — the swarm's settled knowledge as prompt text.
+
+    Composes the memory layer's `verified_knowledge()` (settled hypotheses:
+    supported become reusable common ground, refuted stop being repeated)
+    with the newest evidence rows (real runs by real agents). Returns ""
+    when nothing has been verified yet, so prompts stay unchanged at cold
+    start. Bounded: a prompt must not drown in the lab's whole history."""
+    try:
+        hyps = ctx.memory.verified_knowledge(limit=limit)
+    except Exception:  # noqa: BLE001 — knowledge injection must never break a cycle
+        return ""
+    lines: list[str] = []
+    for h in hyps:
+        mark = "SUPPORTED" if h["status"] == "supported" else "REFUTED"
+        note = f" — {h['note'][:110]}" if h.get("note") else ""
+        lines.append(f"- [{mark}] {h['claim'][:180]} (h#{h['id']}{note})")
+    if not lines:
+        return ""
+    return ("Empirically verified by this lab (exit-code verdicts, P16 — build on "
+            "SUPPORTED facts, never re-assert a REFUTED one):\n" + "\n".join(lines))[:1400]
+
+
 async def _llm_ask(
     ctx: AgentContext, prompt: str, mode: str = "concise", purpose: str = "general",
     state: ResearchState | None = None,
@@ -313,9 +336,13 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
         state["action"] = "plan"
         return state
     topic = state.get("issue_title") or ctx.settings.research_topic
+    # H3: the research LLM must know what the swarm already PROVED by running
+    # code — supported facts are common ground, refuted claims are dead ends.
+    knowledge = verified_knowledge_text(ctx)
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
+        + (f"\n\n{knowledge}" if knowledge else "")
     )
     # P7: dedup — skip if the swarm already covered this
     known = await papers_mod.dedup_query(ctx.vector, topic)
@@ -376,6 +403,13 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         category=category)
     tools_txt = tool_context(
         ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}")
+    # H3: plans must stand on what the lab has PROVEN, not on fresh guesses —
+    # and the declared verify_cmds should re-check exactly the new claims.
+    knowledge_txt = verified_knowledge_text(ctx)
+    knowledge_rule = (f"\nVerified knowledge of this lab (P16, exit-code verdicts — "
+                      f"your plan must be consistent with these and your verify_cmds "
+                      f"must check the NEW claims):\n{knowledge_txt}\n"
+                      if knowledge_txt else "")
     evolution_rule = (
         "\nThis is a SELF-EVOLUTION issue: you may ONLY change these paths: "
         + ", ".join(EVOLUTION_ALLOWED_PATHS) + ".\n"
@@ -396,7 +430,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{evolution_rule}{rework_rule}\n"
+        f"{tools_txt}\n{evolution_rule}{rework_rule}{knowledge_rule}\n"
         "Propose a concrete implementation plan for this repo. Reply ONLY with "
         'JSON: {"files": [{"path": "...", "change": "new|edit"}], '
         '"steps": ["..."], "commit_message": "...", '
