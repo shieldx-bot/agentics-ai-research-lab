@@ -325,6 +325,29 @@ def create_app(memory: SharedMemory, settings: Settings):
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": str(exc)}, status_code=500)
 
+    @app.get("/health")
+    def health():
+        """Liveness probe for external monitoring (uptime check, k8s probe,
+        systemd watchdog). Cheap by design — never builds the full state:
+        answers 'is the dashboard alive AND can it read shared memory', plus
+        a heartbeat age so stale swarms page before they break."""
+        import time as _time
+        try:
+            agents = memory.active_agents(stale_after_s=300)
+            fresh = memory.recent_journal(limit=1)
+            return JSONResponse({
+                "status": "ok",
+                "db": "ok",
+                "active_agents": len(agents),
+                "last_heartbeat_age_s": (int(_time.time() - agents[0]["last_ts"])
+                                         if agents else None),
+                "last_event_age_s": (int(_time.time() - fresh[0]["ts"])
+                                      if fresh else None),
+            })
+        except Exception as exc:  # noqa: BLE001 — probe must answer honestly
+            return JSONResponse({"status": "degraded", "db": "error",
+                                 "error": str(exc)}, status_code=503)
+
     @app.post("/stop")
     def stop():
         """Owner control: graceful stop — cùng cơ chế STOP file với CLI.
