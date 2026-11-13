@@ -247,6 +247,13 @@ class Settings:
         default_factory=lambda: _env_int("ROLE_PROMPT_MAX_CHARS", 1600))
     role_prompt_rework_failures: int = field(
         default_factory=lambda: _env_int("ROLE_PROMPT_REWORK_FAILURES", 2))
+    # --- Coordination pack A2X (docs/COORDINATION.md) ------------------------
+    # Contract-Net-lite: rank bonus a claim adds to a task the supervisor's
+    # scan awarded to THIS agent (0 disables the allocation signal entirely;
+    # the awards table is still maintained). ~0.75 flips a ranking the way a
+    # priority label would, without overriding the agent's own profile.
+    coord_award_bonus: float = field(
+        default_factory=lambda: _env_float("COORD_AWARD_BONUS", 0.75))
     # Free keyless research tools (docs/FREE_TOOLS.md): arXiv / OpenAlex /
     # Crossref / HuggingFace datasets / Wikipedia / DuckDuckGo. They ground
     # research in real publisher metadata and keep node_research alive when

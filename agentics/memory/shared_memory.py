@@ -302,6 +302,14 @@ CREATE TABLE IF NOT EXISTS swarm_eval_snapshots (
     report TEXT NOT NULL DEFAULT '{}'       -- full JSON report of that evaluation
 );
 CREATE INDEX IF NOT EXISTS idx_swarm_eval_ts ON swarm_eval_snapshots(ts);
+CREATE TABLE IF NOT EXISTS task_awards (
+    -- Contract-Net-lite (A2X): the supervisor's allocation signal. Rewritten
+    -- WHOLESALE on every scan, so a row older than one scan cannot exist.
+    task_id INTEGER PRIMARY KEY,
+    agent TEXT NOT NULL,
+    score REAL NOT NULL,                    -- the Performance-Novelty score it won with
+    ts REAL NOT NULL
+);
 """
 
 
@@ -1597,6 +1605,30 @@ class SharedMemory:
                 "SELECT status, COUNT(*) FROM tasks GROUP BY status"
             ).fetchall()
         return {status: n for status, n in rows}
+
+    # ------------------------------------------------------------ task awards (A2X)
+    def replace_task_awards(self, rows: list[dict]) -> None:
+        """Contract-Net-lite: atomically rewrite the award table.
+
+        The supervisor recomputes the FULL allocation every scan, so the
+        table is deleted and re-inserted in one transaction — a stale award
+        can never outlive one scan, and no per-row cleanup is ever needed.
+        """
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM task_awards")
+            self._conn.executemany(
+                "INSERT INTO task_awards (task_id, agent, score, ts) VALUES (?,?,?,?)",
+                [(r["task_id"], r["agent"], float(r["score"]), time.time())
+                 for r in rows],
+            )
+
+    def awards_for(self, agent: str) -> dict[int, float]:
+        """Awards the supervisor currently holds for ``agent``: task_id -> score."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, score FROM task_awards WHERE agent=?", (agent,)
+            ).fetchall()
+        return {int(t): float(s) for t, s in rows}
 
     # ------------------------------------------------------------ reviews (local MRs)
     def open_review(

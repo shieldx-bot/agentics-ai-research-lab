@@ -19,6 +19,9 @@ from pathlib import Path
 
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, parse_json_block
+from agentics.coordination.allocation import award_digest, recommend_awards
+from agentics.coordination.dossier import review_dossier
+from agentics.coordination.lessons import swarm_lessons
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS,
@@ -376,6 +379,17 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     if not tasks and tasks_src is not None:
         topped_up = tasks_src.supervisor_top_up()
         tasks = ctx.memory.scan_open_tasks(limit=30)
+    # A2X Contract-Net-lite: the scan is no longer only a janitor pass — the
+    # supervisor also ALLOCATES: score every open task x every live claimant
+    # (P–N profiles over real merge history) and award the best pairings.
+    # Awards are a market signal, not a lock: the claimant still races and
+    # decides, the award just lifts the task in its ranking (node_claim).
+    try:
+        awards = recommend_awards(ctx.memory)
+    except Exception:  # noqa: BLE001 — allocation must never break the scan
+        awards = []
+    if awards:
+        ctx.memory.journal(ctx.agent_id, "contract_net_awards", {"awards": awards})
     summary = (
         f"Backlog scan: {len(tasks)} open unclaimed task(s)."
         + (f" Stale claims freed: {freed}." if freed else "")
@@ -385,6 +399,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + (f" P19 panel events: {len(swept_panels)}." if swept_panels else "")
         + (f" P23 replayed {replayed_n} claim(s): {replay_events}."
            if replayed_n else "")
+        + (f" Contract-net awards: {award_digest(awards)}." if awards else "")
     )
     ctx.memory.post_message(ctx.agent_id, "broadcast", summary)
     state["summary"] = summary
@@ -516,7 +531,22 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
     by_id = {i.number: i for i in infos}
     profile = build_profile(ctx.memory.agent_outcomes().get(ctx.agent_id, []))
-    for info, score in rank_issues(infos, profile)[:3]:      # lost race → next best
+    # A2X Contract-Net-lite (award step): a task the supervisor awarded to ME
+    # is lifted by `coord_award_bonus` before the top-3 race window — the
+    # manager's allocation actually moves work to the agent it picked, while
+    # the agent's own profile still dominates ties and un-awarded choices.
+    try:
+        awards = ctx.memory.awards_for(ctx.agent_id)
+    except Exception:  # noqa: BLE001 — a read must never kill the claim
+        awards = {}
+    bonus = float(getattr(getattr(ctx, "settings", None),
+                          "coord_award_bonus", 0.75) or 0)
+    ranked = [
+        (info, sc + (bonus if info.number in awards else 0.0))
+        for info, sc in rank_issues(infos, profile)[:8]
+    ]
+    ranked.sort(key=lambda t: (-round(t[1], 9), t[0].created_ts, t[0].number))
+    for info, score in ranked[:3]:      # lost race → next best
         task = next(t for t in tasks if t["id"] == info.number)
         branch = branch_name(ctx.agent_id, task["id"], task["title"])
         if not ctx.claims.try_claim(task["id"], ctx.agent_id, branch):
@@ -530,7 +560,8 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["action"] = "research"
         ctx.memory.add_decision(
             ctx.agent_id, f"claim task #{task['id']}",
-            f"category={info.category} score={score:.2f} (alpha*sqrt(nov)*priority)")
+            f"category={info.category} score={score:.2f} "
+            f"(alpha*sqrt(nov)*priority{'+award' if info.number in awards else ''})")
         ctx.report(
             node="claim", task_id=task["id"], task_title=task["title"],
             intent={
@@ -1245,6 +1276,16 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                       f"your plan must be consistent with these and your verify_cmds "
                       f"must check the NEW claims):\n{knowledge_txt}\n"
                       if knowledge_txt else "")
+    # A2X swarm lessons: OTHER agents' failures aggregated into signatures —
+    # (xN) means the approach was tried N times by DIFFERENT agents and never
+    # worked (Voyager lesson loop / Reflexion, at swarm scale).
+    swarm_txt = swarm_lessons(ctx.memory, category, exclude_agent=ctx.agent_id)
+    swarm_rule = (
+        f"\nSwarm-wide failure patterns in this category (aggregated over ALL "
+        f"agents' failed/rejected attempts — (xN) repeats mean it NEVER worked; "
+        f"choose a different approach):\n{swarm_txt}\n"
+        if swarm_txt else ""
+    )
     evolution_rule = (
         "\nThis is a SELF-EVOLUTION issue: you may ONLY change these paths: "
         + ", ".join(EVOLUTION_ALLOWED_PATHS) + ".\n"
@@ -1265,7 +1306,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{personal_rule}{recall_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
+        f"{tools_txt}\n{personal_rule}{recall_rule}{swarm_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
         f"{PLAN_INSTRUCTION}"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
@@ -1994,9 +2035,23 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                            + "\n".join(ev_lines))
                 if rerun_note:
                     ev_desc += f"\n\nReviewer's own re-runs: {rerun_note}"
+            # A2X dossier: the reviewer inherits the task's FULL history —
+            # earlier attempts and prior objections (the communication bridge:
+            # the verifier must know what already failed on this task).
+            dossier_txt = ""
+            try:
+                dossier_txt = review_dossier(
+                    ctx.memory, candidate.get("task_id"), mr_id=mr_id)
+            except Exception:  # noqa: BLE001 — a dossier read must never kill the review
+                dossier_txt = ""
+            dossier_desc = (
+                f"\n\nTask history (earlier attempts and prior objections — check "
+                f"this MR does not repeat a known-failed approach):\n{dossier_txt}"
+                if dossier_txt else ""
+            )
             prompt = (
                 f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
-                f"Files:\n{files_desc}\n\n"
+                f"Files:\n{files_desc}\n{dossier_desc}\n\n"
                 f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
                 f"{ev_desc}\n\n"
                 + ("Mechanical check: tier-2 tests PASSED on main+MR (you ran them "
