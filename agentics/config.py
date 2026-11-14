@@ -229,6 +229,17 @@ class Settings:
         default_factory=lambda: _env_int("IDEA_MIN_SCORE", 60))
     idea_repair_margin: int = field(
         default_factory=lambda: _env_int("IDEA_REPAIR_MARGIN", 20))
+    # Saturation escape hatch (owner dashboard 2026-11-14: with the topic
+    # saturated the gate rejected EVERY gap proposal outright — weak=-25
+    # missed the repair band by 5 points and the lab oscillated
+    # skip->reject->skip forever). When the world model proposes a
+    # gap-closing hypothesis under saturation, the repair band widens to
+    # this margin so a near-miss gets its ONE repair round instead of
+    # dying. The re-judge after repair still must FULLY pass the gate
+    # (qualification with repair_margin=0), so this cannot lower the bar
+    # for what gets registered — it only grants the repair attempt.
+    idea_repair_margin_saturation: int = field(
+        default_factory=lambda: _env_int("IDEA_REPAIR_MARGIN_SATURATION", 30))
     idea_max_children: int = field(
         default_factory=lambda: _env_int("IDEA_MAX_CHILDREN", 2))
     idea_max_attempts: int = field(
@@ -331,6 +342,15 @@ class Settings:
     # priority label would, without overriding the agent's own profile.
     coord_award_bonus: float = field(
         default_factory=lambda: _env_float("COORD_AWARD_BONUS", 0.75))
+    # Award TTL (owner dashboard 2026-11-14: task #4 was re-awarded to the
+    # same coder EVERY scan forever because the awarded agent never claimed
+    # it — the market signal became a stuck record). An (task, agent) pair
+    # that survives this many consecutive scans without being claimed is
+    # dropped from the allocation: the manager stops nagging, the task stays
+    # open for the ordinary profile race. 0 disables the TTL (re-award
+    # forever, pre-TTL behavior).
+    coord_award_ttl: int = field(
+        default_factory=lambda: _env_int("COORD_AWARD_TTL", 3))
     # Free keyless research tools (docs/FREE_TOOLS.md): arXiv / OpenAlex /
     # Crossref / HuggingFace datasets / Wikipedia / DuckDuckGo. They ground
     # research in real publisher metadata and keep node_research alive when

@@ -448,7 +448,9 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # Awards are a market signal, not a lock: the claimant still races and
     # decides, the award just lifts the task in its ranking (node_claim).
     try:
-        awards = recommend_awards(ctx.memory)
+        awards = recommend_awards(
+            ctx.memory,
+            ttl=int(getattr(ctx.settings, "coord_award_ttl", 3)))
     except Exception:  # noqa: BLE001 — allocation must never break the scan
         awards = []
     if awards:
@@ -964,6 +966,22 @@ async def _dedup_known(ctx: AgentContext, topic: str) -> list[dict]:
 # budget-gated through _llm_ask, and degrade to "no ideation" on failure —
 # the deep-dive experiment itself never depends on the ideation round.
 
+EXTRACT_CLAIMS_PROMPT = (
+    "Research finding to verify:\n{finding}\n\n"
+    "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
+    "self-contained python simulation can check (simulate the method on "
+    "synthetic data, measure the metric). For each claim write its "
+    "protocol.\n\n"
+    f"{PROTOCOL_CONTRACT}\n"
+    'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+    '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+    '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+    '"assumptions": "...", "effect": "..."}}]}\n\n'
+    "The signature quintuple is the idea's compact identity for the "
+    "swarm's Quality-Diversity archive — keep each field under 25 words."
+)
+
+
 async def _ideation_allowed(ctx: AgentContext) -> bool:
     settings = getattr(ctx, "settings", None)
     if not getattr(settings, "ideation_enabled", False):
@@ -991,7 +1009,8 @@ async def _reject_candidate(ctx: AgentContext, claim: str, reason: str,
 async def _gate_and_register(ctx: AgentContext, child: dict,
                              parents: list[int],
                              recent: list[dict],
-                             depth: int = 0, branch: str = "") -> int | None:
+                             depth: int = 0, branch: str = "",
+                             repair_margin: float | None = None) -> int | None:
     """IDEAgent pipeline for ONE candidate: PEM near-dup gate -> judge ->
     qualification (accept / one repair / reject) -> registry insert.
 
@@ -999,7 +1018,11 @@ async def _gate_and_register(ctx: AgentContext, child: dict,
     or the judge is unavailable. `parents` keeps the Kosmos lineage (the
     settled experiment row this idea grew from). `depth`/`branch` carry the
     discovery-branch position (branch level below the discovery root + the
-    attack angle) so the deep-dive backlog can prioritize the subtree."""
+    attack angle) so the deep-dive backlog can prioritize the subtree.
+    `repair_margin` overrides settings.idea_repair_margin — the saturation
+    pivot passes the WIDER band (idea_repair_margin_saturation) so a
+    near-miss idea gets its one repair round when the lab has nothing else
+    to do; the post-repair re-judge still must fully pass the gate."""
     child = idea.normalize_child(child)
     if child is None:                    # contract violation — nothing to judge
         return None
@@ -1025,7 +1048,8 @@ async def _gate_and_register(ctx: AgentContext, child: dict,
     if j is None:
         return None                      # judge unavailable — no registration
     tau = float(getattr(ctx.settings, "idea_min_score", 60))
-    margin = float(getattr(ctx.settings, "idea_repair_margin", 20))
+    margin = (float(getattr(ctx.settings, "idea_repair_margin", 20))
+              if repair_margin is None else float(repair_margin))
     route = idea.qualification(j, tau=tau, repair_margin=margin)
     if route == "reject":
         await _reject_candidate(
@@ -1368,7 +1392,10 @@ async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bo
                 ctx.memory.journal, ctx.agent_id, "gap_proposal_empty",
                 {"why": "no parsable gap hypothesis"})
             return False
-        hyp_id = await _gate_and_register(ctx, children[0], [], recent)
+        hyp_id = await _gate_and_register(
+            ctx, children[0], [], recent,
+            repair_margin=float(getattr(
+                ctx.settings, "idea_repair_margin_saturation", 30)))
         if hyp_id is None:
             return False
         await asyncio.to_thread(
@@ -1380,6 +1407,77 @@ async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bo
         return True
     except Exception as exc:  # noqa: BLE001 — proposal must never crash research
         log.warning("[%s] gap proposal failed: %s", ctx.agent_id, exc)
+        return False
+
+
+async def _seed_hypotheses_from_findings(ctx: AgentContext,
+                                         state: ResearchState) -> bool:
+    """Saturation escape hatch #2 (P16bis raw material): the world model
+    proposed nothing (or the gate refused the idea), but the swarm holds
+    FINDINGS. Each finding hides 1-2 QUANTITATIVE claims a small python
+    protocol can check — extract them and PRE-REGISTER (criterion locked
+    before any run; no experiment executes here), so the deep-dive backlog
+    picks them up next cycle through the ordinary settle machinery.
+
+    Live 2026-11-14 owner dashboard: with the topic saturated, 5 findings
+    stored and 0 hypotheses registered, the lab oscillated skip->reject
+    forever while the whole settle/replication/discovery pipeline starved.
+    This path is that pipeline's raw-material pump. Returns True when at
+    least one hypothesis was registered. Never raises."""
+    if not await _ideation_allowed(ctx):
+        return False
+    try:
+        findings = await asyncio.to_thread(ctx.memory.list_findings, 2)
+        if not findings:
+            return False
+        registered = 0
+        for finding in findings:
+            answer, _ = await _llm_ask(
+                ctx,
+                EXTRACT_CLAIMS_PROMPT.replace(
+                    "{finding}",
+                    (f"{finding.get('title', '')}\n"
+                     f"{finding.get('content', '')}")[:3000]),
+                mode="concise", purpose="verify")
+            parsed = parse_json_block(answer)
+            specs = [h for h in (parsed.get("hypotheses") or [])
+                     if isinstance(h, dict)][:2]
+            for spec in specs:
+                claim = str(spec.get("claim", "")).strip()[:300]
+                protocol_code = str(spec.get("protocol", ""))
+                if not claim or not protocol_code.strip():
+                    continue
+                try:
+                    criterion = Criterion.from_dict(spec)
+                except ValueError:
+                    continue
+                # Same near-clone gate as node_verify: a reworded claim of
+                # something already in the stream must not pass as new.
+                if not _pem_gate(ctx, claim):
+                    continue
+                hyp_id = await asyncio.to_thread(
+                    ctx.memory.add_hypothesis, ctx.agent_id, claim,
+                    criterion.as_dict(), task_id=state.get("issue_number"),
+                    finding_id=finding.get("id"), status="proposed",
+                    protocol_code=protocol_code[:20000])
+                sig = spec.get("signature")
+                if isinstance(sig, dict) and sig:
+                    await asyncio.to_thread(
+                        ctx.memory.set_hypothesis_signature, hyp_id, sig)
+                registered += 1
+        if registered == 0:
+            return False
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "findings_seeded_hypotheses",
+            {"registered": registered,
+             "why": "saturation pivot: pre-registered quantitative claims "
+                    "from stored findings (P16bis raw material)"})
+        state["summary"] = (
+            f"saturation pivot: pre-registered {registered} hypothesis/ies "
+            "from stored findings (P16bis)")
+        return True
+    except Exception as exc:  # noqa: BLE001 — seeding must never crash research
+        log.warning("[%s] findings seeding failed: %s", ctx.agent_id, exc)
         return False
 
 
@@ -1744,6 +1842,12 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
                     return state
                 state["done"] = True
                 return state
+            # Escape hatch #2: even the gap pivot failed — mine the FINDINGS
+            # the lab already holds for quantitative, protocol-checkable
+            # claims (P16bis needs raw material; each stored finding is an
+            # unmined hypothesis source). Registered only, run next cycle.
+            if await _seed_hypotheses_from_findings(ctx, state):
+                return state
             state["summary"] = f"topic already covered by {len(known)} findings; skipping"
             _close_saturated_task(ctx, state)
             state["done"] = True
@@ -1950,20 +2054,10 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             "expected_files": [],
         },
     )
-    prompt = (
-        f"Research finding to verify:\n{finding_text[:3000]}\n\n"
-        "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
-        "self-contained python simulation can check (simulate the method on "
-        "synthetic data, measure the metric). For each claim write its "
-        "protocol.\n\n"
-        f"{PROTOCOL_CONTRACT}\n"
-        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
-        '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
-        '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
-        '"assumptions": "...", "effect": "..."}}]}\n\n'
-        "The signature quintuple is the idea's compact identity for the "
-        "swarm's Quality-Diversity archive — keep each field under 25 words."
-    )
+    # .replace, not .format: the contract text embeds literal JSON braces
+    # (AGENTICS_RESULT: {"<metric>": <number>}) that .format would parse
+    # as placeholders.
+    prompt = EXTRACT_CLAIMS_PROMPT.replace("{finding}", finding_text[:3000])
     answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
     parsed = parse_json_block(answer)
     specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:3]

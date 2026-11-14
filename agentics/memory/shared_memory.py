@@ -351,10 +351,15 @@ CREATE INDEX IF NOT EXISTS idx_swarm_eval_ts ON swarm_eval_snapshots(ts);
 CREATE TABLE IF NOT EXISTS task_awards (
     -- Contract-Net-lite (A2X): the supervisor's allocation signal. Rewritten
     -- WHOLESALE on every scan, so a row older than one scan cannot exist.
+    -- `hits` counts CONSECUTIVE scans the same (task, agent) pair survived
+    -- unclaimed — the award TTL input (recommend_awards drops a pair once
+    -- it exceeds coord_award_ttl: the manager stops re-awarding a task
+    -- nobody claims, instead of nagging forever).
     task_id INTEGER PRIMARY KEY,
     agent TEXT NOT NULL,
     score REAL NOT NULL,                    -- the Performance-Novelty score it won with
-    ts REAL NOT NULL
+    ts REAL NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 1
 );
 -- Co-Scientist tournament (agentics/coscientist): every simulated scientific
 -- debate between two hypotheses, with the exact Elo state transition. The
@@ -498,6 +503,8 @@ class SharedMemory:
                 # worthy (citation / peer_judge / replication / ...).
                 "ALTER TABLE experiment_ledger ADD COLUMN self_authored_ratio REAL",
                 "ALTER TABLE experiment_ledger ADD COLUMN anchors TEXT NOT NULL DEFAULT ''",
+                # Award TTL (2026-11-14): consecutive unclaimed re-award count
+                "ALTER TABLE task_awards ADD COLUMN hits INTEGER NOT NULL DEFAULT 1",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -2289,14 +2296,29 @@ class SharedMemory:
         The supervisor recomputes the FULL allocation every scan, so the
         table is deleted and re-inserted in one transaction — a stale award
         can never outlive one scan, and no per-row cleanup is ever needed.
+        Rows may carry ``hits`` (consecutive unclaimed re-award count) from
+        the TTL bookkeeping in ``recommend_awards``; defaults to 1.
         """
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM task_awards")
             self._conn.executemany(
-                "INSERT INTO task_awards (task_id, agent, score, ts) VALUES (?,?,?,?)",
-                [(r["task_id"], r["agent"], float(r["score"]), time.time())
+                "INSERT INTO task_awards (task_id, agent, score, ts, hits) "
+                "VALUES (?,?,?,?,?)",
+                [(r["task_id"], r["agent"], float(r["score"]), time.time(),
+                  int(r.get("hits", 1)))
                  for r in rows],
             )
+
+    def task_awards_rows(self) -> list[dict]:
+        """Full award rows (task_id, agent, score, ts, hits) — the TTL
+        bookkeeping input for ``recommend_awards`` (which pairs have been
+        re-awarded how many consecutive scans without being claimed)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, agent, score, ts, hits FROM task_awards"
+            ).fetchall()
+        return [{"task_id": int(r[0]), "agent": r[1], "score": float(r[2]),
+                 "ts": float(r[3]), "hits": int(r[4] or 1)} for r in rows]
 
     def awards_for(self, agent: str) -> dict[int, float]:
         """Awards the supervisor currently holds for ``agent``: task_id -> score."""
