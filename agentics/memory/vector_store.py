@@ -1,7 +1,8 @@
 """Vector store — semantic search over findings/papers (ChromaDB, persistent).
 
 ChromaDB is optional at runtime: if it is not installed the lab still works,
-just without semantic recall (polices.py falls back to keyword search in SQLite).
+just without semantic recall (the shared-memory tool/skill lookups fall back
+to keyword-overlap ranking in SQLite).
 """
 from __future__ import annotations
 

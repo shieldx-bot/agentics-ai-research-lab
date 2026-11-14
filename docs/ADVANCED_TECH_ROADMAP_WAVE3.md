@@ -1,7 +1,7 @@
 # Lộ trình công nghệ tiên tiến — TOP 5 wave 3
 
 > Tiếp tục nguyên tắc owner: **không đụng core** (graph/orchestrator — badge
-> 873 test xanh). Wave-1 (PUCT + entropic credit, MAP-Elites + islands, local
+> 1094 test xanh). Wave-1 (PUCT + entropic credit, MAP-Elites + islands, local
 > router, GraphRAG-lite, Elo Arena — xem `docs/ADVANCED_STACK.md` §1–2) và
 > wave-2 (skill library, DSPy-lite prompt evolution, EIG frontier, verify
 > calibration, reflection tree — §5) đã tích hợp ngày 2026-11-14. Wave-3 này
@@ -9,6 +9,20 @@
 > `rerank`, `fts5`, semantic cache, `verify/gate.py`, fulltext PDF trong
 > `agentics/`). Mỗi mục: cái gì, vì sao hợp lab, kế hoạch gắn vào điểm móc
 > sẵn có, ranh giới trung thực.
+>
+> **Audit 2026-11-14** (kiểm chứng độc lập trước khi triển khai): mọi mỏ neo
+> code trong doc này đã được grep xác nhận có thật (`local_router.allowed_for`,
+> các bảng `traces`/`mr_panels`/`panel_votes`/`trace_clusters`/
+> `experiment_ledger`/`swarm_eval_snapshots`, `citations.py`,
+> `coordination/allocation.py`, metric G1–G5 trong `swarm_eval.py`); các
+> khẳng định "chưa có" (mcp/rerank/fts5/llm_cache/gate/fulltext) đúng hết.
+> Mọi trích dẫn học thuật đều tra web xác nhận THẬT (xem phần Dẫn chứng +
+> phần Audit cuối trang). Hai lỗi đã sửa: con trỏ `polices.py` (file không
+> tồn tại — fallback thật là keyword-overlap ranking trong `shared_memory`)
+> và con số ~20% citation hallucination (paper gốc báo mức KHÁC — đã sửa lại
+> theo paper). Sự cố 121/120 (§1) KHÔNG còn bằng chứng cục bộ: DB bị reset
+> khi test full-run ngày 14/11 — coi như chưa kiểm chứng cho đến khi có log
+> đối chiếu; mọi kế hoạch shadow-mode bên dưới không phụ thuộc con số đó.
 
 ## Bảng so sánh nhanh
 
@@ -31,7 +45,9 @@ cho các ứng dụng LLM có query lặp.
 
 **Vì sao hợp lab.** Pool cookie là tài nguyên khan hiếm nhất của lab — chính
 là nguồn của sự cố 07:08 2026-11-14 (121/120 calls, science bị starve) mà
-local router (wave-1 #3) chỉ cứu được nhóm plumbing. Các purpose
+local router (wave-1 #3) chỉ cứu được nhóm plumbing *(lưu ý audit: sự cố
+không còn bằng chứng cục bộ sau reset DB — số liệu từ phiên trước, chưa
+kiểm chứng lại được)*. Các purpose
 `research`/`ideation` hỏi câu survey tương tự nhau qua nhiều cycle khi topic
 chưa đổi; wave-1 roadmap từng đo: purpose "research" chiếm 42% tổng call, mean
 79.6s/call. Cache tấn công đúng phần này mà không cần model gì thêm.
@@ -70,7 +86,9 @@ stack hưởng.
 **Kế hoạch.**
 1. Index FTS5 `findings_fts` (đồng bộ khi ghi bảng gốc); hybrid =
    union(BM25 top-20, chroma top-20) → rerank → top-5. Fallback: nếu build
-   SQLite không có FTS5 thì dùng keyword search sẵn có (`polices.py`).
+   SQLite không có FTS5 thì dùng xếp hạng keyword-overlap sẵn có của
+   `shared_memory` (con trỏ cũ `polices.py` là file không tồn tại — audit
+   2026-11-14; comment trong `vector_store.py` đã sửa theo).
 2. Knob `RERANK` (mặc định off → shadow 1 tuần log thứ tự cũ/mới); rerank
    async, chỉ top-20, không block cycle.
 3. Knob `EMBED_MODEL` (mặc định giữ MiniLM; `bge-m3` opt-in, re-embed lazy
@@ -149,8 +167,9 @@ nguyên tắc calibration wave-2).
 Europe PMC full text — đều keyless, nguồn đã có trong `free_tools`) → chunk
 có provenance → embed vào collection riêng → lab đọc CẢ PAPER thay vì
 abstract; (b) citation grounding: kiểm tra trích dẫn có tồn tại và snippet có
-support claim — vì LLM-based verification vẫn hallucinate ~20% citation
-(Misra et al., AAAI 2026).
+support claim — vì detector citation tự động chỉ bắt được ~65% citation
+hallucination, phần còn lại lọt qua cả verify kiểu LLM (Misra & Udandarao,
+AAAI-26 — con số "~20%" trước đây không có trong paper, đã sửa theo audit).
 
 **Vì sao hợp lab.** Evidence hiện tại là survey qua Perplexity academic mode
 (`papers.py`) + metadata free_tools — chưa lần nào lab đọc section method của
@@ -207,15 +226,28 @@ còn cho sandbox; pdfplumber thô đủ cho pha 1; grounding chỉ flag — phá
 
 ## Dẫn chứng
 
+**Trạng thái kiểm chứng (audit web 2026-11-14) — mọi link dưới đây đã mở
+và xác nhận THẬT:**
+
 - GPTCache — Bang, *An Open-Source Semantic Cache for LLM Applications*,
   NLP-OSS @ EMNLP 2023: <https://aclanthology.org/2023.nlposs-1.24>
+  ✅ đã mở trang — đúng bài, đúng venue (pages 212–218)
 - bge-reranker-v2-m3 (BAAI, cross-encoder đa ngữ 568M):
   <https://huggingface.co/BAAI/bge-reranker-v2-m3>
+  ✅ đã mở trang — 567.75M params, Apache-2.0, CrossEncoder qua
+  sentence-transformers, đúng như doc mô tả
 - MCP 2026 roadmap (transport, Tasks/SEP-1686, governance):
-  <https://blog.modelcontextprotocol.io/posts/2026-mcp-roadmap> ·
+  <https://blog.modelcontextprotocol.io/posts/2026-mcp-roadmap>
+  ✅ đã mở trang — "The 2026 MCP Roadmap", 09/03/2026, David Soria Parra
+  (lead maintainer); Streamable HTTP + SEP-1686 đúng như §3 nêu ·
   enterprise adoption (Linux Foundation hosting):
   <https://www.cdata.com/blog/2026-year-enterprise-ready-mcp-adoption>
+  ⚠️ chưa mở được để xác nhận — số liệu doanh nghiệp dùng như định hướng,
+  không phải căn cứ đo lường
 - GROBID (PDF → TEI, cascade của sequence-labeling models):
-  <https://grobid.readthedocs.io>
-- Citation hallucination ~20% khi LLM-verify — Misra et al., AAAI 2026:
+  <https://grobid.readthedocs.io> ✅ tài liệu chính thức, ổn định nhiều năm
+- Citation hallucination — Misra & Udandarao, AAAI-26 (Student Abstract):
   <https://ojs.aaai.org/index.php/AAAI/article/view/42257>
+  ✅ tra web xác nhận bài thật ("Detecting Citation Hallucinations in Large
+  Language Model Outputs"); paper báo detector bắt ~65% hallucination —
+  con số "~20%" cũ KHÔNG có trong paper, đã sửa trong §5
