@@ -1901,9 +1901,14 @@ class SharedMemory:
 
     def discovery_frontier_puct(self, limit: int = 3, max_depth: int = 4,
                                 c: float = 1.0,
-                                reward_scale: str = "target") -> list[dict]:
+                                reward_scale: str = "target",
+                                eig_weight: float = 0.0) -> list[dict]:
         """C2 (TTT_DISCOVER.md): the discovery frontier scored by the
-        paper's PUCTSampler instead of plain BFS order.
+        paper's PUCTSampler instead of plain BFS order, refined by wave-2
+        #3's expected-information-gain-per-cost term (Bayesian experimental
+        design on the settle ledger): a metric the ledger has answered the
+        same way twenty times buys nothing, an unexplored one buys up to
+        ln2 nats. eig_weight=0 restores the pure PUCT order.
 
             score(s) = Q(s) + c * scale * P(s) * sqrt(1+T) / (1 + n(s))
 
@@ -1980,9 +1985,20 @@ class SharedMemory:
             q_i = qs[i]
             bonus = (c * scale * priors[i] * ((1.0 + T) ** 0.5) / (1 + n_i)
                      if scale > 0 else 0.0)
-            scored.append({**h, "puct_score": round(q_i + bonus, 4),
-                           "puct_q": round(q_i, 4), "puct_n": n_i,
-                           "puct_bonus": round(bonus, 4)})
+            entry = {**h, "puct_score": round(q_i + bonus, 4),
+                     "puct_q": round(q_i, 4), "puct_n": n_i,
+                     "puct_bonus": round(bonus, 4)}
+            # wave-2 #3: information-gain-per-cost refines the order inside
+            # the branch — pure PUCT stays when eig_weight is 0.
+            if eig_weight > 0.0:
+                try:
+                    from agentics.evolution.eig import eig_score
+                    entry.update(eig_score(self, h))
+                    entry["puct_score"] = round(
+                        q_i + bonus + eig_weight * entry["eig_score"], 4)
+                except Exception:  # noqa: BLE001 — EIG is sugar
+                    pass
+            scored.append(entry)
         scored.sort(key=lambda h: -h["puct_score"])
         # lineage blocking: never return two candidates sharing a parent
         # (or the same discovery root) in one batch

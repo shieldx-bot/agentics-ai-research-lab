@@ -194,6 +194,11 @@ class Settings:
         default_factory=lambda: _env_float("ENTROPIC_BONUS_MAX", 8.0))
     reward_scale: str = field(
         default_factory=lambda: _env("REWARD_SCALE", "target"))
+    # Wave-2 #3 — EIG frontier: expected-information-gain-per-cost refines
+    # the PUCT order (Beta-Bernoulli priors from the experiment ledger;
+    # closed-form entropy reduction). 0 = pure PUCT order.
+    eig_weight: float = field(
+        default_factory=lambda: _env_float("EIG_WEIGHT", 0.5))
     # Local small-model router (Ollama / llama.cpp / LM Studio) — the FREE
     # edge for cheap purposes so the cookie pool is spent only on science.
     # Disabled by default: no surprise network calls to localhost.

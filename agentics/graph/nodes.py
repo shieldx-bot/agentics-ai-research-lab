@@ -1671,9 +1671,10 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
     try:
         max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
         puct_c = float(getattr(ctx.settings, "puct_c", 1.0))
+        eig_w = float(getattr(ctx.settings, "eig_weight", 0.5) or 0.0)
         frontier = await asyncio.to_thread(
             ctx.memory.discovery_frontier_puct, 3, max_depth, puct_c,
-            str(getattr(ctx.settings, "reward_scale", "target")))
+            str(getattr(ctx.settings, "reward_scale", "target")), eig_w)
         if not frontier:
             frontier = await asyncio.to_thread(
                 ctx.memory.discovery_frontier, 3, max_depth)
