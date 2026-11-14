@@ -191,25 +191,39 @@ FROM journal WHERE event='discovery_confirmed';
   first `/api/chat` also loads 1.3 GB into RAM (30-60s on CPU), the
   model would otherwise think and generate up to 2048 tokens. The router
   therefore sends `num_predict: 512`, `think: false` (strips any leftover
-  `<think>` block too) and `keep_alive: 30m` so the model stays warm
-  between cycles. Raise `LOCAL_LLM_NUM_PREDICT` only if local answers
-  get truncated.
+  `<think>` block too), pins `num_ctx: 4096` and `keep_alive: 5m` so idle
+  unloads free model + cache (a GPU reload costs seconds). Raise
+  `LOCAL_LLM_NUM_PREDICT` only if local answers get truncated.
 * **Silent `failed: ` warnings are timeouts**: `TimeoutError` stringifies
   to empty — the router now logs `failed: TimeoutError: `. If you see it,
   raise `LOCAL_LLM_TIMEOUT` or lower `LOCAL_LLM_NUM_PREDICT`.
-* **Kernel OOM-killer takes down llama-server** (live 2026-11-14 10:35:
-  `Out of memory: Killed process (llama-server)` mid-request, lab saw
-  `ServerDisconnectedError` then `Connect call failed`, systemd restarted
-  Ollama at 10:35:17). While the model is loaded, llama.cpp keeps its
-  PROMPT CACHE in RAM — ~240-400 MiB per distinct prompt at 4096 ctx,
-  capped at ~8 GiB, and that cap is NOT configurable upstream
-  (ollama#17351). The lab sends a fresh ~3k-token plan prompt nearly every
-  cycle, so a RAM-tight host (MySQL + desktop + lab Python on the same
-  box) reaches global OOM in about an hour of churn. Mitigations, in
-  order of preference: `LOCAL_LLM_KEEP_ALIVE=10m` (idle unloads free the
-  cache with the model; GPU reload costs seconds), `OLLAMA_KV_CACHE_TYPE=q8_0`
-  in the systemd unit (halves per-prompt state size), add swap so the
-  global OOM never fires. Diagnosis: `systemctl show ollama -p NRestarts
+* **Kernel OOM-killer takes down llama-server** (live 2026-11-14 10:35
+  AND ~13:43 — killed TWICE the same day: `Out of memory: Killed process
+  (llama-server)` mid-request, lab saw `ServerDisconnectedError` then
+  `Connect call failed`; a no-LLM dashboard question during the outage
+  window degrades to the raw digest, which is by design). While the
+  model is loaded, llama.cpp keeps its PROMPT CACHE in RAM — ~240-400
+  MiB per distinct prompt at the model-default ctx, capped at ~8 GiB,
+  and that cap is NOT configurable upstream (ollama#17351). The lab
+  sends a fresh ~3k-token plan prompt nearly every cycle, so a RAM-tight
+  host (MySQL + desktop + lab Python on the same box) reaches global OOM
+  in about an hour of churn.
+
+  Shipped fix (defaults, no env needed): the router now pins
+  `num_ctx: 4096` (`LOCAL_LLM_NUM_CTX`) — every cache slot scales with
+  the context window, so the model-default ctx produced the ~238 MiB
+  slots × ~30-slot LRU ≈ 7 GB RSS seen in the 10:35 journal — and
+  defaults `LOCAL_LLM_KEEP_ALIVE=5m` so idle unloads free the cache with
+  the model.
+
+  Host-side hardening (recommended once, for the systemd unit): drop
+  `configs/ollama-hardening.conf` into
+  `/etc/systemd/system/ollama.service.d/` — it sets `OLLAMA_NUM_PARALLEL=1`
+  (one cache slot instead of N), `OLLAMA_KV_CACHE_TYPE=q8_0` (halves
+  per-slot state), and a cgroup `MemoryMax` so a runaway llama-server is
+  contained and restarted INSTEAD of a global OOM hitting the whole
+  desktop. Then `sudo systemctl daemon-reload && sudo systemctl restart
+  ollama`. Diagnosis: `systemctl show ollama -p NRestarts
   -p ExecMainStartTimestamp`, then `sudo dmesg | grep -iE "oom|killed"`.
 * **Ollama down / model missing** → router returns `ok=False`, lab logs a
   warning and continues exactly as before. Nothing to clean up; fix with

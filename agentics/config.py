@@ -230,21 +230,31 @@ class Settings:
     # need 2048 tokens — cap it so CPU inference finishes in seconds.
     local_llm_num_predict: int = field(
         default_factory=lambda: _env_int("LOCAL_LLM_NUM_PREDICT", 512))
+    # Hard context cap per request (live 2026-11-14 10:35 + 13:43: the
+    # kernel OOM-killed llama-server TWICE). llama.cpp's prompt cache
+    # grows ~per DISTINCT prompt, and each slot's size scales with the
+    # context window — the 10:35 journal showed ~238 MiB slots x ~30 LRU
+    # entries ≈ 7 GB RSS → global OOM (upstream cap ~8 GiB, NOT
+    # configurable: ollama#17351). Pinning num_ctx to 4096 shrinks every
+    # slot to a fraction of that and matches the lab's prompt budget
+    # (digests are capped at 5000 chars, the chat prompt design assumes
+    # "qwen3's 4096 ctx"). Raise only with free RAM to spare.
+    local_llm_num_ctx: int = field(
+        default_factory=lambda: _env_int("LOCAL_LLM_NUM_CTX", 4096))
     # qwen3-family thinking models: <think> blocks are stripped from the
     # answer regardless; this ALSO asks the runtime to skip thinking
     # entirely (Ollama >= 0.9; older runtimes just ignore the field).
     local_llm_think: bool = field(
         default_factory=lambda: _env_bool("LOCAL_LLM_THINK", False))
     # Request-level keep_alive (overrides any OLLAMA_KEEP_ALIVE server
-    # default). "30m" keeps the model warm between cycles; lower it
-    # ("10m"/"5m") on RAM-tight hosts — llama.cpp's prompt cache can grow
-    # to ~8 GiB while the model is loaded (upstream ollama#17351: the
-    # cache limit is NOT configurable), and a global OOM kill of
-    # llama-server is what took the local edge down 2026-11-14 10:35.
-    # Unloading on idle frees the cache with it; a GPU reload costs only
-    # seconds.
+    # default). Default "5m": the model unloads and frees model+prompt
+    # cache on 5 minutes of idle — a GPU reload costs only seconds, while
+    # the OOM that killed llama-server twice on 2026-11-14 (10:35 and
+    # again before the 13:43:34 restart) costs the whole local edge for
+    # hours. "30m"/"1h" keeps the model warm instead on RAM-roomy hosts;
+    # see local_llm_num_ctx for the other half of the cache fix.
     local_llm_keep_alive: str = field(
-        default_factory=lambda: _env("LOCAL_LLM_KEEP_ALIVE", "30m"))
+        default_factory=lambda: _env("LOCAL_LLM_KEEP_ALIVE", "5m"))
     # Comma-separated purposes that may route to the local model. Science
     # purposes (research/verify/ideation/implement/review/repair/defend/
     # tournament) can NEVER be listed here — the router refuses them even
