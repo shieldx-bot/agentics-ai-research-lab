@@ -107,3 +107,121 @@ def test_post_never_raises_on_garbage(monkeypatch):
 
     monkeypatch.setattr(local_router.aiohttp, "ClientSession", boom)
     assert asyncio.run(local_router._post("http://x", {})) is None
+
+
+# --------------------------------------------- health check (2026-11-14 405)
+def _fake_session_factory(methods_seen: list, status: int = 200):
+    """Build an aiohttp.ClientSession stand-in that records request methods
+    and answers `status` for every request."""
+
+    class _Resp:
+        status = 200
+
+        async def json(self, *a, **k):
+            return {"models": [{"name": "qwen3:1.7b"}]}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, url):
+            methods_seen.append("GET")
+            return _Ctx()
+
+        def post(self, url, json=None):
+            methods_seen.append("POST")
+            return _Ctx()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    return _Session
+
+
+def _patch_http(monkeypatch, methods_seen: list, status: int = 200):
+    monkeypatch.setattr(local_router.aiohttp, "ClientTimeout",
+                        lambda *a, **k: 1.0)
+    monkeypatch.setattr(local_router.aiohttp, "ClientSession",
+                        _fake_session_factory(methods_seen, status))
+
+
+def test_available_health_check_uses_get(monkeypatch):
+    """Ollama's /api/tags is read-only: a POST gets HTTP 405 and made the
+    lab treat a RUNNING Ollama as absent (live 08:35). The check must GET."""
+    methods: list = []
+    _patch_http(monkeypatch, methods)
+    assert asyncio.run(local_router.available(_settings())) is True
+    assert methods == ["GET"]
+
+
+def test_available_false_on_405_style_failure(monkeypatch, caplog):
+    """A 405 (or any non-200) on /api/tags must read as 'unavailable',
+    never raise."""
+    methods: list = []
+    _patch_http(monkeypatch, methods, status=405)
+
+    class _Resp405:
+        status = 405
+
+        async def json(self, *a, **k):
+            return {}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp405()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session405:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, url):
+            methods.append("GET")
+            return _Ctx()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(local_router.aiohttp, "ClientSession", _Session405)
+    assert asyncio.run(local_router.available(_settings())) is False
+
+
+# ---------------------------------------- scaffolding purposes may fall back
+def test_plan_and_role_synthesis_may_fallback_locally():
+    """plan/role_synthesis are SCAFFOLDING, not verdicts (live 08:35: every
+    cycle starved at `plan blocked by budget`). They may fall back to the
+    local model when the pool refuses — the science that follows still runs
+    pool-side."""
+    s = _settings()  # local_llm_purposes = "kg_extract,classify"
+    assert local_router.allowed_for(s, "plan") is False  # not listed yet
+    s2 = _settings(local_llm_purposes="kg_extract,plan,role_synthesis")
+    assert local_router.allowed_for(s2, "plan") is True
+    assert local_router.allowed_for(s2, "role_synthesis") is True
+    # real science purposes still refuse, even when someone lists them
+    s3 = _settings(local_llm_purposes="plan,role_synthesis,verify,research")
+    assert local_router.allowed_for(s3, "verify") is False
+    assert local_router.allowed_for(s3, "research") is False
+    assert local_router.allowed_for(s3, "ideation") is False
+
+
+def test_default_purpose_list_includes_scaffolding():
+    import agentics.config as config
+    cfg = config.Settings()
+    assert "plan" in cfg.local_llm_purposes
+    assert "role_synthesis" in cfg.local_llm_purposes
+    assert "kg_extract" in cfg.local_llm_purposes

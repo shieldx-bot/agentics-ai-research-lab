@@ -205,10 +205,14 @@ class Settings:
     local_llm_timeout: float = field(
         default_factory=lambda: _env_float("LOCAL_LLM_TIMEOUT", 20.0))
     # Comma-separated purposes that may route to the local model. Science
-    # purposes (research/verify/ideation) can NEVER be listed here — the
-    # router refuses them even if someone puts them in the env.
+    # purposes (research/verify/ideation/implement/review/repair/defend/
+    # tournament) can NEVER be listed here — the router refuses them even
+    # if someone puts them in the env. plan/role_synthesis are scaffolding:
+    # allowed as a P20c budget FALLBACK so a dry pool degrades to a local
+    # plan instead of an idle agent (2026-11-14 08:35 plan-starvation).
     local_llm_purposes: str = field(
-        default_factory=lambda: _env("LOCAL_LLM_PURPOSES", "kg_extract"))
+        default_factory=lambda: _env("LOCAL_LLM_PURPOSES",
+                                     "kg_extract,plan,role_synthesis"))
     # GraphRAG-lite: mine findings into the knowledge graph when the local
     # router is configured; ingest is a no-op without it.
     kg_enabled: bool = field(default_factory=lambda: _env_bool("KG_ENABLED", True))

@@ -39,21 +39,27 @@ Environment knobs (all read from `agentics/config.py`):
 | `LOCAL_LLM_URL` | `http://127.0.0.1:11434` | OpenAI-compatible/Ollama base URL |
 | `LOCAL_LLM_MODEL` | *(empty)* | model tag, e.g. `qwen3:1.7b`, `qwen3:4b` |
 | `LOCAL_LLM_TIMEOUT` | `20.0` | per-request timeout, seconds |
-| `LOCAL_LLM_PURPOSES` | `kg_extract` | comma-separated purposes allowed to route local |
+| `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis` | comma-separated purposes allowed to route local |
 
-Two routing behaviors (both in `agentics/graph/nodes.py:_llm_ask`):
+Two routing behaviors (in `agentics/graph/nodes.py:_llm_ask` and
+`agentics/research/kg_extract.py`):
 
-1. **Primary routing** — a purpose listed in `LOCAL_LLM_PURPOSES` (today:
-   `kg_extract`, the GraphRAG mining extraction) goes to the local model
-   first, every time. Zero cookie cost.
-2. **Budget fallback** — when the P20 pool refuses a *cheap* purpose
-   (pool exhausted), the ask retries once against the local model instead
-   of dying. Journal event: `local_fallback` with `{"purpose": ...}`.
+1. **Primary routing** — `kg_extract` (the GraphRAG mining extraction)
+   calls the local model directly, every time. Zero cookie cost.
+2. **Budget fallback (P20c)** — when the P20 pool refuses a purpose that
+   is allowed to route local, the ask retries once against the local
+   model instead of dying. Default set: `kg_extract`, plus the two
+   SCAFFOLDING purposes `plan` (mission synthesis) and `role_synthesis`
+   (system-prompt synthesis) — a dry pool now degrades to a local plan,
+   not an idle agent (live 2026-11-14 08:35: every cycle starved at
+   `plan blocked by budget`). Journal event: `local_fallback` with
+   `{"purpose": ...}`.
 
 Hard guarantees (see `agentics/llm/local_router.py` docstring):
 
-* Science purposes (`research`, `verify`, `ideation`) are **never** routed
-  to the small model, even if someone adds them to `LOCAL_LLM_PURPOSES` —
+* Science purposes (`research`, `verify`, `ideation`, `implement`,
+  `review`, `repair`, `defend`, `tournament`) are **never** routed to the
+  small model, even if someone adds them to `LOCAL_LLM_PURPOSES` —
   `allowed_for()` refuses them by construction. A weaker verdict is worse
   than a refused ask.
 * The router never raises: a missing/stopped Ollama degrades to the old
@@ -185,9 +191,17 @@ FROM journal WHERE event='discovery_confirmed';
   fallback plumbing on CPU; 4B gives better extraction recall if you have
   ~3 GB RAM spare. Both are far below the science bar — which is exactly
   why science purposes can never route there.
-* **Do not widen `LOCAL_LLM_PURPOSES` beyond plumbing purposes** (dedup,
-  classify, extract, prompt synthesis). The router enforces the science
-  blacklist regardless; listing a science purpose would just be ignored.
+* **Do not widen `LOCAL_LLM_PURPOSES` beyond plumbing/scaffolding
+  purposes** (extract, plan, prompt synthesis, classify). The router
+  enforces the science blacklist regardless; listing a science purpose
+  would just be ignored.
+* **Health check is GET, not POST**: Ollama's `/api/tags` answers 405
+  Method Not Allowed to a POST. Before the fix (live 08:35) the lab
+  logged `local_router .../api/tags -> HTTP 405` every cycle while
+  Ollama was actually running, and kg ingest silently mined nothing.
+  If that line ever reappears, the URL points at a runtime without an
+  Ollama-style `/api/tags` (llama.cpp/LM Studio: use their OpenAI-
+  compatible health endpoint instead).
 * **PUCT tuning**: `PUCT_C` (default 1.0) trades exploration vs reward;
   raise it if the frontier keeps picking the same discovery line.
   `ENTROPIC_BONUS_MAX` (default 8.0) caps the entropy credit from

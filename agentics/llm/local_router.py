@@ -1,7 +1,7 @@
 """Local small-model router (#3 of the advanced-tech integration): a FREE,
 offline LLM edge (Ollama, llama.cpp OpenAI-compatible, LM Studio) for the
-lab's cheap purposes — dedup/classify/extraction — so the cookie pool is
-spent ONLY on science.
+lab's cheap purposes — extraction/planning/system-prompt synthesis — so the
+cookie pool is spent ONLY on science.
 
 Why this exists (live 2026-11-14 07:08): 121/120 pool calls in one hour,
 mostly plumbing, and the science paths got budget-refused. A local model
@@ -13,7 +13,9 @@ Design constraints (honest edge, same as every pool client):
 * never raises — a missing/unresponsive local runtime returns ok=False;
 * only the purposes in `local_llm_purposes` may use it (science purposes
   NEVER silently degrade to the small model — a weaker verdict is worse
-  than a refused ask);
+  than a refused ask; plan/role_synthesis are scaffolding, not verdicts,
+  and MAY fall back so a dry pool degrades to a local plan, not an idle
+  agent);
 * the P20 ledger does NOT count local asks: they consume no shared cookie
   quota, and inflating the ledger would starve the pool cap artificially.
 """
@@ -53,12 +55,32 @@ async def _post(url: str, payload: dict,
         return None
 
 
+async def _get(url: str, settings=None) -> dict | None:
+    """One GET to the local runtime; None on any failure (never raises)."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=_timeout(settings))
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    log.warning("local_router %s -> HTTP %s", url, resp.status)
+                    return None
+                return await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
+        log.warning("local_router %s failed: %s", url, exc)
+        return None
+
+
 async def available(settings=None) -> bool:
-    """True when the local runtime answers /api/tags (Ollama)."""
+    """True when the local runtime answers GET /api/tags (Ollama).
+
+    GET, not POST: Ollama's /api/tags is a read-only endpoint and answers
+    405 Method Not Allowed to a POST (live 2026-11-14 08:35 — the lab
+    logged `HTTP 405` every cycle while Ollama was actually RUNNING, so
+    kg ingest silently mined nothing)."""
     base = str(getattr(settings, "local_llm_url", "") or "").rstrip("/")
     if not base:
         return False
-    data = await _post(f"{base}/api/tags", {}, settings=settings)
+    data = await _get(f"{base}/api/tags", settings=settings)
     return bool(data)
 
 
@@ -105,9 +127,16 @@ async def ask(prompt: str, settings=None, purpose: str = "local",
 # Purposes that may NEVER route to the small model — even if someone
 # lists them in LOCAL_LLM_PURPOSES. A weaker verdict/research answer is
 # worse than a refused ask (the reserve lane should wait for the pool).
+#
+# `plan` and `role_synthesis` are deliberately NOT blacklisted (live
+# 2026-11-14 08:35 — every cycle starved at `plan blocked by budget`): a
+# mission plan / system prompt is SCAFFOLDING, not a verdict — the science
+# that follows (research/verify/ideation) still runs pool-side, so a local
+# plan beats an idle agent when the pool is dry. They route only as a P20c
+# BUDGET FALLBACK (pool refused first), never proactively.
 _SCIENCE_PURPOSES = frozenset({
-    "research", "verify", "ideation", "plan", "implement", "review",
-    "tournament", "tournament_judge2", "role_synthesis",
+    "research", "verify", "ideation", "implement", "review",
+    "repair", "defend", "tournament", "tournament_judge2",
 })
 
 
@@ -115,7 +144,7 @@ def purposes_for(settings) -> tuple[str, ...]:
     """The purposes allowed to route to the local model (config list,
     minus anything science-critical)."""
     raw = str(getattr(settings, "local_llm_purposes",
-                      "kg_extract") or "")
+                      "kg_extract,plan,role_synthesis") or "")
     return tuple(p.strip().lower() for p in raw.split(",") if p.strip()
                  and p.strip().lower() not in _SCIENCE_PURPOSES)
 
