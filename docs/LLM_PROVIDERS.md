@@ -186,12 +186,36 @@ Scaling in cloud-browser mode (P18 token pool):
 * offline unit tests never create sessions; live check:
   `HB_API_KEYS=tk1,tk2,tk3 python scripts/live_research_run.py`
 
+Research fan-out (P18b, `research_fanout` in `configs/lab.yaml` or
+`RESEARCH_FANOUT`):
+
+* when > 1, `node_research` asks complementary angles — benchmarks &
+  datasets, limitations & open problems — IN PARALLEL, each on a different
+  pool identity (a different Hyperbrowser token with the P18 pool, or a
+  different cookie account on the local backend). The angle views wrap
+  round-robin from the agent's own token and are capped at pool size − 1,
+  so an angle never queues behind an ask already running on the same
+  identity.
+* all answers merge into ONE finding (survey first, angles under their own
+  headings, citations deduped) feeding one batched BibTeX grounding call;
+  the P20 budget gate and usage ledger apply to every angle; the fan-out
+  is journalled per agent (`research_fanout` event, meta `research_fanout`).
+* `1` disables the fan-out (legacy single-ask behavior — the safe default;
+  `configs/lab.yaml` ships with `research_fanout: 2` = survey + 1 angle).
+
 ### Failure handling
 
 * A missing composer is not automatically treated as a bad cookie. The client
   records bounded page metadata (URL/title/body excerpt), distinguishes an
   expired login from a provider verification/challenge page, and tears down
   the failed session.
+* One in-place recovery precedes the escalation: a missing composer triggers
+  a home reload + one more wait before any circuit opens, so a slow SPA
+  hydration no longer opens the shared circuit breaker that used to stall
+  every agent for minutes (the 25 s-timeout incident class, 2026-11-12).
+* A submit that silently produces NO answer text after the full answer wait
+  window raises a UI outage (same no-cooldown treatment) instead of returning
+  an empty answer — downstream nodes used to crash parsing `""` as JSON.
 * A verification page opens a process-wide circuit breaker (10 minutes); a
   generic composer/frontend failure opens it for 3 minutes. While open, agents
   fail fast instead of creating sessions for every account.

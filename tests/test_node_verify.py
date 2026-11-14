@@ -91,7 +91,7 @@ def _ctx(mem: SharedMemory, tmp_path: Path, llm, fail_write: bool = False) -> Si
     return SimpleNamespace(
         agent_id="a02", role=Role.RESEARCHER, memory=mem, llm=llm,
         workspace=FakeWS(tmp_path / "ws", fail_write=fail_write),
-        cycle=1, settings=SimpleNamespace(research_topic="NFV"),
+        cycle=1, settings=SimpleNamespace(research_topic="NFV", settle_require_anchor=False),
         heartbeat=lambda *a, **k: None, report=lambda **kw: None,
         meta={"personal": SimpleNamespace(add_lesson=lambda *a, **k: None)},
     )

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import typer
 from rich.console import Console
@@ -135,6 +137,75 @@ def repair() -> None:
             "swept": swept, "repaired": repaired})
     finally:
         memory.close()
+
+
+@app.command("reset-memory")
+def reset_memory_cmd(
+    yes: bool = typer.Option(False, "--yes", "-y",
+                             help="bỏ qua câu hỏi xác nhận"),
+    force: bool = typer.Option(False, "--force",
+                               help="cho phép reset dù còn agent có heartbeat mới"),
+    keep_repo: bool = typer.Option(False, "--keep-repo",
+                                   help="giữ data/lab.git (branch/MR của topic cũ)"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="chỉ liệt kê thứ sẽ bị xoá, không xoá thật"),
+) -> None:
+    """Owner: xoá TOÀN BỘ memory của lab khi đổi research topic mới.
+
+    Xoá: shared memory DB (tasks/findings/panels/journal/role prompts),
+    vector memory (recall finding), personal memory (bài học mỗi agent),
+    workspace các agent và data/lab.git (branch/MR cũ) — trừ khi --keep-repo.
+    Giữ nguyên: code lab, baseline integrity, accounts/, configs/, .env, logs.
+    Lab khởi động lại sẽ tự seed lab.git và tạo schema mới."""
+    setup_logging("ERROR")
+    from agentics.memory.reset import ResetBlocked, reset_memory, running_agents
+
+    settings = _settings()
+    try:
+        preview = reset_memory(settings, keep_repo=keep_repo, dry_run=True)
+    except ResetBlocked as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    if preview.removed:
+        table = Table(title="Memory sẽ được xoá (đổi topic mới)" +
+                          (" — DRY RUN" if dry_run else ""))
+        for col in ("thành phần", "dung lượng"):
+            table.add_column(col)
+        for label, size in preview.removed:
+            human = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B"
+            table.add_row(label, human)
+        console.print(table)
+    else:
+        console.print("[yellow]Không có memory nào để xoá (lab còn nguyên).[/]")
+
+    if dry_run:
+        console.print("[dim]dry-run: chưa xoá gì. Bỏ --dry-run để xoá thật.[/]")
+        return
+
+    live = running_agents(settings)
+    if live and not force:
+        names = ", ".join(f"{a['agent']}({a['role']})" for a in live)
+        console.print(f"[red]Có {len(live)} agent đang chạy ({names}) — "
+                      f"chạy `agentics stop` trước, hoặc dùng --force.[/]")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm("Xoá toàn bộ memory ở trên?"):
+        console.print("[dim]Đã huỷ, không xoá gì.[/]")
+        return
+
+    try:
+        report = reset_memory(settings, keep_repo=keep_repo)
+    except ResetBlocked as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    for label, _size in report.removed:
+        console.print(f"  [red]xoá[/] {label}")
+    for kept in report.kept:
+        console.print(f"  [green]giữ[/] {kept}")
+    console.print(f"[bold green]Memory đã reset[/] — giải phóng "
+                  f"{report.freed_human}. Đổi RESEARCH_TOPIC trong .env/"
+                  f"configs/lab.yaml rồi chạy lại `python -m agentics.cli run` "
+                  f"— lab tự seed lại lab.git và schema mới.")
 
 
 @app.command("dashboard")
@@ -394,6 +465,325 @@ def metrics(
     memory.close()
 
 
+@app.command("swarm-eval")
+def swarm_eval(
+    days: int = typer.Option(0, "--days", help="chỉ đánh giá N ngày gần nhất (0 = toàn bộ)"),
+    as_json: bool = typer.Option(False, "--json", help="in toàn bộ report dạng JSON"),
+    as_percent: bool = typer.Option(False, "--percent", help="bảng % tổng hợp — mọi chỉ số quy về phần trăm cho dễ nắm"),
+    no_save: bool = typer.Option(False, "--no-save", help="không lưu snapshot vào DB"),
+) -> None:
+    """Đánh giá bầy đàn AS A SWARM — quỹ đạo, cộng tác, hội tụ, chịu lỗi, chi phí.
+
+    Tổng hợp 5 nhóm chỉ số swarm-intelligence từ chính vết tích của lab
+    (journal, tasks, MR, panel P19, ledger LLM): hiệu quả phối hợp & nhiệm
+    vụ, hành vi hội tụ, quỹ đạo & chuyển giao, khả năng chịu lỗi & mở rộng
+    (độ co giãn S qua các snapshot), quản trị & chi phí. Không dùng LLM,
+    chỉ đọc — mỗi lần chạy lưu 1 snapshot để so sánh giữa các quy mô đàn."""
+    import time as _t
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.swarm_eval import (attach_scalability, evaluate_swarm,
+                                     percent_rows, save_snapshot)
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        since = _t.time() - days * 86400 if days > 0 else 0.0
+        report = evaluate_swarm(memory, since_ts=since)
+        report = attach_scalability(memory, report)
+        if not no_save:
+            snap_id = save_snapshot(memory, report)
+            report["snapshot_id"] = snap_id
+        if as_json:
+            if as_percent:
+                report["percent_rows"] = percent_rows(report)
+            console.print_json(json.dumps(report, ensure_ascii=False))
+            return
+        if as_percent:
+            _print_percent_rows(percent_rows(report))
+            return
+        _print_swarm_eval(report, memory)
+    finally:
+        memory.close()
+
+
+@app.command("standings")
+def standings(
+    limit: int = typer.Option(15, "--limit", help="số hypothesis hiển thị"),
+) -> None:
+    """Bảng xếp hạng Elo của giải đấu giả thuyết (Co-Scientist tournament).
+
+    Chỉ đọc — không tốn LLM. Elo là chiều CHẤT LƯỢNG ý tưởng (do các trận
+    debate simulated cộng dồn); status là chiều CHÂN LÝ (do P16 chạy code
+    quyết định). Hai chiều này tách bạch có chủ đích."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        pool = memory.tournament_pool()
+        matches = memory.recent_tournament_matches(limit=10)
+        if not pool:
+            console.print("[yellow]Chưa có hypothesis nào trong pool — "
+                          "để lab chạy vài chu kỳ research/verify đã.[/]")
+            return
+        table = Table(title=f"Tournament standings — {len(pool)} hypothesis "
+                            f"(đang xếp hạng, bỏ giả thuyết đã bị bác bỏ)")
+        for col in ("#", "Elo", "trận", "status", "claim", "nguồn"):
+            table.add_column(col)
+        ranked = sorted(pool, key=lambda h: -(h.get("elo") or 1200))[:limit]
+        for i, h in enumerate(ranked, 1):
+            when = datetime.fromtimestamp(h["ts"], tz=timezone.utc).strftime(
+                "%m-%d %H:%M")
+            table.add_row(
+                f"h#{h['id']}", f"{h.get('elo') or 1200:.0f}",
+                str(h.get("matches_played") or 0), h["status"],
+                (h["claim"] or "")[:60], f"{h['agent']}@{when}")
+        console.print(table)
+        decided = [m for m in matches if m.get("winner")]
+        console.print(f"[dim]{len(matches)} trận gần nhất "
+                      f"({len(decided)} có kết quả) — chi tiết: "
+                      "journal event 'tournament_match'.[/]")
+    finally:
+        memory.close()
+
+
+@app.command("tournament")
+def tournament(
+    matches: int = typer.Option(2, "--matches", help="số trận debate chạy"),
+    evolve: int = typer.Option(0, "--evolve", help="số phép tiến hóa chạy"),
+    no_meta: bool = typer.Option(False, "--no-meta", help="không tổng hợp feedback"),
+) -> None:
+    """Chạy trực tiếp một batch giải đấu (Co-Scientist) qua LLM thật.
+
+    Dùng để gom trận debate ngoài chu kỳ lab (owner chạy tay): chọn cặp,
+    tranh luận qua Perplexity, cập nhật Elo zero-sum, có thể tiến hóa top
+    hypotheses thành thế hệ mới. Mọi ask qua P20 budget gate."""
+    import asyncio
+
+    settings = _settings()
+    setup_logging("INFO")
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+
+    async def _run() -> None:
+        from agentics.llm.session_host import BrowserSessionHost
+
+        host = BrowserSessionHost.from_settings(settings)
+        ctx = SimpleNamespace(
+            agent_id="owner-cli", memory=memory, llm=host, settings=settings,
+            budget=None, meta={})
+        try:
+            from agentics.coscientist import evolution as evo_mod
+            from agentics.coscientist import metareview as meta_mod
+            from agentics.coscientist import tournament as tour_mod
+
+            goal = settings.research_topic
+            results = await tour_mod.run_batch(ctx, matches, goal) if matches else []
+            for r in results:
+                if r.get("mode") == "blocked":
+                    console.print("  [yellow]batch dừng: ask bị chặn/lỗi "
+                                  "(budget hoặc session)[/]")
+                elif r.get("mode") == "invalid":
+                    console.print(f"  [yellow]h#{r['a']} vs h#{r['b']}: "
+                                  "không parse được kết luận[/]")
+                else:
+                    e = r.get("elo_after") or [None, None]
+                    console.print(
+                        f"  h#{r['a']} vs h#{r['b']} [{r['mode']}] → "
+                        f"h#{r['a'] if r['winner'] == 'a' else r['b']} thắng "
+                        f"(Elo → {e[0]} / {e[1]})")
+            if evolve:
+                out = await evo_mod.evolve_top(ctx, goal)
+                if out:
+                    console.print(f"  tiến hóa: h#{out['hypothesis_id']} "
+                                  f"({out['strategy']}) từ {out['parent_ids']}")
+            if not no_meta and meta_mod.should_synthesize(
+                    memory, settings.meta_review_window):
+                note = await meta_mod.synthesize_feedback(
+                    ctx, goal, settings.meta_review_window)
+                if note:
+                    console.print(f"  meta-review: {note[:200]}")
+        finally:
+            for client in list(getattr(host, "_clients", {}).values()):
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    try:
+        asyncio.run(_run())
+    finally:
+        memory.close()
+
+
+def _fmt(v, pct: bool = False) -> str:
+    """One metric cell — honest 'n/a' when the lab lacks the data."""
+    if v is None:
+        return "[dim]n/a (chưa đủ dữ liệu)[/]"
+    if pct:
+        return f"{v:.0%}"
+    if isinstance(v, float):
+        return f"{v:.2f}"
+    return str(v)
+
+
+def _print_swarm_eval(report: dict, memory) -> None:
+    """Rich rendering: one table per metric group, snapshot footer."""
+    g = report["groups"]
+    n = report["agents_active"]
+    console.print(f"[bold]Swarm evaluation[/] — {n} agent hoạt động "
+                  f"({report['generated'][:16]}Z)")
+    if n == 0:
+        console.print("[yellow]Không có hoạt động agent nào trong cửa sổ "
+                      "này — hãy để lab chạy vài chu kỳ rồi đánh giá lại.[/]")
+
+    t1 = Table(title="1. Hiệu quả phối hợp & nhiệm vụ (Coordination & Task)")
+    t1.add_column("chỉ số", overflow="fold")
+    t1.add_column("giá trị")
+    c = g["coordination_task"]
+    t1.add_row("Tỷ lệ hoàn thành (merge/judged)", _fmt(c["task_completion_rate"], pct=True))
+    t1.add_row("Hiệu quả phối hợp (panel có >=2 reviewer độc lập)",
+               _fmt(c["coordination_effectiveness"], pct=True))
+    t1.add_row(f"  panel đã quyết / có cross-review",
+               f"{c['panels_decided']} / {c['panels_with_cross_review']}")
+    t1.add_row("Độ bao phủ tìm kiếm (domain citation khác nhau)",
+               _fmt(c["exploration_coverage"], pct=True))
+    t1.add_row("  findings / domains", f"{c['findings']} / {c['citation_domains']}")
+    t1.add_row("Độ đa dạng giải pháp (tác giả có kết quả / agent)",
+               _fmt(c["solution_diversity"], pct=True))
+    t1.add_row("  số nhóm công việc (category)", str(c["category_spread"]))
+    t1.add_row("Tỷ lệ đóng nhiệm vụ (backlog)", _fmt(c["task_close_rate"], pct=True))
+    t1.add_row("  task đang mở", str(c["tasks_open"]))
+    t1.add_row("Cân bằng khối lượng (1 − share agent top)",
+               _fmt(c["workload_balance"], pct=True))
+    console.print(t1)
+
+    t2 = Table(title="2. Động lực học & hội tụ (Convergence & Dynamics)")
+    t2.add_column("chỉ số", overflow="fold")
+    t2.add_column("giá trị")
+    d = g["convergence_dynamics"]
+    t2.add_row("Hội tụ đúng (tỷ lệ panel approve)", _fmt(d["convergence_correctness"], pct=True))
+    t2.add_row("Số vòng vote trung bình tới phán quyết", _fmt(d["mean_panel_rounds"]))
+    t2.add_row("Chu kỳ trung bình của kết quả đầu ra", _fmt(d["mean_trace_cycle"]))
+    t2.add_row("Tỷ lệ defense cứu được MR", _fmt(d["defense_save_rate"], pct=True))
+    t2.add_row("  panel có bảo vệ (round 2)", str(d["panels_defended"]))
+    t2.add_row("Giả thuyết đã quyết (P24)",
+               _fmt(d["hypothesis_resolution_rate"], pct=True))
+    t2.add_row("  tổng giả thuyết", str(d["hypotheses_total"]))
+    console.print(t2)
+
+    t3 = Table(title="3. Quỹ đạo & luồng thông tin (Trajectory & Handoff)")
+    t3.add_column("chỉ số", overflow="fold")
+    t3.add_column("giá trị")
+    h = g["trajectory_handoff"]
+    t3.add_row("Tỷ lệ chu kỳ sinh sản lượng (vs kẹt vòng lặp)",
+               _fmt(h["productive_vs_looping"], pct=True))
+    t3.add_row("  chu kỳ sinh sản lượng / tổng",
+               f"{h['productive_cycles']} / {h['total_cycles']}")
+    t3.add_row("Độ dài quỹ đạo (node/chu kỳ)", _fmt(h["trajectory_length_nodes"]))
+    t3.add_row("Thời lượng chu kỳ trung bình", _fmt(h["mean_cycle_duration_s"]))
+    t3.add_row("Ổn định claim (reconfirm/claim)", _fmt(h["claim_stability"]))
+    t3.add_row("Ma sát claim (lock conflict/unstable/replay)", str(h["claim_friction_events"]))
+    t3.add_row("Tỷ lệ chu kỳ lỗi", _fmt(h["cycle_error_share"], pct=True))
+    console.print(t3)
+
+    t4 = Table(title="4. Chịu lỗi & mở rộng (Resilience & Scalability)")
+    t4.add_column("chỉ số", overflow="fold")
+    t4.add_column("giá trị")
+    r = g["resilience_scalability"]
+    repl = ", ".join(f"{k}={n}" for k, n in (r["replication_counts"] or {}).items())
+    t4.add_row("LLM ok-rate", _fmt(r["llm_ok_rate"], pct=True))
+    t4.add_row("Budget breaker mở", str(r["budget_breaker_opens"]))
+    t4.add_row("Phục hồi sau lỗi chu kỳ", _fmt(r["error_recovery_rate"], pct=True))
+    t4.add_row("plan_retry_recovered / rework_start",
+               f"{r['plan_retry_recovered']} / {r['rework_starts']}")
+    t4.add_row("Evidence thông kiểm chứng",
+               _fmt(r["evidence_pass_rate"], pct=True))
+    t4.add_row("  evidence đã chạy", str(r["evidence_total"]))
+    t4.add_row("Role-prompt sống qua chu kỳ (P11)",
+               _fmt(r["role_prompt_success_rate"], pct=True))
+    t4.add_row("Replication (P24)", repl or _fmt(None))
+    t4.add_row("Độ co giãn quy mô S = %ΔP/%ΔN", _fmt(r.get("scalability_S")))
+    note = r.get("scalability_note") or ""
+    if note:
+        t4.add_row("  ghi chú S", f"[dim]{note}[/]")
+    console.print(t4)
+
+    t5 = Table(title="5. Quản trị & chi phí (Governance & Cost)")
+    t5.add_column("chỉ số", overflow="fold")
+    t5.add_column("giá trị")
+    v = g["governance_cost"]
+    why = ", ".join(f"{k}={n}" for k, n in (v["rejected_why"] or {}).items())
+    mean_dur = (f"{v['llm_mean_duration_s']:.1f}s"
+                if v["llm_mean_duration_s"] else _fmt(None))
+    per_merged_calls = _fmt(v["llm_calls_per_merged"])
+    per_merged_secs = (f"{v['llm_seconds_per_merged']:.0f}s"
+                       if v["llm_seconds_per_merged"] else _fmt(None))
+    t5.add_row("Quality gap (objectors: rejected − approved)", _fmt(v["quality_gap_objectors"]))
+    t5.add_row("Incoherence (bị peer bắt lỗi thực chất)",
+               _fmt(v["incoherence_rate"], pct=True))
+    t5.add_row("Lý do reject", why or _fmt(None))
+    t5.add_row("LLM calls / mean duration", f"{v['llm_calls']} / {mean_dur}")
+    t5.add_row("Đa dạng mục đích LLM (số purpose)", str(v["llm_purpose_spread"]))
+    t5.add_row("Mức tập trung purpose hàng đầu", _fmt(v["llm_top_purpose_share"], pct=True))
+    t5.add_row("Chi phí mỗi MR merge (calls / giây)",
+               f"{per_merged_calls} / {per_merged_secs}")
+    t5.add_row("  đơn vị đo", f"[dim]{v['cost_unit_note']}[/]")
+    console.print(t5)
+
+    snaps = memory.list_eval_snapshots(limit=3)
+    if report.get("snapshot_id") is not None:
+        foot = f"snapshot #{report['snapshot_id']} đã lưu — " \
+               f"{len(snaps)} snapshot gần nhất: "
+        foot += ", ".join(f"#{s['id']}({s['agent_count']} agent)"
+                          for s in snaps)
+        console.print(f"[dim]{foot}[/]")
+    else:
+        console.print(f"[dim]không lưu snapshot (--no-save) — "
+                      f"{len(snaps)} snapshot cũ trong DB[/]")
+    console.print("[dim]So sánh theo thời gian: python -m agentics.cli swarm-eval "
+                  "--days 7 --json | jq .groups[/]")
+
+
+_GROUP_NAMES = {1: "1 phối hợp", 2: "2 hội tụ", 3: "3 quỹ đạo",
+                4: "4 chịu lỗi", 5: "5 quản trị"}
+
+
+def _pct_cell(row: dict) -> str:
+    """Colour the percentage by health direction; '—' when not convertible."""
+    pct, good = row.get("pct"), row.get("good_high", True)
+    if pct is None:
+        return "[dim]—[/]"
+    ok = pct >= 70 if good else pct <= 30
+    warn = (pct >= 40 if good else pct <= 60) and not ok
+    colour = "green" if ok else ("yellow" if warn else "red")
+    return f"[{colour}]{pct:.0f}%[/]"
+
+
+def _print_percent_rows(rows: list[dict]) -> None:
+    """One unified table: every metric normalised to a percentage share."""
+    t = Table(title="Bảng % tổng hợp — quy đổi mọi chỉ số swarm về phần trăm")
+    t.add_column("nhóm", style="cyan", no_wrap=True)
+    t.add_column("chỉ số", overflow="fold")
+    t.add_column("giá trị gốc", overflow="fold")
+    t.add_column("%", justify="right", no_wrap=True)
+    t.add_column("cách đọc", overflow="fold")
+    for row in rows:
+        t.add_row(_GROUP_NAMES.get(row["group"], str(row["group"])),
+                  row["metric"], row["raw"], _pct_cell(row), row["hint"])
+    console.print(t)
+    console.print("[dim]Quy ước: % = tỉ lệ phần trăm theo mẫu số tự nhiên của "
+                  "từng chỉ số; '—' = không có mẫu số trung thực để quy đổi. "
+                  "Màu: xanh ≥ ngưỡng khỏe, vàng = trung gian, đỏ = cần nhìn "
+                  "lại (theo hướng tốt của từng chỉ số).[/]")
+
+
 @app.command("memory-stats")
 def memory_stats() -> None:
     """Memory health: LifeMem traces/clusters/skills + bounded tables + personal lessons."""
@@ -416,6 +806,16 @@ def memory_stats() -> None:
         f"[bold]Decisions:[/] {st['decisions']}   [bold]Evidence:[/] {st['evidence']}   "
         f"[bold]Hypotheses:[/] {st['hypotheses']}"
     )
+    # v3 sync-trim health: vector docs should track the findings count — a
+    # persistently larger number means the tier drifted (ghosts accumulating).
+    from agentics.memory.vector_store import VectorStore
+
+    vector = VectorStore(settings.chroma_path)
+    if vector.available:
+        drift = vector.count() - st["findings"]
+        note = "in sync" if drift == 0 else f"drift {drift:+d} (ghosts trimmed lazily)"
+        console.print(f"[bold]Vector docs:[/] {vector.count()} ({note})")
+    memory.close()
     if st["top_skills"]:
         table = Table(title="Most-reused skills")
         for col in ("uses", "category", "skill"):
@@ -423,7 +823,6 @@ def memory_stats() -> None:
         for s in st["top_skills"]:
             table.add_row(str(s["uses"]), s["category"], s["text"])
         console.print(table)
-    memory.close()
 
     # v2: personal memory health — deduped lessons per agent (the same DB
     # the graph opens at data/personal/<agent>.db, read-only here)
@@ -582,6 +981,123 @@ def audit(
 
 
 @app.command()
+def panel(
+    mr_id: int = typer.Option(0, "--mr", "-m",
+                              help="chi tiết 1 MR: mọi phiếu, objection, bản bảo vệ"),
+    state: str = typer.Option("", "--state", "-s",
+                              help="chỉ hiện panel ở 1 trạng thái (voting/defense/approved/rejected)"),
+    stats: bool = typer.Option(False, "--stats", help="số liệu cơ chế P19 (tỉ lệ duyệt, cứu được bởi bảo vệ...)"),
+    limit: int = typer.Option(20, "--limit", "-l", help="số panel tối đa"),
+) -> None:
+    """Owner: bảng bỏ phiếu đánh giá lẫn nhau (P19) — ai vote gì, phản đối ra sao,
+    đồng hồ bảo vệ còn bao lâu, và cơ chế có đang cải thiện kết quả chung không.
+
+    Đối tác terminal của cột panel trên dashboard; trạng thái panel là nguồn
+    sự thật chung của swarm."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        if stats:
+            st = mem.panel_stats()
+            by_state = st["by_state"]
+            if by_state:
+                console.print("[bold]Peer panel (P19)[/] — tổng:",
+                              " — ".join(f"{k}: {v}" for k, v in sorted(by_state.items())))
+            else:
+                console.print("[bold]Peer panel (P19)[/] — (chưa có panel nào)")
+                return
+            decided = st["decided"]
+            approved = by_state.get("approved", 0)
+            console.print(f"  [bold]tỉ lệ duyệt:[/] {st['approval_rate']:.0%} "
+                          f"({approved}/{decided} panel đã kết luận)")
+            if st["defended"]:
+                save = st["defense_save_rate"]
+                console.print(f"  [bold]đã vào vòng bảo vệ:[/] {st['defended']}"
+                              + (f" — bảo vệ cứu được {save:.0%}"
+                                 if save is not None else ""))
+            if st["rejected_why"]:
+                console.print("  [bold]lý do reject:[/]",
+                              ", ".join(f"{k}: {v}" for k, v in st["rejected_why"].items()))
+            if st["top_objectors"]:
+                console.print("  [bold]người phản đối nhiều nhất:[/]",
+                              ", ".join(f"{r['voter']} ({r['objections']})"
+                                        for r in st["top_objectors"]))
+            if st["votes"]:
+                console.print("  [bold]phiếu (vòng quyết định):[/]",
+                              " — ".join(f"{k}: {v}" for k, v in sorted(st["votes"].items())))
+            return
+        if mr_id:
+            p = mem.get_panel(mr_id)
+            if p is None:
+                console.print(f"[yellow]MR #{mr_id} chưa có panel.[/]")
+                return
+            review = mem.get_review(mr_id)
+            if review is not None:
+                console.print(f"[bold]MR #{mr_id}[/] — {review['title']} "
+                              f"(tác giả {review['author']})")
+            else:
+                console.print(f"[bold]MR #{mr_id}[/] (bản ghi MR đã mất)")
+            console.print(f"  trạng thái: [bold]{p['state']}[/], vòng {p['round']}")
+            if p["state"] == "defense" and p["due_ts"]:
+                import time as _t
+                left = max(0, int(p["due_ts"] - _t.time()))
+                console.print(f"  đồng hồ bảo vệ: còn [bold]{left // 60}p{left % 60:02d}s[/]")
+            for rnd in range(1, p["round"] + 1):
+                votes = mem.panel_votes(mr_id, round=rnd)
+                if votes:
+                    console.print(f"  [bold]phiếu vòng {rnd}:[/]")
+                    for v in votes:
+                        color = "green" if v["vote"] == "accept" else "red"
+                        console.print(f"    [{color}]{v['vote']:>6}[/] {v['voter']}"
+                                      f" — {v['reason'][:160]}")
+                objs = mem.panel_objections(mr_id, round=rnd)
+                if objs:
+                    console.print(f"  [bold]objection vòng {rnd}:[/]")
+                    for o in objs:
+                        console.print(f"    [red]•[/] {o['voter']} — {o['objection'][:200]}")
+            defense = p.get("defense") or {}
+            if defense.get("rebuttals"):
+                console.print("  [bold]bản bảo vệ đã nộp:[/]")
+                for k, text in list(defense["rebuttals"].items())[:6]:
+                    console.print(f"    → {k}: {text[:200]}")
+                if defense.get("evidence_ids"):
+                    console.print(f"    bằng chứng kèm theo: {defense['evidence_ids']}")
+            return
+        rows = mem.panels_overview(limit=limit, state=state)
+        if not rows:
+            console.print("(chưa có panel nào — MR mới sẽ tự mở panel khi reviewer vote)")
+            return
+        table = Table(title="Peer panels (P19)" + (f" — state={state}" if state else ""))
+        table.add_column("MR", justify="right")
+        table.add_column("Trạng thái")
+        table.add_column("Vòng", justify="right")
+        table.add_column("Tác giả")
+        table.add_column("Task", justify="right")
+        table.add_column("Đồng hồ bảo vệ", justify="right")
+        table.add_column("Tiêu đề / kết luận", overflow="fold")
+        import time as _t
+        now = _t.time()
+        for r in rows:
+            color = {"approved": "green", "rejected": "red",
+                     "defense": "cyan", "voting": "yellow"}.get(r["state"], "white")
+            clock = ""
+            if r["state"] == "defense" and r["due_ts"]:
+                clock = f"{max(0, int(r['due_ts'] - now)) // 60}p"
+            tail = (r["verdict_comment"] or r["title"] or "")[:120]
+            table.add_row(
+                str(r["mr_id"]), f"[{color}]{r['state']}[/]", str(r["round"]),
+                r["author"] or "?", str(r["task_id"] if r["task_id"] is not None else "-"),
+                clock, tail,
+            )
+        console.print(table)
+    finally:
+        mem.close()
+
+
+@app.command()
 def hypotheses(
     status: str = typer.Option("", "--status", "-s",
                                help="chỉ hiện 1 trạng thái (supported/refuted/...)"),
@@ -633,6 +1149,152 @@ def hypotheses(
                               f" — {k['note'][:110]}")
     finally:
         mem.close()
+
+
+@app.command()
+def approve(
+    hyp_id: int = typer.Argument(..., help="id của hypothesis cần chấp thuận"),
+    note: str = typer.Option("", "--note", "-n", help="lý do chấp thuận (ghi vào audit trail)"),
+) -> None:
+    """Owner: chấp thuận một claim (neo ngoài tầm với của agent).
+
+    Settle anchor law: một verdict chỉ được ghi `supported` khi có ít nhất
+    một đầu vào mà agent KHÔNG chấp bút. Chấp thuận của owner là đầu vào đó
+    trong local-only mode: self_authored_ratio giảm xuống dưới 1 và claim
+    unanchored được mở đường thành tri thức chung. Mọi quyết định được ghi
+    journal (event `owner_approved`) để audit."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        row = mem.get_hypothesis(hyp_id)
+        if row is None:
+            console.print(f"[red]Không tìm thấy hypothesis #{hyp_id}[/]")
+            raise typer.Exit(1)
+        if mem.owner_approve(hyp_id, note=note):
+            console.print(f"[green]Đã chấp thuận h#{hyp_id}[/] — {row['claim'][:120]}")
+            console.print(f"  anchors hiện có: {mem.settle_anchor_state(hyp_id)}")
+        else:
+            console.print("[yellow]Claim này đã được chấp thuận trước đó.[/]")
+    finally:
+        mem.close()
+
+
+@app.command("verify-all")
+def verify_all(
+    limit: int = typer.Option(20, "--limit", "-l", help="số claim mới nhất được chạy lại"),
+    timeout: int = typer.Option(120, "--timeout", "-t", help="giới hạn giây mỗi protocol"),
+) -> None:
+    """Owner: tái chạy các claim đã settled từ protocol đã lưu (P23 replay).
+
+    Như một researcher thật lặp lại thí nghiệm cũ: claim giữ nguyên kết luận
+    -> claim_reconfirmed; bị lật ngược -> claim_falsified / claim_overturned
+    (tri thức chung được sửa tự động); không chạy được nữa -> claim_unstable.
+    Mọi kết quả ghi vào bảng evidence dùng chung (method='replay')."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.config import PROJECT_ROOT
+    from agentics.github_ops.repo_workspace import RepoWorkspace
+    from agentics.local_ops import LocalRepo
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.verify.replay import replay_settled
+
+    mem = SharedMemory(settings.db_path)
+    try:
+        pending = mem.settled_hypotheses(limit=limit, require_code=True)
+        if not pending:
+            console.print("[bold]P23 replay[/]: chưa có claim settled nào "
+                          "kèm protocol đã lưu — không có gì để tái chạy.")
+            return
+        console.print(f"[bold]P23 replay[/]: tái chạy {len(pending)} claim "
+                      "settled mới nhất trong workspace owner-replay…")
+        LocalRepo(settings).ensure(src=PROJECT_ROOT)
+        ws = RepoWorkspace("owner-replay", settings)
+        ws.sync_main()
+        reports = replay_settled(mem, ws, limit=limit, agent="owner",
+                                 timeout=timeout)
+        table = Table(title="Re-verification (P23) — settled claims, re-run")
+        table.add_column("Claim", justify="right")
+        table.add_column("Kết luận cũ")
+        table.add_column("Kết luận mới")
+        table.add_column("Sự kiện")
+        table.add_column("Ghi chú", overflow="fold")
+        flipped = 0
+        for r in reports:
+            old = r.get("was", "-")
+            new = r.get("status", "-")
+            if r.get("replayed") and old != new:
+                flipped += 1
+            color = {"claim_reconfirmed": "green", "claim_falsified": "red",
+                     "claim_overturned": "yellow"}.get(r.get("event", ""), "dim")
+            table.add_row(
+                f"h#{r['hyp_id']}", str(old),
+                f"[{color}]{new}[/]" if r.get("replayed") else "-",
+                r.get("event", "-") or "-",
+                (r.get("note") or "")[:160],
+            )
+        console.print(table)
+        console.print(f"[bold]{flipped}[/] claim bị lật kết luận sau khi tái "
+                      "chạy — tri thức chung đã được sửa (xem journal "
+                      "claim_falsified / claim_overturned).")
+    finally:
+        mem.close()
+
+
+@app.command()
+def replay(
+    limit: int = typer.Option(5, "--limit", "-l", help="số claim replay trong lần quét này"),
+    hyp_id: int = typer.Option(0, "--id", help="replay đúng 1 giả thuyết theo id"),
+) -> None:
+    """Owner: chạy lại (replicate) các claim đã settled từ protocol đã lưu (P23).
+
+    Mỗi replay là 2 lần chạy thật của protocol trong workspace riêng, machine
+    verdict so với tiêu chí đã pre-register: reconfirm giữ kiến thức, drift
+    (supported->refuted) sửa verified_knowledge, overturn đảo kết luận, unstable
+    đưa về inconclusive. Kết quả ghi vào evidence chung (method='replay') —
+    mọi agent đều thấy. Đây là phần trả lời trực tiếp cho giả thuyết 2 + 3."""
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    from agentics.github_ops.repo_workspace import RepoWorkspace
+    from agentics.memory.shared_memory import SharedMemory
+    from agentics.verify.replay import replay_hypothesis, replay_settled
+
+    memory = SharedMemory(settings.db_path)
+    try:
+        if hyp_id > 0:
+            report = [replay_hypothesis(memory, RepoWorkspace(
+                "owner-cli", settings, guard=None), hyp_id, agent="owner")]
+        else:
+            report = replay_settled(
+                memory, RepoWorkspace("owner-cli", settings, guard=None),
+                limit=max(1, limit), agent="owner")
+        if not report:
+            console.print("[yellow]Không có claim nào replay được[/] "
+                          "(chưa có claim settled mang protocol source).")
+            return
+        table = Table(title=f"P23 replay — {len(report)} claim(s)")
+        table.add_column("ID", justify="right")
+        table.add_column("Claim", overflow="fold")
+        table.add_column("Trước", justify="center")
+        table.add_column("Sau", justify="center")
+        table.add_column("Sự kiện")
+        for r in report:
+            color = {"claim_reconfirmed": "green", "claim_falsified": "red",
+                     "claim_overturned": "cyan", "claim_unstable": "yellow"}.get(
+                r.get("event", ""), "dim")
+            table.add_row(
+                str(r.get("hyp_id")),
+                (r.get("note") or r.get("claim", ""))[:100],
+                r.get("was", "-"), r.get("status", "-"),
+                f"[{color}]{r.get('event', '-')}[/]" if r.get("replayed")
+                else f"[dim]skipped: {r.get('note', '')[:40]}[/]",
+            )
+        console.print(table)
+    finally:
+        memory.close()
 
 
 @app.command()
@@ -906,11 +1568,14 @@ def mr_merge(
 
 @app.command("papers")
 def papers(
-    query: str = typer.Argument(None, help="Search phrase (scholarly / datasets / web)"),
+    query: str = typer.Argument(None, help="Search phrase (scholarly / datasets / models / repos / web)"),
     source: str = typer.Option("all", "--source", "-s",
-                               help="Scholarly source: all | arxiv | openalex | crossref"),
+                               help="Scholarly source: all | arxiv | openalex | crossref | semanticscholar | europepmc"),
     max_results: int = typer.Option(8, "--max", help="Rows per source"),
     datasets: bool = typer.Option(False, "--datasets", help="Search Hugging Face datasets instead"),
+    models: bool = typer.Option(False, "--models", help="Search Hugging Face models instead"),
+    github: bool = typer.Option(False, "--github", help="Search GitHub repos instead (reference implementations)"),
+    pypi: str = typer.Option("", "--pypi", help="One PyPI package: existence + latest real version to pin"),
     web: bool = typer.Option(False, "--web", help="DuckDuckGo web search instead"),
     define: bool = typer.Option(False, "--define", help="Wikipedia summary of the term instead"),
     doi: str = typer.Option("", "--doi", help="Resolve one DOI to real-metadata BibTeX"),
@@ -918,17 +1583,21 @@ def papers(
     """Search the FREE keyless research tools directly (no LLM cookies).
 
     Same sources the agents fall back to when the LLM pools are dead —
-    arXiv / OpenAlex / Crossref return real publisher metadata (authors,
-    year, abstract, citation counts), never LLM-generated text. Quick way
-    to sanity-check the evidence path before starting a run.
+    arXiv / OpenAlex / Crossref / Semantic Scholar / Europe PMC return real
+    publisher metadata (authors, year, abstract, citation counts), never
+    LLM-generated text. GitHub/PyPI/HuggingFace ground the verification
+    side: reference implementations to clone, datasets/models to feed a
+    protocol, real dependency versions to pin. Quick way to sanity-check
+    the evidence path before starting a run.
     """
     setup_logging("ERROR")
     settings = _settings()
     if not getattr(settings, "free_tools_enabled", True):
         console.print("[red]Free tools are disabled[/] — set FREE_TOOLS_ENABLED=1")
         raise typer.Exit(1)
-    if not any((query, datasets, web, define, doi)):
-        console.print("Nothing to search — give QUERY or one of --datasets/--web/--define/--doi")
+    if not any((query, datasets, models, github, pypi, web, define, doi)):
+        console.print("Nothing to search — give QUERY or one of "
+                      "--datasets/--models/--github/--pypi/--web/--define/--doi")
         raise typer.Exit(1)
     import asyncio as _aio
     from agentics.research import free_tools as ft
@@ -937,6 +1606,17 @@ def papers(
         if doi:
             bib = await ft.crossref_bibtex(doi, settings=settings)
             console.print(bib or f"[yellow]no BibTeX found for DOI {doi}[/]")
+            return
+        if pypi:
+            info = await ft.pypi_package_info(pypi, settings=settings)
+            if not info:
+                console.print(f"[yellow]no PyPI package named '{pypi}'[/]")
+                return
+            console.print(f"[bold]{info['name']}=={info['version']}[/] "
+                          f"(requires Python {info['requires_python'] or '?'})")
+            if info["summary"]:
+                console.print(info["summary"])
+            console.print(f"[dim]pin: {info['name']}=={info['version']}{(' — ' + info['home_page']) if info['home_page'] else ''}[/]")
             return
         if define:
             info = await ft.wikipedia_summary(query or "", settings=settings)
@@ -955,6 +1635,29 @@ def papers(
                 table.add_row(r["id"], str(r["downloads"] or 0), str(r["likes"] or 0), r["url"])
             console.print(table if rows else "[yellow]no datasets found[/]")
             return
+        if models:
+            rows = await ft.hf_models_search(query or "", max_results, settings=settings)
+            table = Table(title=f"Hugging Face models: {query}")
+            for col in ("model", "downloads", "likes", "task", "url"):
+                table.add_column(col, overflow="fold")
+            for r in rows:
+                table.add_row(r["id"], str(r["downloads"] or 0), str(r["likes"] or 0),
+                              r["pipeline_tag"] or "-", r["url"])
+            console.print(table if rows else "[yellow]no models found[/]")
+            return
+        if github:
+            rows = await ft.github_repo_search(query or "", max_results, settings=settings)
+            table = Table(title=f"GitHub repos: {query} (reference implementations)")
+            for col in ("repo", "stars", "language", "license", "last push", "url"):
+                table.add_column(col, overflow="fold")
+            for r in rows:
+                table.add_row(f"{r['repo']}", str(r["stars"] if r["stars"] is not None else "-"),
+                              r["language"] or "-", r["license"] or "-", r["pushed_at"] or "-", r["url"])
+            console.print(table if rows else "[yellow]no repos found[/]")
+            for r in rows:
+                if r["description"]:
+                    console.print(f"[dim]{r['repo']}: {r['description']}[/]")
+            return
         if web:
             rows = await ft.ddg_web_search(query or "", max_results, settings=settings)
             for i, r in enumerate(rows, 1):
@@ -969,6 +1672,10 @@ def papers(
             hits = await ft.openalex_search(query or "", max_results, settings=settings)
         elif source == "crossref":
             hits = await ft.crossref_works(query or "", max_results, settings=settings)
+        elif source == "semanticscholar":
+            hits = await ft.semantic_scholar_search(query or "", max_results, settings=settings)
+        elif source == "europepmc":
+            hits = await ft.europepmc_search(query or "", max_results, settings=settings)
         else:
             hits = await ft.search_all(query or "", max_results, settings=settings)
         if not hits:

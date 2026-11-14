@@ -187,6 +187,16 @@ class LocalRepo:
             ["git", "-C", str(self.path), "symbolic-ref", "HEAD", "refs/heads/main"],
             capture_output=True, text=True,
         )
+        # the whole local-mode stack (integrator merges, P10 default-branch
+        # rule, branch_name flow) assumes 'main' — fail HERE with an
+        # actionable message instead of a raw CalledProcessError later,
+        # deep inside the first merge
+        if not self.branch_exists("main"):
+            raise RuntimeError(
+                f"local origin seeded from {src} has no 'main' branch. The "
+                "local lab requires the checkout to carry main — create it "
+                "(git branch main && git checkout main) and restart the lab."
+            )
         self.ensure_guard()
         return self.path
 
@@ -222,8 +232,14 @@ class LocalRepo:
     def main_head(self) -> str:
         proc = subprocess.run(
             ["git", "-C", str(self.path), "rev-parse", "main"],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=False,
         )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"local origin {self.path} has no readable 'main' branch "
+                f"(git said: {proc.stderr.strip()[:200]}). It was probably "
+                "seeded from a checkout without main — re-seed the bare repo."
+            )
         return proc.stdout.strip()
 
     def branch_exists(self, branch: str) -> bool:
@@ -279,8 +295,10 @@ class TaskSource:
              backlog sweeps every research angle instead of reopening
              "State-of-the-art survey" forever.
 
-        The dedup title set is built ONCE and threaded through every source
-        call, so the shortfall slots never re-derive the same task.
+        Dedup is the ``task_title_exists`` point lookup inside each source
+        (unbounded — an investigated failure never re-opens even past any
+        title window; a few point queries per slot instead of loading every
+        task title), so the shortfall slots never re-derive the same task.
 
         Returns the number of tasks created (0..shortfall).
         """
@@ -289,10 +307,9 @@ class TaskSource:
         shortfall = min_open - len(self.memory.scan_open_tasks(limit=min_open))
         if shortfall <= 0:
             return 0
-        known = {t["title"] for t in self.memory.list_tasks(limit=500)}
         created = 0
         for _ in range(shortfall):
-            made = self._open_failure_investigation(known)
+            made = self._open_failure_investigation()
             if not made:
                 made = self._open_next_survey_angle()
             if not made:
@@ -300,12 +317,8 @@ class TaskSource:
             created += made
         return created
 
-    def _open_failure_investigation(self, known: set[str]) -> int:
-        """Turn the newest un-investigated failed trace into a bugfix task.
-
-        ``known`` is the shared dedup title set of the whole top-up pass; the
-        created title is added to it so the next shortfall slot skips it.
-        """
+    def _open_failure_investigation(self) -> int:
+        """Turn the newest un-investigated failed trace into a bugfix task."""
         for trace in self.memory.recent_traces(limit=5, failures_only=True):
             failure = " ".join(
                 str(trace.get("failure") or trace.get("attempted") or "").split()
@@ -316,8 +329,10 @@ class TaskSource:
             title = (f"Investigate failure ({trace.get('category', 'unknown')}): "
                      f"{snippet}")
             # a failure already investigated (any state, incl. merged) must not
-            # re-open — recurring failures are the evolution task's job
-            if title in known:
+            # re-open — recurring failures are the evolution task's job. Point
+            # lookup so the rule holds even when the lab outgrew a fixed
+            # recent-titles window.
+            if self.memory.task_title_exists(title):
                 continue
             task_id = self.memory.create_task_if_absent(
                 title,
@@ -333,7 +348,6 @@ class TaskSource:
                 agent="supervisor",
             )
             if task_id is not None:
-                known.add(title)
                 self.memory.journal("supervisor", "backlog_top_up",
                                     {"task": task_id, "source": "failure_trace",
                                      "trace": trace.get("id")})
@@ -580,8 +594,12 @@ class LocalMergeQueue:
                 continue
             if merge is None:
                 # no merge callback wired in this process: leave it queued for
-                # an Integrator that has one
-                self.memory.mq_mark(mr_id, "queued", bump_attempt=True)
+                # an Integrator that has one. Nothing was actually attempted,
+                # so the attempt budget must not burn — a queue drained while
+                # no Integrator is live used to pre-spend MAX_ATTEMPTS, and
+                # the first real conflict later failed the MR as
+                # "not mergeable after 3 attempts" on its first real try.
+                self.memory.mq_mark(mr_id, "queued", bump_attempt=False)
                 continue
             if bool(merge(mr_id)):
                 self.memory.mq_mark(mr_id, "merged")

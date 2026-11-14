@@ -20,6 +20,7 @@ ALL = [
     "open_pr",
     "review",
     "integrate",
+    "tournament",
     "reflect",
 ]
 

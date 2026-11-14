@@ -186,6 +186,68 @@ class Settings:
         default_factory=lambda: _env_int("LLM_FAIL_STREAK_LIMIT", 5))
     llm_breaker_cooldown_s: int = field(
         default_factory=lambda: _env_int("LLM_BREAKER_COOLDOWN_S", 900))
+    # P20b — science reserve: the last slice of the pool cap that ONLY the
+    # reserve purposes may spend, so plumbing (plan/review/research fan-out)
+    # can never starve the verify/ideation escape hatch the way the live
+    # 07:08 run starved it (previous hour drained the pool, the saturation
+    # pivot itself was refused). 0 = off; purposes are a comma-separated tag
+    # list matched against the ask's `purpose`.
+    budget_reserve_pct: float = field(
+        default_factory=lambda: _env_float("BUDGET_RESERVE_PCT", 0.25))
+    budget_reserve_purposes: str = field(
+        default_factory=lambda: _env("BUDGET_RESERVE_PURPOSES",
+                                     "verify,ideation"))
+    # Max seconds a blocked reserve-purpose ask may sleep inside _llm_ask
+    # and retry ONCE (the window slides continuously; waiting beats dying
+    # for the whole hour). 0 = never wait.
+    budget_block_wait_cap_s: float = field(
+        default_factory=lambda: _env_float("BUDGET_BLOCK_WAIT_CAP_S", 45.0))
+    # TTT_DISCOVER.md C2/C3 config — PUCT frontier + entropic credit.
+    puct_c: float = field(default_factory=lambda: _env_float("PUCT_C", 1.0))
+    entropic_bonus_max: float = field(
+        default_factory=lambda: _env_float("ENTROPIC_BONUS_MAX", 8.0))
+    reward_scale: str = field(
+        default_factory=lambda: _env("REWARD_SCALE", "target"))
+    # Wave-2 #3 — EIG frontier: expected-information-gain-per-cost refines
+    # the PUCT order (Beta-Bernoulli priors from the experiment ledger;
+    # closed-form entropy reduction). 0 = pure PUCT order.
+    eig_weight: float = field(
+        default_factory=lambda: _env_float("EIG_WEIGHT", 0.5))
+    # Local small-model router (Ollama / llama.cpp / LM Studio) — the FREE
+    # edge for cheap purposes so the cookie pool is spent only on science.
+    # Disabled by default: no surprise network calls to localhost.
+    local_llm_enabled: bool = field(
+        default_factory=lambda: _env_bool("LOCAL_LLM_ENABLED", False))
+    local_llm_url: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_URL", "http://127.0.0.1:11434"))
+    local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL"))
+    # CPU-realistic defaults (live 2026-11-14 08:51: the first /api/chat
+    # also LOADS the model into RAM and qwen3 would think/generate for
+    # minutes — 20s timed out with an empty error string every cycle).
+    local_llm_timeout: float = field(
+        default_factory=lambda: _env_float("LOCAL_LLM_TIMEOUT", 120.0))
+    # Bounded generation: plumbing answers (triples, plans, prompts) never
+    # need 2048 tokens — cap it so CPU inference finishes in seconds.
+    local_llm_num_predict: int = field(
+        default_factory=lambda: _env_int("LOCAL_LLM_NUM_PREDICT", 512))
+    # qwen3-family thinking models: <think> blocks are stripped from the
+    # answer regardless; this ALSO asks the runtime to skip thinking
+    # entirely (Ollama >= 0.9; older runtimes just ignore the field).
+    local_llm_think: bool = field(
+        default_factory=lambda: _env_bool("LOCAL_LLM_THINK", False))
+    # Comma-separated purposes that may route to the local model. Science
+    # purposes (research/verify/ideation/implement/review/repair/defend/
+    # tournament) can NEVER be listed here — the router refuses them even
+    # if someone puts them in the env. plan/role_synthesis are scaffolding:
+    # allowed as a P20c budget FALLBACK so a dry pool degrades to a local
+    # plan instead of an idle agent (2026-11-14 08:35 plan-starvation).
+    local_llm_purposes: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_PURPOSES",
+                                     "kg_extract,plan,role_synthesis,"
+                                     "prompt_evolve,reflect,skill_distill"))
+    # GraphRAG-lite: mine findings into the knowledge graph when the local
+    # router is configured; ingest is a no-op without it.
+    kg_enabled: bool = field(default_factory=lambda: _env_bool("KG_ENABLED", True))
     # P22 — retention: workspaces of agents inactive longer than this AND
     # with a clean git tree get pruned by the supervisor sweep (0 = off).
     workspace_retention_minutes: int = field(
@@ -193,6 +255,99 @@ class Settings:
     # P10 layer 4 — integrity self-healing sweep interval (0 = off).
     integrity_interval_s: int = field(
         default_factory=lambda: _env_int("INTEGRITY_INTERVAL_S", 20))
+    # P23 — replay: settled claims are periodically re-run from their stored
+    # protocol source by the supervisor sweep. replay_sweep_size caps how many
+    # claims one sweep replays (0 = off); replay_every_n_cycles gates how
+    # often the sweep runs. Every outcome lands in shared evidence
+    # (method='replay') so the whole swarm sees replication results (H3).
+    replay_sweep_size: int = field(
+        default_factory=lambda: _env_int("REPLAY_SWEEP_SIZE", 2))
+    replay_every_n_cycles: int = field(
+        default_factory=lambda: _env_int("REPLAY_EVERY_N_CYCLES", 3))
+    # P23 flood control: a claim replayed again within cooldown_s (or beyond
+    # replay_max_per_hyp total replays) adds no information — the sweep skips
+    # it. Live 2026-11-14: two replayable claims were re-run every sweep by
+    # both supervisors -> hundreds of duplicate evidence rows.
+    replay_cooldown_s: int = field(
+        default_factory=lambda: _env_int("REPLAY_COOLDOWN_S", 1800))
+    replay_max_per_hyp: int = field(
+        default_factory=lambda: _env_int("REPLAY_MAX_PER_HYP", 10))
+    # QD diversity (DAPS / IDEAgent): a new hypothesis whose word-Jaccard
+    # with a recent one exceeds diversity_jaccard_max is rejected as a
+    # near-clone (PEM); the supervisor's diversity_audit alerts when
+    # mechanism entropy over the last 20 hypotheses drops below
+    # diversity_min_entropy nats (algorithmic mode collapse alarm).
+    diversity_jaccard_max: float = field(
+        default_factory=lambda: _env_float("DIVERSITY_JACCARD_MAX", 0.8))
+    diversity_min_entropy: float = field(
+        default_factory=lambda: _env_float("DIVERSITY_MIN_ENTROPY", 1.0))
+    # Kosmos world model: how many world_notes rows the agent snapshots
+    # carry into prompts (bounded — the model is a summary, not a ledger).
+    world_context_notes: int = field(
+        default_factory=lambda: _env_int("WORLD_CONTEXT_NOTES", 12))
+    # P24bis — independent replication: reviewers re-run settled claims from
+    # their stored protocols in their own workspaces. replication_limit caps
+    # how many claims ONE reviewer cycle replicates (0 = off). No LLM is
+    # involved: the criterion is frozen data and the verdict is machine-made.
+    replication_limit: int = field(
+        default_factory=lambda: _env_int("REPLICATION_LIMIT", 1))
+    # QD ideation closed loop (IDEAgent gate + Kosmos harvest, 2026-11-14):
+    # AGENTICS_IDEATION=0 turns the whole loop off (no ideation LLM calls);
+    # idea_min_score is the IDEAgent qualification gate tau (0-100);
+    # idea_repair_margin routes near-misses into ONE repair round;
+    # idea_max_children bounds how many follow-up hypotheses one settled
+    # experiment may spawn; idea_max_attempts bounds deep-dive RETRIES of
+    # inconclusive protocols (autoresearch: fix-and-rerun, then move on).
+    ideation_enabled: bool = field(
+        default_factory=lambda: _env("AGENTICS_IDEATION", "1")
+        .strip().lower() not in ("0", "false", "no", "off"))
+    idea_min_score: int = field(
+        default_factory=lambda: _env_int("IDEA_MIN_SCORE", 60))
+    idea_repair_margin: int = field(
+        default_factory=lambda: _env_int("IDEA_REPAIR_MARGIN", 20))
+    # Saturation escape hatch (owner dashboard 2026-11-14: with the topic
+    # saturated the gate rejected EVERY gap proposal outright — weak=-25
+    # missed the repair band by 5 points and the lab oscillated
+    # skip->reject->skip forever). When the world model proposes a
+    # gap-closing hypothesis under saturation, the repair band widens to
+    # this margin so a near-miss gets its ONE repair round instead of
+    # dying. The re-judge after repair still must FULLY pass the gate
+    # (qualification with repair_margin=0), so this cannot lower the bar
+    # for what gets registered — it only grants the repair attempt.
+    idea_repair_margin_saturation: int = field(
+        default_factory=lambda: _env_int("IDEA_REPAIR_MARGIN_SATURATION", 30))
+    idea_max_children: int = field(
+        default_factory=lambda: _env_int("IDEA_MAX_CHILDREN", 2))
+    idea_max_attempts: int = field(
+        default_factory=lambda: _env_int("IDEA_MAX_ATTEMPTS", 2))
+    # Discovery branching (2026-11-14 novelty round): when the ideator grades
+    # a settled result's novelty >= discovery_novelty_min (0-100) the result
+    # is marked a DISCOVERY and its follow-ups become angled branches the
+    # deep-dive backlog prioritizes (frontier). branch_max_depth caps the
+    # branch level below the discovery root — past it the harvest stops
+    # spawning children and the frontier stops boosting the subtree.
+    discovery_novelty_min: int = field(
+        default_factory=lambda: _env_int("DISCOVERY_NOVELTY_MIN", 70))
+    branch_max_depth: int = field(
+        default_factory=lambda: _env_int("BRANCH_MAX_DEPTH", 4))
+    # Discovery double-judge gate: mark_discovery fires only when a SECOND,
+    # INDEPENDENT account re-grades the result as surprising AND its answer
+    # carries at least one external citation URL (an input the authoring
+    # agent did not author). Single-account setups therefore never mark
+    # discoveries — that is the honest behavior, not a bug (set 0 to
+    # restore the single-judge behavior).
+    discovery_second_judge: bool = field(
+        default_factory=lambda: _env_bool("DISCOVERY_SECOND_JUDGE", True))
+    # Settle anchor law (verdict provenance): a verdict may be recorded
+    # `supported` ONLY when self_authored_ratio < 1 — at least one input of
+    # the verdict (external citation, independent replication, owner
+    # approval, pinned-hash data) must be something the agent did NOT
+    # author. An anchorless supported is downgraded to `unanchored` and
+    # waits for independent replication (P24 promotes it when a peer's
+    # re-run agrees). The law guards OPTIMISM, not pessimism: refuted and
+    # inconclusive verdicts pass unchanged.
+    settle_require_anchor: bool = field(
+        default_factory=lambda: _env_bool("SETTLE_REQUIRE_ANCHOR", True))
     # Perplexity
     pplx_ws_url: str = field(
         default_factory=lambda: _env(
@@ -224,6 +379,24 @@ class Settings:
     # visible before failing an ask with a diagnostic error (challenge page,
     # logged-out wall, or a UI markup change).
     hb_input_timeout: int = field(default_factory=lambda: _env_int("HB_INPUT_TIMEOUT", 45))
+    # --- Second-judge provider (dual-model de-correlation) -------------------
+    # When "chatgpt", tournament debate asks run a SECOND, independent model
+    # family (ChatGPT via its own cookie session on the same Hyperbrowser
+    # edge) alongside the primary Perplexity jury. Both verdicts must agree
+    # before Elo moves; disagreement records a `contested` match (no Elo
+    # movement) for the owner. "" keeps the single-jury behaviour.
+    judge_second_provider: str = field(
+        default_factory=lambda: _env("JUDGE_SECOND_PROVIDER", ""))
+    chatgpt_cookie_path: str = field(
+        default_factory=lambda: _env("CHATGPT_COOKIE_PATH", ""))
+    # Free-plan Hyperbrowser sessions carry a hard duration cap (~10 min;
+    # live 2026-11-13: six sessions aged 9m37s-10m06s all died mid-ask inside
+    # one 30-second window, wrecking every in-flight call). Recycle each
+    # cloud session BEFORE the cap — between asks, while healthy — instead
+    # of losing everything at once. The client jitters this ±10-15% so a
+    # swarm never recycles in sync. 0 disables the guard.
+    hb_session_recycle_s: int = field(
+        default_factory=lambda: _env_int("HB_SESSION_RECYCLE_S", 480))
 
     # --- Adaptive planning & role prompts (LLM-authored) ---------------------
     # Role missions are WRITTEN by the LLM (shared swarm-wide via the
@@ -238,6 +411,57 @@ class Settings:
         default_factory=lambda: _env_int("ROLE_PROMPT_MAX_CHARS", 1600))
     role_prompt_rework_failures: int = field(
         default_factory=lambda: _env_int("ROLE_PROMPT_REWORK_FAILURES", 2))
+    # Wave-2 #2 — DSPy-lite prompt evolution: the role mission is not just
+    # re-synthesized after failures, it EVOLVES. Challenger variants (arms)
+    # are served on exploration cycles, scored on real exit-code outcomes,
+    # and promoted when they beat the champion's win-rate by a margin.
+    # Mutation runs on the LOCAL router (purpose prompt_evolve) — no cookie
+    # cost. Requires adaptive_prompts.
+    prompt_evolution_enabled: bool = field(
+        default_factory=lambda: _env_bool("PROMPT_EVOLUTION", True))
+    prompt_variant_pool: int = field(
+        default_factory=lambda: _env_int("PROMPT_VARIANT_POOL", 3))
+    prompt_explore_p: float = field(
+        default_factory=lambda: _env_float("PROMPT_EXPLORE_P", 0.25))
+    prompt_variant_promote_min: int = field(
+        default_factory=lambda: _env_int("PROMPT_VARIANT_PROMOTE_MIN", 10))
+    prompt_variant_promote_edge: float = field(
+        default_factory=lambda: _env_float("PROMPT_VARIANT_PROMOTE_EDGE",
+                                           0.15))
+    # Wave-2 #5 — reflection tree (Generative-Agents style): every
+    # reflect_every_cycles supervisor cycles, the world model's recent
+    # notes are synthesized into 1-2 higher-level INSIGHT notes on the
+    # LOCAL router (purpose reflect) — insights carry provenance (parent
+    # note ids, validated) and feed ideation seeding. 0 = off.
+    reflect_every_cycles: int = field(
+        default_factory=lambda: _env_int("REFLECT_EVERY_CYCLES", 6))
+    reflect_min_notes: int = field(
+        default_factory=lambda: _env_int("REFLECT_MIN_NOTES", 5))
+    # Wave-2 #1 — Voyager-style skill library: supported settles are
+    # distilled into reusable skills (description via the LOCAL router,
+    # purpose skill_distill; code stored verbatim). Retrieval injects the
+    # token-overlap top-3 into protocol-writing/implement prompts.
+    skill_library_enabled: bool = field(
+        default_factory=lambda: _env_bool("SKILL_LIBRARY", True))
+    skill_distill_every_cycles: int = field(
+        default_factory=lambda: _env_int("SKILL_DISTILL_EVERY_CYCLES", 4))
+    skill_max: int = field(default_factory=lambda: _env_int("SKILL_MAX", 120))
+    # --- Coordination pack A2X (docs/COORDINATION.md) ------------------------
+    # Contract-Net-lite: rank bonus a claim adds to a task the supervisor's
+    # scan awarded to THIS agent (0 disables the allocation signal entirely;
+    # the awards table is still maintained). ~0.75 flips a ranking the way a
+    # priority label would, without overriding the agent's own profile.
+    coord_award_bonus: float = field(
+        default_factory=lambda: _env_float("COORD_AWARD_BONUS", 0.75))
+    # Award TTL (owner dashboard 2026-11-14: task #4 was re-awarded to the
+    # same coder EVERY scan forever because the awarded agent never claimed
+    # it — the market signal became a stuck record). An (task, agent) pair
+    # that survives this many consecutive scans without being claimed is
+    # dropped from the allocation: the manager stops nagging, the task stays
+    # open for the ordinary profile race. 0 disables the TTL (re-award
+    # forever, pre-TTL behavior).
+    coord_award_ttl: int = field(
+        default_factory=lambda: _env_int("COORD_AWARD_TTL", 3))
     # Free keyless research tools (docs/FREE_TOOLS.md): arXiv / OpenAlex /
     # Crossref / HuggingFace datasets / Wikipedia / DuckDuckGo. They ground
     # research in real publisher metadata and keep node_research alive when
@@ -249,6 +473,42 @@ class Settings:
     # Optional polite-pool contact for OpenAlex/Crossref (a plain email).
     # Not required, but it puts the calls in the friendlier rate-limit tier.
     free_tools_mailto: str = field(default_factory=lambda: _env("FREE_TOOLS_MAILTO"))
+    # P18b research fan-out: when > 1, node_research asks complementary
+    # angles (survey / benchmarks / open problems) IN PARALLEL — each extra
+    # angle runs on a different Hyperbrowser token of the pool (or a
+    # different cookie account on the local backend). Results merge into one
+    # finding; every angle still passes the P20 budget gate and the fan-out
+    # is journalled. 1 keeps the single-ask behaviour.
+    research_fanout: int = field(default_factory=lambda: _env_int("RESEARCH_FANOUT", 1))
+    # Solo-lab unblock: when the pool has fewer identities than angles
+    # (e.g. one Hyperbrowser token), the extra angle still runs — SEQUENTIALLY
+    # on the agent's own pinned view, never parallel on the same session.
+    # Off restores the strict single-ask behaviour for 1-identity pools.
+    research_same_view_angle: bool = field(
+        default_factory=lambda: _env_bool("RESEARCH_SAME_VIEW_ANGLE", True))
+    # --- Co-Scientist tournament (agentics/coscientist, ported from the
+    # Apache-2.0 Kaimen-Inc re-implementation of Gottweis et al. 2026) ---
+    # The Elo tournament over hypotheses: a QUALITY dimension on top of the
+    # P16 truth dimension. Every match and evolution ask passes the P20
+    # budget gate; 0 matches/cycle or enabled=False disables the loop.
+    tournament_enabled: bool = field(
+        default_factory=lambda: _env_bool("TOURNAMENT_ENABLED", True))
+    tournament_matches_per_cycle: int = field(
+        default_factory=lambda: _env_int("TOURNAMENT_MATCHES_PER_CYCLE", 2))
+    evolution_per_cycle: int = field(
+        default_factory=lambda: _env_int("EVOLUTION_PER_CYCLE", 1))
+    evolution_top_k: int = field(
+        default_factory=lambda: _env_int("EVOLUTION_TOP_K", 3))
+    # Meta-review feedback synthesis: every N decisive debates the newest
+    # win/loss patterns are distilled into a steering note (one more ask).
+    meta_review_window: int = field(
+        default_factory=lambda: _env_int("META_REVIEW_WINDOW", 4))
+    # P16-R (Reflection on failed protocols): when a hypothesis protocol is
+    # inconclusive, the author gets N bounded self-repair rounds — the
+    # machine failure note is fed back and the protocol is rewritten ONCE,
+    # then re-adjudicated by the same frozen criterion. 0 = off.
+    verify_protocol_repair_rounds: int = field(
+        default_factory=lambda: _env_int("VERIFY_PROTOCOL_REPAIR_ROUNDS", 1))
 
     @property
     def owner(self) -> str:

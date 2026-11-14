@@ -8,6 +8,9 @@ memory from degrading into an unorganized pile as the lab runs for weeks.
 A later hardening pass (v2) closed the loops that were half-built — dedup,
 recall, bounded growth — without introducing any new subsystem; every
 change upgrades a mechanism that already existed. See "v2 hardening" below.
+A second pass (v3) tightened the same loops one more notch (vector-tier
+sync-trim, offline dedup fallback, number-blind lesson identity, issue-aware
+recall) — see "v3 hardening".
 
 ## Layer 1 — Shared memory (`agentics/memory/shared_memory.py`)
 
@@ -129,6 +132,29 @@ new surface (old fixtures, test fakes, a partially started swarm) degrades to
 an empty string — memory can never break a cycle. At cold start every new
 prompt block is empty, so prompts are unchanged until memory actually has
 something to say.
+
+## v3 hardening — same loops, one notch tighter
+
+Nothing new was invented here either; each row upgrades a mechanism that
+already existed (trim, dedup, recall, fallback).
+
+| Half-built loop (v2 left it at) | What the v3 upgrade does |
+| --- | --- |
+| Findings trim only trimmed SQLite — the ChromaDB tier kept every doc forever (ghosts ate the `n_results` budget and the index grew unbounded) | **Sync-trim**: each finding row stores its `vector_doc_id`; when the trim evicts rows it hands the evicted doc ids to a hook the orchestrator wires to `VectorStore.delete_many` — both tiers stay the same size. `memory-stats` prints the drift (`Vector docs: N`) so the owner can see the tiers track. |
+| P7 research dedup needed chromadb — with the vector store offline the gate returned "unknown" every cycle | **SQLite fallback**: `finding_search` (keyword overlap over the newest 500 finding titles) answers the same gate when `vector.available` is False — the fallback pattern the policies layer already used, applied to the dedup gate. A match needs ≥ 2 significant shared words, so one common word never counts as coverage. |
+| Lesson dedup was number-sensitive — "cap reached (57/50)" and "(63/50)" sat as two rows, so recurring failures with varying counts never showed `(xN)` | **Number-blind identity**: `lesson_hash` collapses digit runs before hashing (verbatim text stays stored for display); v2 notebooks re-normalize + re-consolidate in place on first open, guarded by a `state` key so the sweep runs exactly once. |
+| `relevant_lessons` ignored the `issue` column (written since v1, never read) | **Issue-aware recall**: lessons recorded on the same issue get +3 on the keyword-overlap score, so a retry/rework of issue N finds this agent's own history on N even when the wording shares no keywords. `node_plan` passes `issue_number`; old fakes without the kwarg fall back to the v2 call. |
+
+Operational notes:
+
+- The sync-trim hook runs outside the SQLite lock and swallows its own
+  failures — a chroma hiccup can delay ghost cleanup but never breaks the
+  finding insert that triggered the trim. Legacy rows written before v3 have
+  no `vector_doc_id`; their docs (if any) are cleaned lazily and are already
+  skipped at read time by the v2 ghost-check.
+- Digit-blind identity is deliberately coarse: "exit code 1" and "exit code 2"
+  are one lesson. For recurring-failure detection that is the point — the
+  number is the cycle's, the lesson is the swarm's.
 
 ### Limits
 

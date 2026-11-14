@@ -61,6 +61,7 @@ def build_ctx(settings: Settings, host: BrowserSessionHost, mem: SharedMemory):
         cycle=0,
         meta={"personal": FakePersonal()},
         heartbeat=lambda status="working": None,
+        report=lambda **k: None,   # node_start reports intent (P19+); display only
     )
 
 
@@ -75,7 +76,11 @@ async def main() -> None:
     mem = SharedMemory(scratch / "memory.db")
     host = BrowserSessionHost.from_settings(settings)
     ctx = build_ctx(settings, host, mem)
-    report = {"topic": settings.research_topic, "backend": "hyperbrowser"}
+    report: dict = {"topic": settings.research_topic, "backend": "hyperbrowser"}
+    out = scratch / "live_run_report.json"
+
+    def save() -> None:
+        out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
 
     t0 = time.monotonic()
     state = {}
@@ -83,13 +88,14 @@ async def main() -> None:
     state = nodes.node_start(ctx, state)
     print(f"[{time.monotonic() - t0:6.1f}s] node_research (topic: {settings.research_topic[:70]}…)")
     state = await nodes.node_research(ctx, state)
+    answer = state.get("papers", [{}])[0].get("answer", "")
     report["research"] = {
         "done": state.get("done"), "error": state.get("error", ""),
         "citations": state.get("citations", []),
-        "answer": answer,
+        "answer_chars": len(answer),
         "bibtex": state.get("bibtex", ""),
     }
-    answer = state.get("papers", [{}])[0].get("answer", "")
+    save()          # research evidence survives a later-phase timeout
     print(f"[{time.monotonic() - t0:6.1f}s] research done: "
           f"{report['research']['answer_chars']} chars, "
           f"{len(report['research']['citations'])} citations")
@@ -128,8 +134,7 @@ async def main() -> None:
         await client.close()
     mem.close()
 
-    out = Path("/home/z/my-project/download/hb_test/live_run_report.json")
-    out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    save()
     print(f"report saved: {out} | total wall time: {time.monotonic() - t0:.0f}s")
 
 

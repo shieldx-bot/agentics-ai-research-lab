@@ -33,6 +33,33 @@ class LLMError(RuntimeError):
     """Marker base for classifier-based checks (backends may reuse it)."""
 
 
+class LLMRefused(LLMError):
+    """The ask never reached the provider — a refusal, not a failure.
+
+    Three sources raise it today: the P20 budget gate is implicit (its
+    refusals never call ``ask``), the session host has no usable account
+    (empty pool / every account cooling down), and the Hyperbrowser
+    frontend circuit is open. The caller already knows the request was
+    never attempted, so the P20 fail-streak must NOT count it as a
+    provider failure — otherwise the breaker punishes the agent for the
+    breaker's own refusals and a dead window inflates into a dead hour
+    (live 2026-11-13: llm_usage rows 7-12 recorded 6 "failures" of 0.4ms
+    each while the frontend circuit was merely open)."""
+
+
+def is_llm_refusal(exc: BaseException) -> bool:
+    """True when the exception means 'the request never left the machine'.
+
+    Refusals (``LLMRefused``, an open Hyperbrowser frontend circuit) are
+    budget/telemetry events, NOT provider failures: they must not feed the
+    P20 fail-streak. The type-name check keeps this import-light — the
+    Hyperbrowser module is optional and errors.py must not import it at
+    module scope."""
+    if isinstance(exc, LLMRefused):
+        return True
+    return type(exc).__name__ == "HyperbrowserBackendUnavailable"
+
+
 def _hyperbrowser_error_types() -> tuple[type[BaseException], ...]:
     try:
         from agentics.llm.hyperbrowser_client import HyperbrowserError
@@ -63,3 +90,31 @@ def is_auth_failure(exc: BaseException) -> bool:
     if _HTTP_AUTH_STATUS.search(msg):
         return True
     return any(marker in msg for marker in AUTH_MARKERS)
+
+
+# Transport/session-level failure markers: the cloud browser, its session
+# slot, or the CDP link failed — these say NOTHING about the cookie, the
+# model, or the answer (matched lowercase against str(exc)).
+_INFRA_MARKERS: tuple[str, ...] = (
+    "target page, context or browser has been closed",   # playwright target-closed family
+    "maximum number of active sessions",                 # HB per-token cap while a stop propagates
+    "session not found",                                 # HB CDP endpoint 404 right after create
+    "connect_over_cdp",                                  # CDP websocket connect failures
+)
+
+
+def is_infra_failure(exc: BaseException) -> bool:
+    """True when the failure is session/transport-level rather than a
+    model/cookie failure.
+
+    The P20 fail-streak must not count these as provider failures: the free
+    plan's hard ~10-minute session cap once killed every session mid-ask,
+    and the rebuild burst's transient errors then read as five consecutive
+    "model failures" per agent — freezing the WHOLE swarm for the 900s
+    cooldown (live 2026-11-13 14:47-15:10) while sessions were actually
+    recovering on their own. A plain websocket read timeout is still a
+    provider failure: only the session-lifecycle classes are exempt."""
+    if type(exc).__name__ in ("TargetClosedError", "TargetClosed"):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _INFRA_MARKERS)

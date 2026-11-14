@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agentics.config import Settings
+from agentics.llm.errors import is_auth_failure
 from agentics.llm.perplexity_client import CookieAccount, LLMResponse, PerplexityClient
 from agentics.llm.qwen_client import QwenClient
 from agentics.llm.session_host import PURPOSE_PROVIDER, BrowserSessionHost
@@ -29,6 +30,11 @@ def _settings(tmp_path: Path) -> Settings:
     }))
     s = Settings()
     s.accounts_dir = acc
+    # Unit tests must not depend on the machine's runtime backend choice:
+    # .env / lab.yaml may say "hyperbrowser" (datacenter deployments), which
+    # makes _lease() wrap accounts in HyperbrowserClient instead of
+    # PerplexityClient. Pin the raw-socket backend these tests assert on.
+    s.browser_backend = "local"
     return s                                  # default: perplexity-only mode
 
 
@@ -139,6 +145,54 @@ def test_lease_none_when_both_pools_empty(tmp_path):
     assert host._lease("research") == (None, None)
     with pytest.raises(RuntimeError, match="no usable browser-session account"):
         asyncio.run(host.ask("x", purpose="research"))
+
+
+def test_empty_pool_ask_raises_llm_refused(tmp_path):
+    """An empty pool raises LLMRefused (a RuntimeError subclass, so legacy
+    catch-sites keep working) — the P20 fail-streak must be able to tell
+    'never reached the provider' apart from a real provider failure."""
+    from agentics.llm.errors import LLMRefused, is_llm_refusal
+
+    s = _hybrid_settings(tmp_path)
+    for f in s.accounts_dir.glob("*.json"):
+        f.unlink()
+    host = BrowserSessionHost.from_settings(s)
+    with pytest.raises(LLMRefused, match="no usable browser-session account"):
+        asyncio.run(host.ask("x", purpose="research"))
+    try:
+        asyncio.run(host.ask("x", purpose="research"))
+    except Exception as exc:  # noqa: BLE001 — classify exactly what escaped
+        assert is_llm_refusal(exc) is True
+        assert is_auth_failure(exc) is False
+    else:  # pragma: no cover
+        pytest.fail("expected LLMRefused")
+
+
+def test_views_share_the_client_cache_and_close_all_reaches_them(tmp_path):
+    """Live 2026-11-13 shutdown leak: agents run on view()s whose client
+    cache was per-view, so the root host's close_all() closed nothing and
+    every CLI run left its cloud session running (next run then hit the
+    1-session cap). Views must share the cache with the root host."""
+    host = BrowserSessionHost.from_settings(_hybrid_settings(tmp_path))
+    v0 = host.view(prefer_index=0)
+    v1 = host.view(prefer_index=1)
+    assert v0._clients is host._clients
+    assert v1._clients is host._clients
+
+    closed: list[str] = []
+
+    class FakeClient:
+        def __init__(self, name):
+            self.name = name
+
+        async def close(self):
+            closed.append(self.name)
+
+    host._clients[("perplexity", "account-01")] = FakeClient("c1")
+    host._clients[("perplexity", "account-02")] = FakeClient("c2")
+    asyncio.run(host.close_all())
+    assert sorted(closed) == ["c1", "c2"]
+    assert host._clients == {}               # cache cleared after teardown
 
 
 # ------------------------------------------------------------- ask dispatch

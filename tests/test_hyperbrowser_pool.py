@@ -285,3 +285,63 @@ def test_teardown_releases_only_its_own_key_slot(monkeypatch):
         assert hb_mod._ACTIVE_BY_KEY.get("tk_a") is c
         runner.run(c.close())
     assert "tk_a" not in hb_mod._ACTIVE_BY_KEY
+
+
+# ---------------------------------------------------------- dead-session rebuild
+def test_ask_rebuilds_session_once_after_cdp_death(monkeypatch):
+    """A dead CDP link (session duration cap, network blip) still LOOKS alive
+    on our side; ask() must rebuild the cloud session once and succeed —
+    otherwise every later node of the cycle fails against the stale handle."""
+    created = _fake_sdk(monkeypatch)
+    c = _client("tk_retry")
+    gotos = {"n": 0}
+
+    async def dead_then_alive():
+        gotos["n"] += 1
+        if gotos["n"] == 1:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    async def ok_submit(q):
+        pass
+
+    async def ok_collect():
+        return ("recovered answer", ["https://arxiv.org/abs/2401.11111"])
+
+    c._goto_home = dead_then_alive
+    c._submit = ok_submit
+    c._collect_answer = ok_collect
+
+    with asyncio.Runner() as runner:
+        resp = runner.run(c.ask("survey"))
+    assert resp.ok and resp.answer == "recovered answer"
+    assert len(created) == 2          # session rebuilt exactly once
+    assert gotos["n"] == 2
+
+
+def test_ask_does_not_rebuild_for_ui_outages(monkeypatch):
+    """A UI outage (no answer text) is not a dead session: no second create,
+    the error surfaces to the session-host failover unchanged."""
+    created = _fake_sdk(monkeypatch)
+    c = _client("tk_ui")
+
+    async def ok_goto():
+        pass
+
+    async def ok_submit(q):
+        pass
+
+    async def empty_collect():
+        return ("", [])
+
+    c._goto_home = ok_goto
+    c._submit = ok_submit
+    c._collect_answer = empty_collect
+
+    with asyncio.Runner() as runner:
+        caught = None
+        try:
+            runner.run(c.ask("survey"))
+        except Exception as exc:  # noqa: BLE001
+            caught = exc
+    assert caught is not None and "no answer text" in str(caught)
+    assert len(created) == 1

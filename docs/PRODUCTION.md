@@ -18,6 +18,8 @@ agent chạy không giám sát dài ngày.
 | `INTEGRITY_INTERVAL_S` | `20` | P10 tầng 4b: chu kỳ watcher (0 = tắt) |
 | `PEER_PANEL_SIZE` | `2` | P18: số reviewer đồng thuận trước khi MR qua |
 | `PEER_DEFENSE_TTL_MINUTES` | `30` | P18: hạn tác giả bảo vệ MR bị phản đối |
+| `REPLAY_SWEEP_SIZE` | `2` | P23: số claim supervisor sweep chạy lại mỗi lần quét (0 = tắt) |
+| `REPLICATION_LIMIT` | `1` | P24bis: số claim reviewer lặp lại độc lập mỗi chu kỳ (0 = tắt) |
 
 Khuyến nghị production: giữ mặc định; hạ `LLM_MAX_CALLS_PER_HOUR` nếu pool
 cookie nhỏ; bật retention (mặc định đã bật).
@@ -55,6 +57,27 @@ cookie nhỏ; bật retention (mặc định đã bật).
 4. **Lý lịch MR**: merge/reject/exempt/reverdict đều có dòng audit bất biến
    — đối chiếu sau sự cố không phụ thuộc journal đã trim (P21).
 
+## 4b. Backup — một lệnh, chạy khi lab vẫn đang sống
+
+```bash
+python scripts/backup_lab.py --dest backups --keep 7        # cron / systemd timer
+```
+
+Snapshot CÙNG LÚC: `shared_memory.db` (SQLite **online backup** — nhất quán
+kể cả khi các thread agent đang ghi) + `lab.git` (bundle, khôi phục bằng
+`git clone backups/backup-<ts>/lab.git.bundle`). `manifest.json` ghi kích
+thước + sha256 + số dòng audit/evidence/task/hypothesis — kiểm tra tính
+đầy đủ **không cần mở** backup. Backup không có bare repo (lab chưa chạy)
+vẫn snapshot DB và khai thật trong manifest; chỉ DB snapshot thất bại mới
+trả exit code 1.
+
+## 4c. Health probe — cho uptime monitor / systemd / k8s
+
+`GET /health` trên dashboard: `status`, `db`, `active_agents`,
+`last_heartbeat_age_s`, `last_event_age_s`. Rẻ (2 truy vấn COUNT), probe
+thường xuyên an toàn; DB đọc không được → **503 degraded** với lỗi, không
+bao giờ giả 200.
+
 ## 5. Checklist trước khi go-live
 
 - [ ] `python -m pytest -q` — full suite xanh trên máy đích.
@@ -66,5 +89,7 @@ cookie nhỏ; bật retention (mặc định đã bật).
       cookie thật (người dùng thử đã nói quota hữu hạn).
 - [ ] Chạy `scripts/local_mode_demo.py` trong sandbox riêng để thấy trọn
       vòng claim → verify → panel → merge trước khi chạy thật.
-- [ ] Đặt lịch sao lưu `data/` (SQLite + bare repo) — audit trail là thứ
-      KHÔNG thể tạo lại từ anywhere.
+- [ ] Đặt cron/systemd timer cho `scripts/backup_lab.py` (mỗi giờ là hợp lý)
+      — audit trail là thứ KHÔNG thể tạo lại từ anywhere.
+- [ ] Trỏ uptime monitor vào `http://<host>:<port>/health` (page khi
+      `status != ok` hoặc `last_heartbeat_age_s` vượt ngưỡng).

@@ -85,6 +85,10 @@ class Orchestrator:
         issue_ops.set_scan_cache_ttl(getattr(self.settings, "gh_scan_cache_ttl", 60))
         self.memory = SharedMemory(self.settings.db_path)
         self.vector = VectorStore(self.settings.chroma_path)
+        # v3 sync-trim: when the findings table evicts its oldest rows, the
+        # matching ChromaDB docs die with them — the vector tier stays the
+        # same size as the SQLite tier instead of accumulating ghosts.
+        self.memory.set_vector_trim_hook(self.vector.delete_many)
         self.host = BrowserSessionHost.from_settings(self.settings)
         self.local = LocalOps(self.memory, self.settings)
         self.local.setup()          # seed data/lab.git + the starter backlog
@@ -106,7 +110,22 @@ class Orchestrator:
 
             guard = IntegrityGuard(PROJECT_ROOT, self.settings.integrity_path)
             existed, drift = guard.ensure_baseline()
-            if drift:
+            reanchor = getattr(guard, "last_reanchor", None)
+            if reanchor:
+                # The tree changed BECAUSE the git HEAD moved (owner pulled a
+                # new commit, or the guarded merge queue advanced main) — the
+                # baseline is stale by definition, not tampered with. Re-
+                # anchor to the new HEAD and say so; only drift WITHOUT a
+                # HEAD move stays an owner-visible alert.
+                msg = ("integrity baseline re-anchored to %s (%d file(s) "
+                       "changed with the new HEAD)" % (
+                           reanchor["to"][:12], reanchor["changed"]))
+                self.memory.journal("orchestrator", "integrity_reanchored",
+                                    {"from": reanchor["from"][:12],
+                                     "to": reanchor["to"][:12],
+                                     "changed": reanchor["changed"]})
+                log.info(msg)
+            elif drift:
                 msg = (
                     "Runtime integrity drift: %d file(s) differ from the baseline "
                     "- run `agentics verify` (owner decision)" % len(drift)
@@ -165,6 +184,12 @@ class Orchestrator:
                     fail_streak_limit=self.settings.llm_fail_streak_limit,
                     cooldown_s=self.settings.llm_breaker_cooldown_s,
                     agent_id=agent_id,
+                    reserve_pct=float(getattr(self.settings,
+                                              "budget_reserve_pct", 0.0) or 0.0),
+                    reserve_purposes=tuple(
+                        p.strip() for p in str(getattr(
+                            self.settings, "budget_reserve_purposes",
+                            "") or "").split(",") if p.strip()),
                 ),
                 panel=PeerPanel(
                     self.memory,
@@ -220,6 +245,30 @@ class Orchestrator:
                     await asyncio.sleep(min(1.0, delay - waited))
                     waited += 1.0
             while not should_stop():
+                # P20 — when the circuit breaker is open the cycle would
+                # degrade at the first ask anyway (every node's budget gate
+                # refuses); sleeping through the cooldown keeps the journal
+                # quiet and the provider resting instead of burning ~12
+                # dead cycles per 15-minute window. STOP stays responsive
+                # (1s chunks) and the lease heartbeat task keeps beating.
+                budget = getattr(ctx, "budget", None)
+                if budget is not None:
+                    remaining = budget.breaker_remaining_s(ctx.agent_id)
+                    if remaining > 0:
+                        log.warning(
+                            "[%s] LLM circuit open — sleeping %.0fs "
+                            "instead of burning a dead cycle",
+                            tag, remaining)
+                        try:
+                            ctx.memory.journal(ctx.agent_id, "breaker_wait",
+                                               {"wait_s": round(remaining)})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        waited = 0.0
+                        while waited < remaining and not should_stop():
+                            await asyncio.sleep(1)
+                            waited += 1.0
+                        continue
                 try:
                     ctx.heartbeat("cycle-start")
                     await run_cycle(ctx)

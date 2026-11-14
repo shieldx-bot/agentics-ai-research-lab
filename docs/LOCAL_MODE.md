@@ -161,11 +161,101 @@ python -m agentics.cli task "Improve the benchmark runner" \
 python -m agentics.cli status            # CLI snapshot
 python -m agentics.cli verify            # runtime-tree integrity check
 python -m agentics.cli stop              # graceful stop (STOP file)
+python -m agentics.cli reset-memory --dry-run   # preview a topic reset
 ```
 
 Merge behaviour: with `AUTO_MERGE` on (default) the Integrator merges
 approved MRs serially after tier-2 passes; with `AUTO_MERGE` off the queue
 only records readiness and the owner merges by hand.
+
+Single-token labs: the swarm is sized by the Hyperbrowser token pool, so
+`HB_API_KEY` (one token) means ONE agent. `assign_roles` gives a lone agent
+the **researcher** role — a lone supervisor would only scan the backlog and
+never call the LLM (live 2026-11-13) — and pins supervisor+researcher for
+two agents. Pin explicit roles in `configs/lab.yaml` `role_map` only when
+your token pool matches that exact size. When the configured research topic
+is already covered (P7: >= 3 vector hits), the researcher rotates through
+fresh angles (benchmarks, open problems, deployments, recent advances) and
+journals `research_topic_rotated` — an angle whose label already appears in
+a stored finding title counts as spent, so the lab keeps producing new
+findings instead of printing "skipping" forever.
+
+### 4b. Switching research topic — `agentics reset-memory`
+
+Every memory surface is topic-bound, so a new topic needs a clean slate —
+old findings would be recalled into the new research, old lessons would
+steer new plans, old workspaces and origin branches would shadow fresh
+clones. `agentics reset-memory` (added after `repair`) wipes exactly that
+set and nothing else:
+
+- **wiped** — `data/shared_memory.db` (+`-wal`/`-shm`: tasks, findings,
+  panels, journal, cached role prompts), `data/chroma` (vector recall),
+  `data/personal/` (per-agent lessons), `data/workspaces/` (old checkouts),
+  `data/lab.git` (old-topic branches/MRs — re-seeded from the checkout at
+  the next boot by `LocalRepo.ensure`);
+- **kept** — lab code, the integrity baseline (`data/integrity`),
+  `accounts/`, `configs/`, `.env`, `logs/`.
+
+Flags: `--dry-run` (list what would go, delete nothing), `--yes` (skip the
+confirm prompt), `--keep-repo` (preserve `data/lab.git`), `--force`
+(override the running-agent guard). The guard refuses to run while any
+agent heartbeat is fresher than 120 s and not marked `stopped` — a reset
+under a live swarm would corrupt sessions; stop the lab first
+(`agentics stop`). After the reset, change `research_topic`
+(`configs/lab.yaml` wins over `RESEARCH_TOPIC` in `.env`) and start the lab
+again — schema, bare origin and vector store are rebuilt empty.
+
+### 4c. Grading the swarm itself — `agentics swarm-eval`
+
+Output quality alone cannot judge a multi-agent lab: one lucky answer can
+come from premature convergence or a single agent carrying the rest
+(swarm-intelligence evaluation literature calls for trajectory,
+collaboration and hierarchy metrics, not just per-answer scores).
+`agentics swarm-eval` (`agentics/swarm_eval.py`) grades the lab AS A SWARM
+from its own immutable traces — no LLM, read-only — in five groups:
+
+1. **Coordination & task** — merge rate (judged traces), share of decided
+   panels that had >= 2 distinct reviewers (cross-agent verification),
+   citation-domain coverage of findings, share of active agents that ever
+   produced a terminal outcome, task close rate over the backlog
+   (closed+merged+failed / all tasks), workload balance (1 − share of the
+   busiest agent's journal events — 100% would mean a perfectly even load);
+2. **Convergence & dynamics** — panel approval rate (converged to correct),
+   mean vote rounds and mean cycle to a verdict, defense save rate,
+   hypothesis resolution rate (supported+refuted / all registered, P24);
+3. **Trajectory & handoff** — productive-vs-looping cycle ratio
+   (`cycle_done` outcomes vs `no_change`), node events per cycle
+   (trajectory length), mean cycle wall-clock duration (per-agent
+   `cycle_done` deltas, gaps > 1h excluded), claim stability
+   (`claim_reconfirmed` / claims — renewals in good order), lock friction,
+   cycle-error share;
+4. **Resilience & scale** — LLM ok-rate, budget-breaker trips, error
+   recovery (a `cycle error` followed by that agent's next `cycle_done`),
+   plan-retry/rework recovery, evidence pass rate (confirmed evidence /
+   all evidence runs), role-prompt learning success (P11: mission bumps
+   that stayed active / all bumps), replication counts, and the scalability
+   elasticity **S = %ΔP / %ΔN** across persisted snapshots at different
+   swarm sizes (S > 1 → superlinear);
+5. **Governance & cost** — quality gap (distinct objectors on rejected vs
+   approved panels), peer-substantiated incoherence rate (objection stood
+   after defense / author conceded), LLM purpose spread and top-purpose
+   concentration (is one role dominating the ledger?), LLM calls +
+   wall-clock seconds per merged MR (cookie providers expose no token
+   counts — the ledger's honest units).
+
+Metrics pruned as INCOMPATIBLE with this codebase (the machinery does not
+exist, so they could only ever fabricate noise): potential-field
+cohesion/repulsion, context-survival-at-handoff (handoff payloads are not
+journaled), per-tool path/detour efficiency (no per-tool-call telemetry),
+classifier-based toxicity, token-denominated cost, and handoff churn
+(release/claim — a tautology here, since a release is only ever logged
+after its own claim; replaced by claim stability + cycle duration).
+
+Flags: `--days N` (window), `--json` (full machine-readable report),
+`--no-save` (don't persist). Every real evaluation appends one row to
+`swarm_eval_snapshots` — the history that makes S and trend reading
+possible. Missing data renders as an honest `n/a`, never a fabricated
+number. Tests: `tests/test_swarm_eval.py`.
 
 ---
 
@@ -186,6 +276,13 @@ only records readiness and the owner merges by hand.
 - `tests/test_scan_cache_stability.py` — legacy `github_ops` scan cache keyed
   on stable identity only (CPython `id()` reuse could resurrect a stale list).
 - `tests/test_journal_cap.py` — journal trim keeps the feed bounded.
+- `tests/test_reset_memory.py` — topic reset: dry-run deletes nothing,
+  running-agent guard, complete wipe (DB/WAL/chroma/personal/workspaces/
+  origin), `--keep-repo`, cold lab, CLI paths.
+- `tests/test_swarm_eval.py` — the five swarm-metric groups over a seeded
+  history (panels with defense, findings, LLM ledger, error recovery),
+  scalability elasticity S across snapshots, honest `None` on empty data,
+  CLI rendering + snapshot persistence.
 
 ---
 
@@ -324,3 +421,62 @@ LLM itself, with code owning only the safety rails.
   (JSON of the model's own fields, shown to the owner) — instead of dropping
   them by a rigid schema. A plan without `verify_cmds`/`hypotheses` behaves
   exactly like the pre-adaptive plans (backward compatible).
+
+### Plan-conditioned downstream prompts (no fixed recipe left)
+
+- The per-file implement ask (`node_implement`, `_implement_brief`) is no
+  longer a minimal fixed template: it carries the planner's OWN proposal —
+  the declared `approach`, the P16 `verify_cmds` that will judge the code
+  and the pre-registered hypotheses — so the implementer writes code that
+  satisfies the checks it itself declared. Bounded (approach 700 chars,
+  5 cmds, 2 hypotheses); a minimal/legacy plan reproduces the old prompt
+  byte for byte. Zero extra LLM calls.
+- The research query (`node_research`) now carries the issue's own problem
+  statement (a bounded 400-char body excerpt) instead of only the title +
+  a fixed recipe. Dedup still keys on the title-based topic, so the P7
+  skip guard is untouched.
+- Both paths are covered offline in `tests/test_plan_conditioned_prompts.py`
+  (brief content, runaway caps, legacy-plan backward compat, body excerpt
+  bound).
+
+## 9. Swarm evaluation — reading the lab AS a swarm (`agentics swarm-eval`)
+
+The lab grades ITSELF as a multi-agent system, offline and read-only, from
+its own traces (journal, tasks, MRs, P19 panels, LLM ledger):
+`python -m agentics.cli swarm-eval`. Five metric groups — coordination &
+task, convergence & dynamics, trajectory & handoff, resilience & scale
+(elasticity S across snapshots), governance & cost — are documented in
+`agentics/swarm_eval.py`. Each run persists a snapshot
+(`swarm_eval_snapshots`); S becomes computable once two snapshots exist at
+different swarm sizes.
+
+### Percent view (quick read)
+
+`python -m agentics.cli swarm-eval --percent` renders ONE unified table
+where every metric is normalised to a percentage:
+
+- a rate maps directly (0.62 -> 62%);
+- a count maps to its share of the natural total (e.g. reject reasons over
+  decided panels, replication verdicts over all replication tasks);
+- the elasticity S maps so 100% == linear scaling;
+- mean panel rounds map against the P19 cap (2 rounds);
+- a metric with no honest denominator keeps `—` — never faked.
+Cells are colour-coded green/yellow/red per metric's healthy direction.
+`--json --percent` embeds the same rows as `percent_rows` for scripting.
+
+### Operational findings from the first live evaluations (2026-11-13)
+
+- **Leaked Hyperbrowser sessions throttle the swarm.** A killed run leaves
+  its cloud session active until the idle timeout; the free plan allows one
+  concurrent session per token, so leftover sessions 429-block half the
+  swarm (LLM ok-rate fell to 27% until `scripts/hb_session_cleanup.py`
+  stopped 10 orphans; after the sweep a full run held **100% ok-rate over
+  24 calls**). Sweep before every evaluation run.
+- **The P7 coverage gate saturates ALL roles.** Once >= 3 findings cover
+  the topic, every agent's cycle short-circuits with "topic already
+  covered" — including coders/writers, so the MR -> panel -> merge pipeline
+  never engages and productive-cycle share collapses (~1-6%). The metrics
+  expose exactly this premature-convergence signature; a future fix may let
+  code/docs tasks bypass the research dedup gate.
+- Reset topic memory (`agentics reset-memory`) to give the swarm a fresh
+  trajectory before re-evaluating a run.

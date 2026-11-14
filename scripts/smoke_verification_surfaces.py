@@ -17,6 +17,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from agentics.config import Settings
 from agentics.dashboard.app import create_app
 from agentics.memory.shared_memory import SharedMemory
 
@@ -39,13 +40,9 @@ def main() -> None:
     mem.update_hypothesis(sup, "supported", evidence_id=ev1, note="measured 0.9")
     mem.update_hypothesis(ref, "refuted", note="measured precision=0.4")
 
-    # The REAL Settings class — the dashboard state now carries the P18 LLM
-    # budget dial (llm_max_calls_per_hour) and the P20 audit counters, so a
-    # hand-rolled fake settings namespace 500s the endpoint and the smoke
-    # reads {"error": ...} instead of the state payload.
-    from agentics.config import Settings
-
-    app = create_app(mem, Settings(data_dir=root / "data", research_topic="NFV"))
+    # a REAL Settings (P20's budget dial reads llm_max_calls_per_hour etc.)
+    settings = Settings(data_dir=root / "data")
+    app = create_app(mem, settings)
     client = _client(app)
     state = client.get("/api/state").json()
     hyp = state["hypotheses"]

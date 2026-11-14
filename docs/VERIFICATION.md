@@ -14,7 +14,10 @@
 > `AGENTICS_RESULT: {"metric": <number>}`; the verdict is a machine
 > comparison of measured vs criterion — never an LLM's self-assessment.
 > Protocols run twice; non-reproducible or unparsable output is
-> `inconclusive` and can never pose as success.
+> `inconclusive` and can never pose as success. And the verdict does not
+> rest on one agent's word: ANOTHER agent independently re-runs the stored
+> protocol in its own workspace (P24/P24bis replication) before the claim
+> is marked `replicated`.
 >
 > **H3 — Can an agent share its verification results with every AI?**
 > Yes — verdicts land in the shared `evidence` + `hypotheses` tables,
@@ -22,6 +25,9 @@
 > dashboard, queryable via `agentics evidence` / `agentics hypotheses`, and
 > injected into EVERY agent's prompt as settled knowledge (supported facts
 > become reusable common ground; refuted claims stop being repeated).
+> Sharing is also enforced: the replication ledger tracks WHO re-ran WHAT,
+> so the swarm never pays for the same experiment twice — and a refuted
+> replication self-corrects the shared knowledge everywhere.
 
 The stack grew from several parallel contributors on this branch; this
 document describes how the pieces compose today.
@@ -203,3 +209,126 @@ Pinned by `tests/test_peer_review.py`, `tests/test_peer_review_memory.py`,
 the defense paths in `tests/test_nodes_integration.py` /
 `tests/test_layer4_guard.py` / `tests/test_experiment_runner.py`, and the
 owner surfaces in `tests/test_dashboard_api.py`.
+
+## 12. P23 replay — replication runs inside the live cycle (H2 + H3 closed)
+
+A settled verdict is a measurement, and measurements go stale: dependencies
+move, protocols drift, an early run may simply have been wrong. The replay
+engine (`agentics/verify/replay.py`) re-runs a SETTLED claim from its stored
+protocol source (registered with `protocol_code` since the P23 precondition
+commit) and re-settles it from fresh measurements:
+
+| outcome | event | effect |
+| --- | --- | --- |
+| same verdict | `claim_reconfirmed` | the claim survives scrutiny, `attempts` grows |
+| supported → refuted | `claim_falsified` | verified_knowledge corrected automatically |
+| refuted → supported | `claim_overturned` | the original refutation was wrong |
+| settled → inconclusive | `claim_unstable` | the protocol no longer runs deterministically |
+
+Every replay lands in the SAME shared evidence table (`method="replay"`)
+with the measured metrics attached, so the whole swarm sees replication
+results — H3 at its strongest: verdicts are shared WITH their reproducible
+artifacts, and a second agent can re-check the first agent's word.
+
+**Live wiring (this commit):**
+
+* the supervisor's `node_scan` runs a bounded sweep on schedule —
+  `REPLAY_SWEEP_SIZE` claims (default 2, `0` disables) every
+  `REPLAY_EVERY_N_CYCLES` cycles (default 3) — following the exact
+  P13/P19/P22 maintenance-sweep pattern: replication must never break the
+  scan, and the scan summary line carries the drift events to the dashboard;
+* the owner can run the sweep on demand: `agentics replay [--limit N]`
+  or a single claim with `agentics replay --id X`;
+* contradictions between same-criterion hypotheses stay owner-visible via
+  the `claim_contradiction` journal alert (P23 memory layer).
+
+Pinned by `tests/test_replay.py` (engine), `tests/test_protocol_code.py`
+(storage precondition) and `tests/test_replay_wiring.py` (live-cycle wiring:
+on-schedule sweep, off-schedule skip, zero-off, drift falsification
+correcting verified_knowledge, and a broken protocol never breaking the scan).
+
+## 8. Re-verification (P23): settled claims must survive being re-run
+
+A ledger nobody re-checks is a diary. The replay layer lets the owner (or a
+supervisor sweep) re-run SETTLED claims from the protocol source stored with
+the hypothesis (`hypotheses.protocol_code`), in a fresh `owner-replay`
+workspace — so replication survives P21 workspace pruning:
+
+```bash
+python -m agentics.cli verify-all            # replicate newest settled claims
+```
+
+Each replay records fresh evidence (method='replay'), bumps the claim's
+`attempts`, and re-settles the hypothesis:
+
+| replay outcome | journal event | effect |
+| --- | --- | --- |
+| same verdict | `claim_reconfirmed` | attempts++ — the claim has survived N scrutinies |
+| supported → refuted | `claim_falsified` | drift: `verified_knowledge` is corrected automatically |
+| refuted → supported | `claim_overturned` | the original refutation was wrong (or the code improved) |
+| now inconclusive | `claim_unstable` | protocol no longer runs deterministically — reviewer decides |
+
+**Contradiction alerts:** when ANOTHER hypothesis with the SAME criterion
+settles to the OPPOSITE verdict, `update_hypothesis` journals
+`claim_contradiction` — the swarm disagreed with itself on a measurable fact
+and the owner/panel arbitrates. A replay flipping its own row is drift, not
+disagreement, and does not alert.
+
+Tests: `tests/test_protocol_code.py`, `tests/test_replay.py` (including a
+real bare-origin/clone integration run — the exact `verify-all` sequence).
+
+## 13. P24/P24bis — INDEPENDENT replication by another agent (H2 closed twice)
+
+The P23 sweep re-checks claims over TIME from one workspace — a claim's
+verdict still rests on a single agent's word on day one. Independent
+replication is the other half: a DIFFERENT agent re-runs the claim in its
+OWN workspace, and only then does `verified_knowledge` flag it `replicated`.
+
+Two pieces, one rulebook:
+
+* **P24 ledger** (`SharedMemory`): `hypotheses.replication` +
+  `replication_attempts` — the canonical once-per-swarm bookkeeping.
+  `hypotheses_needing_replication(agent)` offers each agent the OLDEST
+  settled `supported` claim it did NOT author (author exclusion, retry
+  budget: an `inconclusive` replication is retried by a DIFFERENT peer up
+  to 2 attempts, then left alone).
+* **P24bis engine** (`agentics/verify/replication.py`):
+  `replicate_candidate` rebuilds the stored protocol in the peer's
+  workspace, runs the full two-run reproducibility gate, writes the
+  provenance ledger (`record_replication_detail`: who, measured metrics,
+  per-run detail) and the peer's own evidence row
+  (`method='replication'`), then applies the P17 asymmetry:
+
+| replication outcome | journal event | effect |
+| --- | --- | --- |
+| confirms | `replication_confirmed` | claim annotated `replicated` — author-confirmed becomes independently replicated |
+| refutes | `replication_refuted` | ledger closed: the author's evidence row is re-verdicted, the claim downgraded — `verified_knowledge` stops serving a dead claim |
+| inconclusive | `replication_inconclusive` | annotates only, NEVER refutes; another peer may retry within the budget |
+
+The live wiring is `node_verify` (`agentics/graph/nodes.py`): BEFORE any
+fresh-finding verification — and needing neither a finding nor an LLM —
+every researcher cycle feeds the P24 selector into the engine
+(`_replicate_settled`, up to 2 claims per cycle). A researcher with nothing
+new to verify still advances the swarm's trust in what it already knows.
+Self-replication is refused at BOTH layers (selector + engine).
+
+Composition with dedup (section 9): an agent that meets an already-settled
+claim replicates it once AND reuses the settled verdict — efficiency and
+trust do not compete.
+
+Consumption + routing (P24bis surfaces): `verified_knowledge()` carries a
+`replicated` flag — every agent's prompt annotates independently replicated
+claims as `SUPPORTED+ (independently replicated)`, the strongest kind of
+common ground; the dashboard has a Vietnamese "Lặp lại độc lập" panel
+(counts from the canonical ledger + provenance rows). Reviewers also carry
+a dedicated route (`node_replicate`, knob `REPLICATION_LIMIT`, default 1
+per reviewer cycle, 0 = off): pending replication outranks ordinary review
+(but never the P19 defense), so the trust work happens even when no new
+finding needs verifying.
+
+Tests: `tests/test_replication_ledger.py` (selection + bookkeeping),
+`tests/test_replication_memory.py`, `tests/test_replication_engine.py`,
+`tests/test_replication.py` (live node wiring, zero-LLM path),
+`tests/test_node_replicate.py` (reviewer route + routing table),
+`tests/test_replication_surfaces.py` (prompt + dashboard), plus the
+dedup composition pinned in `tests/test_hypothesis_dedup.py`.

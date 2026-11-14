@@ -71,3 +71,31 @@ class VectorStore:
                 entry["distance"] = dists[i]
             out.append(entry)
         return out
+
+    # v3 sync-trim: the findings table self-trims to its newest rows, and the
+    # vector tier must follow — otherwise the index fills with docs whose
+    # SQLite row is gone (ghosts). Recall skips ghosts at read time, but they
+    # still eat the n_results budget and the index grows forever.
+    def delete_many(self, doc_ids: list[str]) -> int:
+        """Delete vector documents by id. Returns how many ids were accepted
+        (0 when the store is offline or the list is empty)."""
+        ids = [d for d in (doc_ids or []) if d]
+        if not self._ok or not ids:
+            return 0
+        try:
+            self._col.delete(ids=ids)
+            return len(ids)
+        except Exception as exc:  # noqa: BLE001
+            log.error("vector delete failed (%d ids): %s", len(ids), exc)
+            return 0
+
+    def count(self) -> int:
+        """Documents currently indexed — the `memory-stats` observability of
+        the sync-trim (findings rows and vector docs should track together)."""
+        if not self._ok:
+            return 0
+        try:
+            return int(self._col.count())
+        except Exception as exc:  # noqa: BLE001
+            log.error("vector count failed: %s", exc)
+            return 0

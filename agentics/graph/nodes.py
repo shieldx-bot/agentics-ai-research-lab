@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
 import sys
 import time
@@ -19,6 +20,9 @@ from pathlib import Path
 from agentics.agents.base import AgentContext
 from agentics.agents.roles import Role, parse_json_block
 from agentics.config import DEFAULT_BACKLOG_WATERMARK
+from agentics.coordination.allocation import award_digest, recommend_awards
+from agentics.coordination.dossier import review_dossier
+from agentics.coordination.lessons import swarm_lessons
 from agentics.evolution.scoring import IssueInfo, build_profile, categorize_issue, rank_issues
 from agentics.evolution.traces import (
     EVOLUTION_ALLOWED_PATHS,
@@ -36,16 +40,22 @@ from agentics.peer_review import (
 from agentics.planning import (
     PLAN_INSTRUCTION,
     bump_prompt_feedback,
+    extras_state_json,
     normalize_plan,
+    plan_state_json,
     resolve_system_prompt,
 )
 from agentics.policies.guard import is_credential_path
 from agentics.memory import lifemem
 from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
+from agentics.research import diversity as research_diversity
 from agentics.research import free_tools
+from agentics.research import ideation as idea
 from agentics.research import papers as papers_mod
+from agentics.evolution.skills import skills_block          # wave-2 #1
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
+from agentics import diversity as qd
 from agentics.verify_ops import (
     Evidence, cmds_from_evidence, run_experiment, run_experiments, summarize,
     verdict_for,
@@ -71,18 +81,23 @@ def _panel_engine(ctx: AgentContext) -> PeerPanel:
 
 
 # ---------------------------------------------------------------- helpers
-def _lessons_text(ctx: AgentContext, query: str = "", limit: int = 5) -> str:
+def _lessons_text(ctx: AgentContext, query: str = "", limit: int = 5,
+                  issue: int | None = None) -> str:
     """The agent's OWN lessons from past cycles — the personal memory was
     write-only until now; this closes the loop so an agent stops repeating
     its own failures. With a ``query`` the lessons are ranked by relevance
-    to the current task; without one, by recency. Defensive: contexts (or
-    test doubles) without the recall methods degrade to "" — never a crash."""
+    to the current task (plus a same-issue boost, v3); without one, by
+    recency. Defensive: contexts (or test doubles) without the recall
+    methods degrade to "" — never a crash."""
     personal = (getattr(ctx, "meta", None) or {}).get("personal")
     if personal is None:
         return ""
     try:
         if query and hasattr(personal, "relevant_lessons"):
-            lessons = personal.relevant_lessons(query, limit)
+            try:      # v3 signature (query, limit, issue); v2 fakes lack `issue`
+                lessons = personal.relevant_lessons(query, limit, issue=issue)
+            except TypeError:
+                lessons = personal.relevant_lessons(query, limit)
         elif hasattr(personal, "recent_lessons"):
             lessons = personal.recent_lessons(limit)
         else:
@@ -144,7 +159,45 @@ def _memory_context(ctx: AgentContext) -> dict:
         # supported claims are reusable common ground, refuted ones are dead
         # ends (rendered by verified_knowledge_text, below).
         "verified": verified_knowledge_text(ctx) or "(nothing verified yet)",
+        # Kosmos world model: the swarm's structured current state (newest
+        # findings, verified/refuted facts, open gaps) for coherent long runs.
+        "world": _world_model_text(ctx) or "(world model empty)",
     }
+
+
+def _world_model_text(ctx: AgentContext) -> str:
+    """Kosmos world model, consumption side — the swarm's structured state
+    (newest findings, verified/refuted facts, open gaps) as bounded prompt
+    text. Empty when the model has no notes yet (cold start unchanged)."""
+    try:
+        n = int(getattr(ctx.settings, "world_context_notes", 12) or 12)
+        return ctx.memory.world_render(limit=n)
+    except Exception:  # noqa: BLE001 — world model must never break a cycle
+        return ""
+
+
+def _pem_gate(ctx: AgentContext, claim: str, exclude_id: int | None = None) -> bool:
+    """DAPS Persistent-Edit-Memory gate: reject a NEW hypothesis that is a
+    near-clone of one already in the stream (word-Jaccard over non-stopword
+    tokens, signature axes included). Returns True when acceptable."""
+    threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+    try:
+        priors = ctx.memory.recent_hypotheses(limit=12)
+    except Exception:  # noqa: BLE001 — a broken gate must not block research
+        return True
+    dup = qd.near_duplicate(claim, priors, threshold,
+                            exclude_ids={exclude_id} if exclude_id else None)
+    if dup is None:
+        return True
+    score, prior = dup
+    try:
+        ctx.memory.journal(ctx.agent_id, "hypothesis_near_duplicate", {
+            "claim": claim[:160], "duplicate_of": prior.get("id"),
+            "status": prior.get("status"), "jaccard": round(score, 3),
+            "why": "PEM gate: near-clone rejected, not a new discovery"})
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
@@ -161,13 +214,18 @@ def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
         return ""
     lines: list[str] = []
     for h in hyps:
-        mark = "SUPPORTED" if h["status"] == "supported" else "REFUTED"
+        # P24bis: an INDEPENDENTLY replicated claim is stronger common
+        # ground than an author-confirmed one — the prompt says so.
+        mark = ("SUPPORTED+ (independently replicated)"
+                if h["status"] == "supported" and h.get("replicated")
+                else "SUPPORTED" if h["status"] == "supported" else "REFUTED")
         note = f" — {h['note'][:110]}" if h.get("note") else ""
         lines.append(f"- [{mark}] {h['claim'][:180]} (h#{h['id']}{note})")
     if not lines:
         return ""
     return ("Empirically verified by this lab (exit-code verdicts, P16 — build on "
-            "SUPPORTED facts, never re-assert a REFUTED one):\n" + "\n".join(lines))[:1400]
+            "SUPPORTED facts, never re-assert a REFUTED one; SUPPORTED+ survived "
+            "an independent agent's re-run, the strongest kind):\n" + "\n".join(lines))[:1400]
 
 
 async def _llm_ask(
@@ -194,9 +252,48 @@ async def _llm_ask(
     budget = getattr(ctx, "budget", None)
     started = time.monotonic()
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose)
+        if not allowed and purpose and why.startswith("P20 pool budget"):
+            # P20b — a science-critical ask (verify/ideation reserve) that
+            # is merely AHEAD of the sliding window should wait seconds and
+            # retry ONCE instead of dying for the rest of the hour: the
+            # window frees continuously, so a short bounded wait usually
+            # gets the escape hatch through. Wait only when the retry hint
+            # is small (window nearly drained anyway); otherwise give up
+            # fast and let the cycle degrade as before.
+            wait_cap = float(getattr(ctx.settings, "budget_block_wait_cap_s",
+                                     0.0) or 0.0)
+            if wait_cap > 0:
+                wait = budget.retry_in_s(ctx.agent_id, purpose)
+                if 0 < wait <= wait_cap:
+                    log.info("[%s] %s waits %.0fs for the budget window "
+                             "to slide", ctx.agent_id, purpose, wait)
+                    await asyncio.sleep(wait)
+                    allowed, why = budget.can_ask(ctx.agent_id, purpose)
         if not allowed:
-            log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
+            # P20c (#3 local router): a CHEAP purpose that the pool refuses
+            # can still run on the free local model — the cookies stay
+            # reserved for science. Science purposes never degrade here
+            # (local_router.allowed_for refuses them by construction).
+            try:
+                from agentics.llm import local_router
+                if local_router.allowed_for(ctx.settings, purpose):
+                    local_resp = await local_router.ask(
+                        prompt, settings=ctx.settings, purpose=purpose)
+                    if local_resp is not None and local_resp.ok:
+                        log.info("[%s] %s served by the local model "
+                                 "(pool budget exhausted)",
+                                 ctx.agent_id, purpose)
+                        try:
+                            ctx.memory.journal(ctx.agent_id, "local_fallback",
+                                               {"purpose": purpose})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return local_resp.answer, []
+            except Exception:  # noqa: BLE001 — fallback must never break the gate
+                pass
+            log.warning("[%s] %s blocked by budget: %s",
+                        ctx.agent_id, purpose, why)
             if state is not None and not state.get("error"):
                 state["error"] = f"P20 budget: {why}"
             try:
@@ -213,6 +310,42 @@ async def _llm_ask(
         if budget is not None:
             budget.record(ctx.agent_id, purpose, True, time.monotonic() - started)
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
+        from agentics.llm.errors import is_infra_failure, is_llm_refusal
+
+        if is_llm_refusal(exc):
+            # A refusal never touched the provider (empty pool, backend
+            # circuit open) — recording it as a failure would inflate the
+            # P20 fail-streak with the breaker's own refusals and turn a
+            # dead window into a dead hour (live 2026-11-13). Journal and
+            # degrade; the fail-streak stays truthful.
+            log.warning("[%s] %s llm refused: %s", ctx.agent_id, purpose, exc)
+            if state is not None and not state.get("error"):
+                state["error"] = f"llm refused: {exc}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "llm_refused",
+                                   {"purpose": purpose, "why": str(exc)[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return "", []
+        if is_infra_failure(exc):
+            # Session/transport-level (cloud session died mid-ask, the
+            # per-token cap rejected a rebuild, the CDP link dropped): the
+            # cookie and the model are fine and the client already rebuilt
+            # once. The P20 fail-streak must stay truthful — the free plan's
+            # ~10-minute session cap once read as five consecutive "model
+            # failures" per agent and froze the WHOLE swarm for the 900s
+            # cooldown (live 2026-11-13 14:47-15:10). Loudly logged and
+            # journalled, but not counted.
+            log.warning("[%s] %s llm infra failure: %s",
+                        ctx.agent_id, purpose, str(exc)[:200])
+            if state is not None and not state.get("error"):
+                state["error"] = f"llm {purpose} infra failure: {exc}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "llm_infra_failure",
+                                   {"purpose": purpose, "why": str(exc)[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+            return "", []
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
         if budget is not None:
             budget.record(ctx.agent_id, purpose, False, time.monotonic() - started)
@@ -314,6 +447,69 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 f"P22 pruned {len(pruned_ws)} idle workspace(s): {pruned_ws}")
     except Exception:  # noqa: BLE001 — retention must never break the scan
         pruned_ws = []
+    # P23 replication: on schedule, re-run settled claims from their stored
+    # protocol source — the swarm's knowledge must survive re-measurement,
+    # not be asserted once. Drift (supported->refuted), overturns and
+    # contradictions land in the shared evidence feed (method='replay'), so
+    # every agent sees replication results, not just the replayer.
+    replay_report: list[dict] = []
+    try:
+        sweep_size = int(getattr(ctx.settings, "replay_sweep_size", 0) or 0)
+        every_n = int(getattr(ctx.settings, "replay_every_n_cycles", 1) or 1)
+        workspace = getattr(ctx, "workspace", None)
+        if sweep_size > 0 and every_n > 0 and ctx.cycle % every_n == 0 and workspace is not None:
+            from agentics.verify.replay import replay_settled
+            replay_report = replay_settled(
+                ctx.memory, workspace, limit=sweep_size, agent=ctx.agent_id,
+                cooldown_s=getattr(ctx.settings, "replay_cooldown_s", 0),
+                max_replays=getattr(ctx.settings, "replay_max_per_hyp", 0))
+    except Exception:  # noqa: BLE001 — replication must never break the scan
+        replay_report = []
+    replayed_n = sum(1 for r in replay_report if r.get("replayed"))
+    replay_events = [r.get("event", "") for r in replay_report if r.get("replayed")]
+    # DAPS diversity audit: mechanism entropy over the recent hypothesis
+    # stream. DAPS showed SURFACE diversity staying flat while MECHANISM
+    # entropy collapses (and in-loop gains stop transferring) — so we monitor
+    # mechanism categories, not wording variety, and alert the owner early.
+    try:
+        recent_hyps = ctx.memory.recent_hypotheses(limit=20)
+        audit = qd.audit([h["claim"] for h in recent_hyps])
+        ctx.memory.journal(ctx.agent_id, "diversity_audit", audit)
+        if (audit["window"] >= 8
+                and audit["entropy_nats"] < float(
+                    getattr(ctx.settings, "diversity_min_entropy", 1.0))):
+            ctx.memory.post_message(
+                ctx.agent_id, "alert",
+                f"DIVERSITY ALERT (DAPS): mechanism entropy {audit['entropy_nats']} "
+                f"nats over last {audit['window']} hypotheses — the research "
+                f"stream is collapsing onto few categories "
+                f"({audit['categories']}). Mode collapse suspected: next "
+                "proposals should target an under-represented category.")
+    except Exception:  # noqa: BLE001 — the audit must never break the scan
+        pass
+    # Wave-2 #4: verify calibration audit — the settle verdicts' empirical
+    # confidence floor (replay/replication agreement, Wilson-95); the owner
+    # gets ONE alert when the floor drops, not a flood.
+    try:
+        from agentics.verify.calibration import calibration_audit
+        calibration_audit(ctx)
+    except Exception:  # noqa: BLE001 — the audit must never break the scan
+        pass
+    # Wave-2 #5: periodic reflection tree — the supervisor synthesizes
+    # higher-level insights from the world model on the LOCAL router
+    # (zero cookie cost); insights carry provenance and feed ideation.
+    try:
+        from agentics.graph.reflection import maybe_reflect
+        maybe_reflect(ctx)
+    except Exception:  # noqa: BLE001 — reflection must never break the scan
+        pass
+    # Wave-2 #1: skill library distillation — supported settles become
+    # reusable skills (description via the LOCAL router, code verbatim).
+    try:
+        from agentics.evolution.skills import maybe_distill
+        maybe_distill(ctx)
+    except Exception:  # noqa: BLE001 — distill must never break the scan
+        pass
     tasks = ctx.memory.scan_open_tasks(limit=30)
     # Watermark top-up: keep `backlog_watermark` unclaimed tasks available so
     # every free coder/writer has something to claim this cycle (0 disables).
@@ -323,6 +519,19 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     if tasks_src is not None and len(tasks) < watermark:
         topped_up = tasks_src.supervisor_top_up(min_open=watermark - len(tasks))
         tasks = ctx.memory.scan_open_tasks(limit=30)
+    # A2X Contract-Net-lite: the scan is no longer only a janitor pass — the
+    # supervisor also ALLOCATES: score every open task x every live claimant
+    # (P–N profiles over real merge history) and award the best pairings.
+    # Awards are a market signal, not a lock: the claimant still races and
+    # decides, the award just lifts the task in its ranking (node_claim).
+    try:
+        awards = recommend_awards(
+            ctx.memory,
+            ttl=int(getattr(ctx.settings, "coord_award_ttl", 3)))
+    except Exception:  # noqa: BLE001 — allocation must never break the scan
+        awards = []
+    if awards:
+        ctx.memory.journal(ctx.agent_id, "contract_net_awards", {"awards": awards})
     summary = (
         f"Backlog scan: {len(tasks)} open unclaimed task(s)."
         + (f" Stale claims freed: {freed}." if freed else "")
@@ -330,6 +539,9 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         + (f" Repaired stalled task(s): {repaired}." if repaired else "")
         + (f" Opened {topped_up} new survey task(s)." if topped_up else "")
         + (f" P19 panel events: {len(swept_panels)}." if swept_panels else "")
+        + (f" P23 replayed {replayed_n} claim(s): {replay_events}."
+           if replayed_n else "")
+        + (f" Contract-net awards: {award_digest(awards)}." if awards else "")
     )
     # Pipeline depths: where the work actually sits. One glance answers "why
     # is nobody merging?" (MRs stuck awaiting review, panels waiting for a
@@ -503,11 +715,27 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
         return state
     by_id = {i.number: i for i in infos}
     profile = build_profile(ctx.memory.agent_outcomes().get(ctx.agent_id, []))
+    # A2X Contract-Net-lite (award step): a task the supervisor awarded to ME
+    # is lifted by `coord_award_bonus` before the race window — the manager's
+    # allocation actually moves work to the agent it picked, while the agent's
+    # own profile still dominates ties and un-awarded choices.
+    try:
+        awards = ctx.memory.awards_for(ctx.agent_id)
+    except Exception:  # noqa: BLE001 — a read must never kill the claim
+        awards = {}
+    bonus = float(getattr(getattr(ctx, "settings", None),
+                          "coord_award_bonus", 0.75) or 0)
     # Try EVERY ranked candidate, not a top-3 slice: with several agents
     # racing for the same head of the queue, losing the top-3 used to mean a
     # whole idle cycle even while lower-ranked tasks sat open. Each attempt
-    # is one cheap try_claim; the ranking (P-N profile) is unchanged.
-    for info, score in rank_issues(infos, profile):            # lost race → next best
+    # is one cheap try_claim; the ranking (P-N profile + award bonus) is
+    # unchanged.
+    ranked = [
+        (info, sc + (bonus if info.number in awards else 0.0))
+        for info, sc in rank_issues(infos, profile)
+    ]
+    ranked.sort(key=lambda t: (-round(t[1], 9), t[0].created_ts, t[0].number))
+    for info, score in ranked:          # lost race → next best
         task = next(t for t in tasks if t["id"] == info.number)
         branch = branch_name(ctx.agent_id, task["id"], task["title"])
         if not ctx.claims.try_claim(task["id"], ctx.agent_id, branch):
@@ -521,7 +749,8 @@ def node_claim(ctx: AgentContext, state: ResearchState) -> ResearchState:
         state["action"] = "research"
         ctx.memory.add_decision(
             ctx.agent_id, f"claim task #{task['id']}",
-            f"category={info.category} score={score:.2f} (alpha*sqrt(nov)*priority)")
+            f"category={info.category} score={score:.2f} "
+            f"(alpha*sqrt(nov)*priority{'+award' if info.number in awards else ''})")
         ctx.report(
             node="claim", task_id=task["id"], task_title=task["title"],
             intent={
@@ -549,6 +778,174 @@ async def _grounded_bibtex(ctx: AgentContext, urls: list[str]) -> str:
         return cite_fmt.to_bibtex(cite_fmt.parse_citations(list(urls)))
 
 
+# ---------------------------------------------------------------- research fan-out (P18b)
+_FANOUT_ANGLES = (
+    ("benchmarks & datasets",
+     "Focus on benchmark suites, public datasets and reproducible evaluation "
+     "protocols for the topic. Name concrete datasets and metric numbers."),
+    ("limitations & open problems",
+     "Focus on failure modes, limitations, negative results and open research "
+     "problems reported for the topic. Cite the papers that report them."),
+    ("production experience",
+     "Focus on practitioner engineering experience: production deployments, "
+     "postmortems, case studies and field reports for the topic. Cite the "
+     "engineering blogs, conference talks or repository issues that report them."),
+)
+
+
+def _fanout_views(ctx: AgentContext, n_extra: int) -> list:
+    """One extra BrowserSessionHost view per research angle, each on a
+    DIFFERENT pool identity than the agent's own pinned view — with the P18
+    token pool that is a different Hyperbrowser token (a genuinely parallel
+    cloud session); on the local websocket backend it is a different cookie
+    account. Fewer slots than angles -> fewer angles, never contention."""
+    host = ctx.llm
+    if host is None or not hasattr(host, "view"):
+        return []
+    backend = (getattr(ctx.settings, "browser_backend", "") or "local").lower()
+    if backend == "hyperbrowser":
+        capacity = max(1, len(getattr(ctx.settings, "hyperbrowser_api_keys", None) or []))
+    else:
+        try:
+            capacity = len(host.pools["perplexity"].accounts) or 1
+        except Exception:  # noqa: BLE001 — probing the pool must not break research
+            capacity = 1
+    if capacity < 2 or n_extra < 1:
+        return []                       # a single identity cannot fan out
+    base = getattr(host, "prefer_index", 0) or 0
+    views = []
+    for k in range(1, min(n_extra + 1, capacity)):
+        views.append(host.view(prefer_index=(base + k) % capacity))
+    return views
+
+
+async def _ask_angle(ctx: AgentContext, view, angle: tuple[str, str],
+                     base_query: str, budget) -> tuple[str, object] | None:
+    """One complementary angle ask — shared by both fan-out modes.
+
+    The angle passes the same P20 budget gate as the primary ask and is
+    recorded in the usage ledger; a blocked, failed or empty angle returns
+    None instead of breaking the finding."""
+    label, hint = angle
+    if budget is not None:
+        allowed, why = budget.can_ask(ctx.agent_id, purpose="research")
+        if not allowed:
+            log.info("[%s] fan-out angle '%s' skipped by budget: %s",
+                     ctx.agent_id, label, why)
+            return None
+    started = time.monotonic()
+    try:
+        r = await papers_mod.search_papers(
+            view,
+            f"{base_query}\n\n[Angle: {label}] {hint}",
+            purpose="research")
+    except Exception as exc:  # noqa: BLE001 — one angle must not kill the finding
+        log.warning("[%s] fan-out angle '%s' failed: %s", ctx.agent_id, label, exc)
+        return None
+    if budget is not None:
+        budget.record(ctx.agent_id, "research", bool(r and r.ok),
+                      time.monotonic() - started)
+    if r is None or not r.ok:
+        return None
+    return label, r
+
+
+async def _fanout_angles(ctx: AgentContext, base_query: str, n_extra: int,
+                         budget) -> list[tuple[str, object]]:
+    """Run the complementary research angles in parallel on the extra views.
+
+    Every angle passes the same P20 budget gate as the primary ask and is
+    recorded in the usage ledger; a blocked, failed or empty angle simply
+    contributes nothing instead of breaking the finding."""
+    views = _fanout_views(ctx, n_extra)
+    if not views:
+        return []
+
+    async def one(view, angle):
+        return await _ask_angle(ctx, view, angle, base_query, budget)
+
+    results = await asyncio.gather(
+        *(one(v, a) for v, a in zip(views, _FANOUT_ANGLES[:len(views)])))
+    ran = [r for r in results if r is not None]
+    if ran:
+        ctx.meta["research_fanout"] = 1 + len(ran)
+        try:
+            ctx.memory.journal(ctx.agent_id, "research_fanout",
+                               {"angles": [label for label, _ in ran]})
+        except Exception:  # noqa: BLE001 — telemetry must never gate harder
+            pass
+    return ran
+
+
+async def _same_view_angles(ctx: AgentContext, base_query: str, n_extra: int,
+                            budget) -> list[tuple[str, object]]:
+    """Solo-lab unblock: extra angles SEQUENTIALLY on the agent's own view.
+
+    ``_fanout_views`` correctly refuses to fan out when the pool has fewer
+    identities than angles (one Hyperbrowser token = one cloud session),
+    which left solo deployments structurally unable to widen their source
+    diet (live 2026-11-13: research_fanout=2 configured, 0 angles ever
+    ran). Here the extra angle runs on the SAME pinned view — strictly one
+    after another, never concurrent on one session — passing the identical
+    budget gate; the first blocked or failed angle stops the loop so a dead
+    session is not hammered twice."""
+    if n_extra < 1 or ctx.llm is None:
+        return []
+    ran: list[tuple[str, object]] = []
+    for angle in _FANOUT_ANGLES[:n_extra]:
+        got = await _ask_angle(ctx, ctx.llm, angle, base_query, budget)
+        if got is None:
+            break
+        ran.append(got)
+    if ran:
+        ctx.meta["research_fanout"] = 1 + len(ran)
+        ctx.meta["research_fanout_same_view"] = len(ran)
+        try:
+            ctx.memory.journal(ctx.agent_id, "research_fanout_same_view",
+                               {"angles": [label for label, _ in ran]})
+        except Exception:  # noqa: BLE001 — telemetry must never gate harder
+            pass
+    return ran
+
+
+def _merge_research(primary, extras: list[tuple[str, object]]):
+    """Merge parallel angle answers into the primary finding: primary text
+    first, then each angle under its own heading; citations deduped in
+    order. The merged shape is exactly the LLMResponse the rest of the
+    pipeline already consumes.
+
+    Dedup keys on the CANONICAL host form (citations.canonical_url):
+    www.sqlite.org/x and sqlite.org/x are one document and must not occupy
+    two citation slots (live 2026-11-13: exactly that pair in one finding).
+    The first-seen original URL is kept for the citation list."""
+    from agentics.llm.perplexity_client import LLMResponse
+    from agentics.research.citations import canonical_url
+
+    parts = [primary.answer.rstrip()]
+    citations: list[str] = []
+    seen: set[str] = set()
+    for c in primary.citations:
+        key = canonical_url(c) if c else ""
+        if not c or key in seen:
+            continue
+        seen.add(key)
+        citations.append(c)
+    for label, r in extras:
+        parts.append(f"## Supplementary angle — {label}\n{r.answer.strip()}")
+        for c in r.citations:
+            key = canonical_url(c) if c else ""
+            if not c or key in seen:
+                continue
+            seen.add(key)
+            citations.append(c)
+    return LLMResponse(
+        answer="\n\n".join(parts),
+        citations=citations,
+        raw=getattr(primary, "raw", None),
+        elapsed_s=getattr(primary, "elapsed_s", 0.0),
+    )
+
+
 async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
                            answer: str, citations: list[str], source: str) -> ResearchState:
     """Shared tail of node_research: persist the finding and route the cycle.
@@ -564,10 +961,41 @@ async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
         ctx.memory.add_finding,
         ctx.agent_id, title, content, list(citations), state.get("issue_number"),
     )
-    await asyncio.to_thread(
+    # Kosmos world model: the new finding becomes structured shared state so
+    # every other agent's next prompt sees it without reading the full text.
+    try:
+        await asyncio.to_thread(
+            ctx.memory.world_add, ctx.agent_id, "finding",
+            f"{topic}: {answer[:200]}", source=f"finding#{fid}")
+    except Exception:  # noqa: BLE001 — world model must never break research
+        pass
+    # v3 sync-trim: remember WHICH vector doc indexes this row, so the day the
+    # findings trim evicts it the vector tier deletes the same doc (the ghost
+    # rows the recall path used to skip at read time never accumulate).
+    doc_id = await asyncio.to_thread(
         ctx.vector.add, content,
         {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
     )
+    # GraphRAG-lite (#4): mine the finding into the knowledge graph via the
+    # LOCAL router (zero cookie spend). A missing/absent runtime is a no-op
+    # — an honest degradation, never an invented triple.
+    if bool(getattr(ctx.settings, "kg_enabled", True)):
+        try:
+            from agentics.research.kg_extract import ingest_text
+            await asyncio.wait_for(
+                ingest_text(ctx.memory, content, ctx.settings,
+                            source_hyp=None),
+                timeout=float(getattr(ctx.settings, "local_llm_timeout",
+                                      20.0)) + 5.0)
+        except Exception:  # noqa: BLE001 — KG sugar must never break research
+            pass
+    if doc_id:
+        linker = getattr(ctx.memory, "set_finding_vector_doc", None)
+        if linker is not None:
+            try:
+                await asyncio.to_thread(linker, fid, doc_id)
+            except Exception:  # noqa: BLE001 — linking is best-effort
+                pass
     await asyncio.to_thread(
         ctx.memory.post_message,
         ctx.agent_id, "broadcast",
@@ -615,6 +1043,937 @@ async def _free_tools_fallback(ctx: AgentContext, state: ResearchState,
     return await _finish_research(ctx, state, topic, fb.answer, fb.citations, "free-tools")
 
 
+# P7 saturation rotation: when the configured topic is already covered, the
+# researcher tries fresh ANGLES of the same domain instead of idling. Labels
+# reuse the fan-out vocabulary (one consistent way to slice a domain).
+_ROTATION_ANGLES = (
+    "benchmarks & datasets",
+    "limitations & open problems",
+    "deployment & case studies",
+    "recent advances (last 12 months)",
+)
+
+_ANGLE_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _angle_researched(ctx: AgentContext, label: str) -> bool:
+    """True when a stored finding's title already carries this angle's own
+    vocabulary — i.e. the ANGLE itself was researched before.
+
+    Why not the vector gate: a broad survey finding sits at distance ~0.4
+    of EVERY query in its domain (live calibration 2026-11-13 — the three
+    NFV survey findings measure 0.41-0.44 from the base topic AND from every
+    angle phrasing, while fresh-domain queries measure 1.4-2.0), so no
+    distance threshold can separate 'same broad topic' from 'new angle'.
+    Angle freshness is therefore judged on finding TITLES, where the angle
+    label lives (finding titles are f"Findings: {topic}" and a rotated
+    topic embeds its label). The ratchet: researching an angle stores a
+    title containing its label, so the next saturation rotates further."""
+    search = getattr(ctx.memory, "finding_search", None)
+    if search is None:
+        return False
+    label_words = {w for w in _ANGLE_WORD_RE.findall(label.lower()) if len(w) > 2}
+    if not label_words:
+        return False
+    try:
+        return any(m.get("hits", 0) >= 1 for m in search(label, limit=10))
+    except Exception:  # noqa: BLE001 — dedup must never break research
+        return False
+
+
+async def _dedup_known(ctx: AgentContext, topic: str) -> list[dict]:
+    """P7 dedup gate for ONE candidate topic — vector hits within the
+    distance threshold, or the SQLite keyword fallback when the vector
+    store is offline. Shared by the primary topic and by rotation angles,
+    so rotation can never weaken the skip guard."""
+    known = await papers_mod.dedup_query(ctx.vector, topic)
+    if not getattr(ctx.vector, "available", False):
+        fallback = getattr(ctx.memory, "finding_search", None)
+        if fallback is not None:
+            try:
+                known = [m for m in fallback(topic, limit=5) if m.get("hits", 0) >= 2]
+            except Exception:  # noqa: BLE001 — dedup fallback must never break research
+                known = []
+    return known
+
+
+# ------------------------------------ QD ideation closed loop (2026-11-14)
+# IDEAgent qualification gate + Kosmos insight harvest / gap proposal. All
+# LLM calls run with purpose="ideation" (routed to the general pool), are
+# budget-gated through _llm_ask, and degrade to "no ideation" on failure —
+# the deep-dive experiment itself never depends on the ideation round.
+
+EXTRACT_CLAIMS_PROMPT = (
+    "Research finding to verify:\n{finding}\n\n"
+    "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
+    "self-contained python simulation can check (simulate the method on "
+    "synthetic data, measure the metric). For each claim write its "
+    "protocol.\n\n"
+    f"{PROTOCOL_CONTRACT}\n"
+    'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+    '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+    '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+    '"assumptions": "...", "effect": "..."}}]}\n\n'
+    "The signature quintuple is the idea's compact identity for the "
+    "swarm's Quality-Diversity archive — keep each field under 25 words."
+)
+
+
+async def _ideation_allowed(ctx: AgentContext) -> bool:
+    settings = getattr(ctx, "settings", None)
+    if not getattr(settings, "ideation_enabled", False):
+        return False
+    return ctx.llm is not None
+
+
+async def _reject_candidate(ctx: AgentContext, claim: str, reason: str,
+                            why: str) -> None:
+    """Archive a rejected candidate as a COMPACT pattern (IDEAgent R store)
+    and journal it. Full claims would bloat every future seed prompt."""
+    mech = ""
+    try:
+        mech = qd.classify(claim)
+    except Exception:  # noqa: BLE001 — taxonomy is advisory only
+        pass
+    await asyncio.to_thread(
+        ctx.memory.add_rejected_pattern, ctx.agent_id, claim, mech, reason)
+    # MAP-Elites: a rejected idea still OCCUPIES its behaviour cell — the
+    # archive keeps one representative of every approach ever tried, so the
+    # saturation pivot steers toward cells that do not exist yet.
+    try:
+        await asyncio.to_thread(
+            ctx.memory.qd_record, mech, "rejected", None, claim, 0.0)
+    except Exception:  # noqa: BLE001 — archive must never break the gate
+        pass
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "idea_rejected",
+        {"claim": claim[:160], "reason": reason, "mechanism": mech,
+         "why": why[:160]})
+
+
+async def _gate_and_register(ctx: AgentContext, child: dict,
+                             parents: list[int],
+                             recent: list[dict],
+                             depth: int = 0, branch: str = "",
+                             repair_margin: float | None = None) -> int | None:
+    """IDEAgent pipeline for ONE candidate: PEM near-dup gate -> judge ->
+    qualification (accept / one repair / reject) -> registry insert.
+
+    Returns the new hypothesis id, or None when the candidate is rejected
+    or the judge is unavailable. `parents` keeps the Kosmos lineage (the
+    settled experiment row this idea grew from). `depth`/`branch` carry the
+    discovery-branch position (branch level below the discovery root + the
+    attack angle) so the deep-dive backlog can prioritize the subtree.
+    `repair_margin` overrides settings.idea_repair_margin — the saturation
+    pivot passes the WIDER band (idea_repair_margin_saturation) so a
+    near-miss idea gets its one repair round when the lab has nothing else
+    to do; the post-repair re-judge still must fully pass the gate."""
+    child = idea.normalize_child(child)
+    if child is None:                    # contract violation — nothing to judge
+        return None
+    claim = child["claim"]
+    crit = child["criterion"]
+    # Cheap mechanical gate first: a near-clone of ANY recent hypothesis
+    # (any status) is archived as a rejected pattern without an LLM call.
+    threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+    dup = qd.near_duplicate(claim, recent, threshold)
+    if dup is not None:
+        await _reject_candidate(
+            ctx, claim,
+            f"near-duplicate of h#{dup[1].get('id')} "
+            f"(jaccard={dup[0]:.2f})", "PEM: re-proposed an existing idea")
+        return None
+    # IDEAgent judge: one call, scores on the four axes.
+    answer, _ = await _llm_ask(
+        ctx,
+        idea.JUDGE_PROMPT.format(claim=claim[:1200],
+                                 criterion=json.dumps(crit, ensure_ascii=False)),
+        purpose="ideation")
+    j = idea.parse_scores(answer)
+    if j is None:
+        return None                      # judge unavailable — no registration
+    tau = float(getattr(ctx.settings, "idea_min_score", 60))
+    margin = (float(getattr(ctx.settings, "idea_repair_margin", 20))
+              if repair_margin is None else float(repair_margin))
+    route = idea.qualification(j, tau=tau, repair_margin=margin)
+    if route == "reject":
+        await _reject_candidate(
+            ctx, claim, f"gate rejected (Q={j.quality():.0f}, "
+            f"weak={j.worst_margin(tau):+.0f})",
+            j.notes[:120] or "IDEAgent gate")
+        return None
+    if route == "repair":
+        # ONE repair round: fix the weak axes WITHOUT changing the
+        # mechanism (IDEAgent Stage II), then re-judge the child.
+        weak = (f"non_obviousness={j.non_obviousness:.0f}, "
+                f"clarity={j.clarity:.0f}, soundness={j.soundness:.1f}")
+        r_answer, _ = await _llm_ask(
+            ctx,
+            idea.REPAIR_PROMPT.format(claim=claim[:1000],
+                                      criterion=json.dumps(crit,
+                                                           ensure_ascii=False),
+                                      feedback=j.notes[:300] or "see weak scores",
+                                      weak=weak),
+            purpose="ideation")
+        fixed = idea.parse_repair(r_answer)
+        if fixed is None:
+            await _reject_candidate(
+                ctx, claim, "repair round produced nothing usable",
+                "IDEAgent repair")
+            return None
+        j2 = None
+        r2, _ = await _llm_ask(
+            ctx,
+            idea.JUDGE_PROMPT.format(claim=fixed["claim"][:1200],
+                                     criterion=json.dumps(fixed["criterion"],
+                                                          ensure_ascii=False)),
+            purpose="ideation")
+        j2 = idea.parse_scores(r2)
+        if j2 is None or idea.qualification(
+                j2, tau=tau, repair_margin=0.0) != "accept":
+            await _reject_candidate(
+                ctx, claim, "repaired child still below the gate",
+                "IDEAgent repair")
+            return None
+        child, claim, crit = fixed, fixed["claim"], fixed["criterion"]
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "idea_repaired",
+            {"final_claim": claim[:160], "Q_before": round(j.quality(), 1),
+             "Q_after": round(j2.quality(), 1)})
+    hyp_id = await asyncio.to_thread(
+        ctx.memory.add_hypothesis, ctx.agent_id, claim, crit,
+        parents=parents, depth=max(0, int(depth)), branch=branch)
+    sig = child.get("signature")
+    if isinstance(sig, dict) and sig:
+        await asyncio.to_thread(
+            ctx.memory.set_hypothesis_signature, hyp_id, sig)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "idea_registered",
+        {"hyp": hyp_id, "claim": claim[:160], "parents": parents,
+         "Q": round(j.quality(), 1), "route": route,
+         "depth": max(0, int(depth)), "branch": branch})
+    return hyp_id
+
+
+async def _harvest_insights(ctx: AgentContext, parent_id: int,
+                            claim: str, verdict: str, measured: str) -> int:
+    """Kosmos closed loop: a settled experiment proposes its FOLLOW-UPS —
+    and, when the ideator grades the result surprising (novelty >=
+    discovery_novelty_min), the result becomes a DISCOVERY: the registry
+    row is flagged, the world model records it, and the follow-ups become
+    ANGLED BRANCHES (mechanism / generalize / boundary / amplify) at
+    depth+1 that the deep-dive backlog prioritizes (discovery_frontier).
+
+    One ideation call -> up to idea_max_children children -> each gated
+    through _gate_and_register (PEM + judge + repair). Returns how many
+    children were registered; never raises."""
+    if not await _ideation_allowed(ctx):
+        return 0
+    try:
+        parent_row = ctx.memory.get_hypothesis(parent_id) or {}
+        parent_depth = int(parent_row.get("depth") or 0)
+        max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        novelty_min = int(getattr(ctx.settings, "discovery_novelty_min", 70))
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        rejected = ctx.memory.rejected_render()
+        recent = ctx.memory.recent_hypotheses(12)
+        n_children = max(1, int(getattr(ctx.settings, "idea_max_children", 2)))
+        answer, _ = await _llm_ask(
+            ctx,
+            idea.INSIGHT_PROMPT.format(
+                n_children=n_children, claim=claim[:1200],
+                verdict=verdict, measured=measured[:300] or "none recorded",
+                world=world[:1800] or "(empty)", rejected=rejected[:800] or "(none)",
+                angles="/".join(idea.DISCOVERY_ANGLES)),
+            purpose="ideation")
+        novelty, is_disc, reason, children = idea.parse_discovery(
+            answer, max_children=n_children)
+        # ---- discovery recognition (autoresearch quantitative judgment):
+        # the agent KNOWS it found something new, marks it, and the swarm
+        # pivots its backlog into that finding's subtree.
+        branch_mode = bool(
+            novelty is not None and is_disc and novelty >= novelty_min)
+        if branch_mode:
+            # double-judge + citation gate: the FIRST judge (this ideator)
+            # already said discovery; the gate demands an INDEPENDENT second
+            # opinion from another account AND an external citation URL —
+            # without them the discovery would rest entirely on inputs the
+            # authoring agent authored (self-graded surprise).
+            gate_ok, gate_why = await _discovery_gate(
+                ctx, claim, verdict, measured, novelty_min)
+            if gate_ok:
+                await asyncio.to_thread(
+                    ctx.memory.mark_discovery, parent_id, novelty)
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "discovery_detected",
+                    {"hyp": parent_id, "novelty": round(float(novelty), 1),
+                     "reason": reason[:200], "verdict": verdict,
+                     "branches_planned": len(children),
+                     "gate": "double_judge+citation"})
+                await asyncio.to_thread(
+                    ctx.memory.world_add, ctx.agent_id, "finding",
+                    f"DISCOVERY(novelty={round(float(novelty))}): {claim[:150]} "
+                    f"-> {verdict}; digging in: {reason[:120]}",
+                    source=f"h#{parent_id}")
+            else:
+                branch_mode = False
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "discovery_gate_denied",
+                    {"hyp": parent_id,
+                     "novelty": round(float(novelty), 1),
+                     "why": gate_why[:220]})
+        if not children:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "insight_harvest_empty",
+                {"parent_hyp": parent_id, "verdict": verdict,
+                 "novelty": None if novelty is None else round(float(novelty), 1),
+                 "is_discovery": branch_mode})
+            return 0
+        if parent_depth >= max_depth:
+            # branch cap: this subtree is deep enough — stop spawning children
+            # so a single discovery cannot monopolize the registry forever.
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "branch_depth_cap",
+                {"parent_hyp": parent_id, "depth": parent_depth,
+                 "max_depth": max_depth})
+            return 0
+        registered = 0
+        for child in children:
+            # refresh the archive before EACH child: a child registered
+            # moments ago must already block its own clones (IDEAgent: the
+            # active archive grows as candidates are admitted).
+            recent_now = ctx.memory.recent_hypotheses(12)
+            hyp_id = await _gate_and_register(
+                ctx, child, [parent_id], recent_now,
+                depth=parent_depth + 1,
+                branch=str(child.get("angle") or "") if branch_mode else "")
+            if hyp_id is not None:
+                registered += 1
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "insight_harvest",
+            {"parent_hyp": parent_id, "verdict": verdict,
+             "proposed": len(children), "registered": registered,
+             "novelty": None if novelty is None else round(float(novelty), 1),
+             "is_discovery": branch_mode})
+        return registered
+    except Exception as exc:  # noqa: BLE001 — harvest must never break a settle
+        log.warning("[%s] insight harvest failed: %s", ctx.agent_id, exc)
+        return 0
+
+
+async def _branch_feedback(ctx: AgentContext, hyp_id: int, status: str) -> None:
+    """C3 entropic credit assignment (TTT_DISCOVER.md) — a BRANCH settle
+    credits its discovery root (nearest ancestor with discovery=1) by HOW
+    GOOD the settle was, not just that it happened:
+
+        q_i = softmax_beta(r_i)   (beta adaptive: KL(q||uniform) = log 2)
+        boost_i = bonus_max * k * q_i / sum(q_j)
+
+    The best branch's reward takes nearly the whole `bonus_max`
+    (settings.entropic_bonus_max, default 8.0); equally-rewarded groups are
+    constant-reward groups — NO information, boost 0 (the old +5-for-every-
+    supported line was exactly the rich-get-richer pump the harsh review
+    convicted). refuted/unanchored rows carry reward 0 and weight ~0.
+    The discovery root's own settle is judged by the ideator's novelty
+    grading instead (no self-reinforcement). Never raises."""
+    if status not in ("supported", "refuted"):
+        return
+    try:
+        root = await asyncio.to_thread(
+            ctx.memory.nearest_discovery_ancestor, hyp_id)
+        if root is None or int(root.get("id") or 0) == int(hyp_id):
+            return
+        if status == "supported":
+            from agentics.verify.reward import (
+                adaptive_softmax_weights as entropic_weights)
+            bonus_max = float(getattr(ctx.settings, "entropic_bonus_max",
+                                      8.0))
+            scale_mode = str(getattr(ctx.settings, "reward_scale", "target"))
+            rows = await asyncio.to_thread(
+                ctx.memory.discovery_subtree_rewards, int(root["id"]),
+                scale_mode)
+            boost = 0.0
+            if rows:
+                rewards = [float(r.get("reward") or 0.0) for r in rows]
+                weights = entropic_weights(rewards)
+                # constant-reward group (>= 2 identical results) carries NO
+                # information -> zero boost. A SINGLE settle is still
+                # evidence: its weight is 1.0, boost = bonus_max.
+                constant = (len(rewards) > 1
+                            and len(set(round(r, 9) for r in rewards)) == 1)
+                my_rows = [r for r in rows
+                           if int(r.get("hyp_id") or -1) == int(hyp_id)]
+                if my_rows and not constant:
+                    my_reward = max(float(r.get("reward") or 0.0)
+                                    for r in my_rows)
+                    idx = rewards.index(my_reward)
+                    boost = bonus_max * len(rewards) * weights[idx]
+            nov = await asyncio.to_thread(
+                ctx.memory.discovery_reinforce, int(root["id"]), boost)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "discovery_confirmed",
+                {"branch_hyp": hyp_id, "discovery": int(root["id"]),
+                 "novelty": round(float(nov), 1),
+                 "boost": round(boost, 3),
+                 "group_size": len(rows),
+                 "why": "branch settled supported — entropic credit applied"})
+        else:
+            row = await asyncio.to_thread(ctx.memory.get_hypothesis, hyp_id)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "branch_dead_end",
+                {"branch_hyp": hyp_id,
+                 "discovery": int(root["id"]),
+                 "angle": (row or {}).get("branch", ""),
+                 "why": "branch settled refuted — this attack angle failed"})
+    except Exception as exc:  # noqa: BLE001 — feedback must never break a settle
+        log.warning("[%s] branch feedback failed: %s", ctx.agent_id, exc)
+
+
+# ------------------------------------------------- settle anchor law
+def _settle_law(ctx: AgentContext, hyp_id: int, claim: str, status: str,
+                ev, code: str, citations: int = 0):
+    """Apply the settle anchor law to one machine verdict (node paths).
+
+    The epistemic rule: `supported` requires self_authored_ratio < 1 — at
+    least one verdict input the agent did NOT author. Anchor sources at the
+    node level: external citation URLs from the ask that produced the
+    protocol, a pinned-hash dataset the protocol declares (verified against
+    the actual workspace file), an already-confirmed P24 replication, and
+    owner approval. An anchorless supported is downgraded to the new
+    `unanchored` status + journaled `settle_unanchored`; the caller records
+    the provenance (ratio + anchors) in the ledger row either way.
+    Returns (status_after, provenance). Never raises."""
+    from agentics.verify.anchors import (
+        apply_settle_law, detect_pinned_data, provenance_for_settle)
+    require = bool(getattr(ctx.settings, "settle_require_anchor", True))
+    try:
+        flags = ctx.memory.settle_anchor_state(hyp_id)
+    except Exception:  # noqa: BLE001 — provenance must never break a settle
+        flags = {"replicated": False, "owner_approved": False}
+    try:
+        pinned = detect_pinned_data(ctx.workspace, code)
+    except Exception:  # noqa: BLE001
+        pinned = False
+    prov = provenance_for_settle(
+        citations=citations, replicated=bool(flags.get("replicated")),
+        owner_approved=bool(flags.get("owner_approved")), pinned_data=pinned)
+    status, _downgraded = apply_settle_law(status, prov, require)
+    if _downgraded:
+        try:
+            ctx.memory.journal(ctx.agent_id, "settle_unanchored", {
+                "hyp": hyp_id, "claim": claim[:160],
+                "self_authored_ratio": prov.ratio,
+                "why": "verdict passed the criterion but every deciding "
+                       "input was agent-authored — supported withheld "
+                       "until independent replication / owner approval"})
+        except Exception:  # noqa: BLE001 — the law must never break a settle
+            pass
+    return status, prov
+
+
+def _world_kind(status: str) -> str:
+    """World-model kind for a settled status. `unanchored` is NOT verified
+    knowledge — it is a measured finding waiting for an external anchor, so
+    it enters the world model as a provisional `finding`, never as
+    `verified` (common ground only grows from anchored verdicts)."""
+    return ("verified" if status == "supported"
+            else "refuted" if status == "refuted"
+            else "finding" if status == "unanchored" else "gap")
+
+
+async def _discovery_gate(ctx: AgentContext, claim: str, verdict: str,
+                          measured: str,
+                          novelty_min: int) -> tuple[bool, str]:
+    """The discovery double-judge + external-citation gate.
+
+    mark_discovery fires only when TWO independent inputs agree the result
+    is surprising: (a) the ideator's own grading (checked by the caller)
+    and (b) a SECOND opinion from an INDEPENDENT account — a sibling view
+    of the session host pinned to the NEXT account, so the judge cannot be
+    the author's own cookie identity re-answering itself. The peer's
+    answer must also carry at least one external citation URL (Perplexity
+    academic mode returns citations natively): the URL is a verdict input
+    the authoring agent did not author.
+
+    Returns (ok, why). A failed gate never breaks the harvest — the result
+    simply keeps the plain follow-up behavior instead of branching."""
+    if not bool(getattr(ctx.settings, "discovery_second_judge", True)):
+        return True, "second judge disabled by config (DISCOVERY_SECOND_JUDGE=0)"
+    host = ctx.llm
+    try:
+        pool = len(host) if host is not None else 0
+    except Exception:  # noqa: BLE001 — non-pool hosts (fakes) have no peers
+        pool = 0
+    if host is None or pool < 2:
+        return False, (f"no independent judge account available "
+                       f"(pool={pool}; discovery needs a second identity)")
+    try:
+        peer_idx = ((int(getattr(host, "prefer_index", 0) or 0) + 1) % pool)
+        peer = host.view(peer_idx)
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        resp = await peer.ask(
+            idea.NOVELTY_JUDGE_PROMPT.format(
+                claim=claim[:1200], verdict=verdict,
+                measured=(measured or "none recorded")[:300],
+                world=world[:1500] or "(empty)", novelty_min=novelty_min),
+            mode="academic", purpose="research")
+        nov2, disc2, why2 = idea.parse_novelty_judgement(
+            getattr(resp, "answer", ""))
+        cites = list(getattr(resp, "citations", None) or [])
+        if nov2 is None:
+            return False, "second judge reply unparsable (no novelty contract)"
+        if not disc2 or nov2 < novelty_min:
+            return False, (f"second judge graded novelty "
+                           f"{round(float(nov2), 1)} (agreement requires "
+                           f">= {novelty_min}): {why2[:120]}")
+        if not cites:
+            return False, ("second judge returned no external citation URL "
+                           "— no input outside the author's reach")
+        return True, (f"peer judge novelty {round(float(nov2), 1)} + "
+                      f"{len(cites)} external citation(s)")
+    except Exception as exc:  # noqa: BLE001 — a failed gate never breaks the harvest
+        return False, f"second judge unavailable: {exc}"[:200]
+
+
+async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
+    """Kosmos world model as TASK PROPOSER: topic saturated + registry
+    empty -> the agent reads the world model and registers ONE gap-closing
+    hypothesis instead of idling (autoresearch NEVER-STOP clause).
+
+    Returns True when a hypothesis was registered (the deep-dive can pick
+    it up in the same or next cycle)."""
+    if not await _ideation_allowed(ctx):
+        return False
+    try:
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        # MAP-Elites steering (#2): mechanisms with NO archived elite are
+        # the pivot's target list — a saturated topic escapes by moving to
+        # an unoccupied behaviour cell, not by re-proposing covered ones.
+        try:
+            from agentics.diversity import _MECHANISM_KEYWORDS
+            from agentics.research.kg_extract import mechanism_hint
+            hint = mechanism_hint(
+                ctx.memory, list(_MECHANISM_KEYWORDS.keys()))
+            if hint:
+                world = (world + "\n\n" + hint)[:2100]
+        except Exception:  # noqa: BLE001 — hint is advisory
+            pass
+        rejected = ctx.memory.rejected_render()
+        recent = ctx.memory.recent_hypotheses(12)
+        recent_claims = [r["claim"] for r in recent]
+        answer, _ = await _llm_ask(
+            ctx,
+            idea.GAP_PROMPT.format(
+                world=world[:1800] or "(empty)",
+                recent="\n".join(f"- {c[:140]}" for c in recent_claims[:10])
+                or "(none)",
+                rejected=rejected[:800] or "(none)"),
+            purpose="ideation")
+        children = idea.parse_children(answer, max_children=1)
+        if not children:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "gap_proposal_empty",
+                {"why": "no parsable gap hypothesis"})
+            return False
+        hyp_id = await _gate_and_register(
+            ctx, children[0], [], recent,
+            repair_margin=float(getattr(
+                ctx.settings, "idea_repair_margin_saturation", 30)))
+        if hyp_id is None:
+            return False
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "gap_hypothesis_registered",
+            {"hyp": hyp_id, "claim": children[0]["claim"][:160],
+             "source": "world_model_gap"})
+        state["summary"] = (f"saturation pivot: registered gap hypothesis "
+                            f"h#{hyp_id} from the world model")
+        return True
+    except Exception as exc:  # noqa: BLE001 — proposal must never crash research
+        log.warning("[%s] gap proposal failed: %s", ctx.agent_id, exc)
+        return False
+
+
+async def _seed_hypotheses_from_findings(ctx: AgentContext,
+                                         state: ResearchState) -> bool:
+    """Saturation escape hatch #2 (P16bis raw material): the world model
+    proposed nothing (or the gate refused the idea), but the swarm holds
+    FINDINGS. Each finding hides 1-2 QUANTITATIVE claims a small python
+    protocol can check — extract them and PRE-REGISTER (criterion locked
+    before any run; no experiment executes here), so the deep-dive backlog
+    picks them up next cycle through the ordinary settle machinery.
+
+    Live 2026-11-14 owner dashboard: with the topic saturated, 5 findings
+    stored and 0 hypotheses registered, the lab oscillated skip->reject
+    forever while the whole settle/replication/discovery pipeline starved.
+    This path is that pipeline's raw-material pump. Returns True when at
+    least one hypothesis was registered. Never raises."""
+    if not await _ideation_allowed(ctx):
+        return False
+    try:
+        findings = await asyncio.to_thread(ctx.memory.list_findings, 2)
+        if not findings:
+            return False
+        registered = 0
+        for finding in findings:
+            answer, _ = await _llm_ask(
+                ctx,
+                EXTRACT_CLAIMS_PROMPT.replace(
+                    "{finding}",
+                    (f"{finding.get('title', '')}\n"
+                     f"{finding.get('content', '')}")[:3000]),
+                mode="concise", purpose="verify")
+            parsed = parse_json_block(answer)
+            specs = [h for h in (parsed.get("hypotheses") or [])
+                     if isinstance(h, dict)][:2]
+            for spec in specs:
+                claim = str(spec.get("claim", "")).strip()[:300]
+                protocol_code = str(spec.get("protocol", ""))
+                if not claim or not protocol_code.strip():
+                    continue
+                try:
+                    criterion = Criterion.from_dict(spec)
+                except ValueError:
+                    continue
+                # Same near-clone gate as node_verify: a reworded claim of
+                # something already in the stream must not pass as new.
+                if not _pem_gate(ctx, claim):
+                    continue
+                hyp_id = await asyncio.to_thread(
+                    ctx.memory.add_hypothesis, ctx.agent_id, claim,
+                    criterion.as_dict(), task_id=state.get("issue_number"),
+                    finding_id=finding.get("id"), status="proposed",
+                    protocol_code=protocol_code[:20000])
+                sig = spec.get("signature")
+                if isinstance(sig, dict) and sig:
+                    await asyncio.to_thread(
+                        ctx.memory.set_hypothesis_signature, hyp_id, sig)
+                registered += 1
+        if registered == 0:
+            return False
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "findings_seeded_hypotheses",
+            {"registered": registered,
+             "why": "saturation pivot: pre-registered quantitative claims "
+                    "from stored findings (P16bis raw material)"})
+        state["summary"] = (
+            f"saturation pivot: pre-registered {registered} hypothesis/ies "
+            "from stored findings (P16bis)")
+        return True
+    except Exception as exc:  # noqa: BLE001 — seeding must never crash research
+        log.warning("[%s] findings seeding failed: %s", ctx.agent_id, exc)
+        return False
+
+
+def _close_saturated_task(ctx: AgentContext, state: ResearchState) -> None:
+    """Stop re-awarding a task whose research target is fully covered.
+
+    The claim/release cycle below is what produced the live 400+-cycle idle
+    loop: contract-net re-awards the task, the researcher skips it as
+    covered, releases it, and the next cycle repeats. Closing the task (the
+    local board in local-only mode; a no-op on unknown ids in GitHub mode)
+    removes it from the open pool permanently."""
+    task_id = state.get("issue_number")
+    if not task_id:
+        return
+    try:
+        ctx.memory.set_task_status(task_id, "closed")
+        ctx.memory.journal(ctx.agent_id, "task_closed_saturated",
+                           {"task": task_id,
+                            "why": "topic covered, all angles researched"})
+    except Exception as exc:  # noqa: BLE001 — closure must never break research
+        log.warning("could not close saturated task %s: %s", task_id, exc)
+
+
+async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
+    """Deep-dive path: turn ONE registry `proposed` hypothesis into a real
+    experiment and adjudicate it with the same machine gate as node_verify.
+
+    Returns True when a hypothesis was picked up and run (or irreversibly
+    marked), False when the registry has nothing testable this cycle.
+    The hypothesis's OWN row is updated (status testing -> settled) so the
+    registry stays the single source of truth — no duplicate claim rows."""
+    if ctx.llm is None:
+        return False
+    try:
+        max_attempts = int(getattr(ctx.settings, "idea_max_attempts", 2))
+        backlog = await asyncio.to_thread(
+            ctx.memory.testable_hypotheses, 6, max_attempts)
+    except Exception:  # noqa: BLE001
+        backlog = []
+    if not backlog:
+        return False
+    # Deep-dive backlog v2 (autoresearch): `inconclusive` near-misses whose
+    # protocol measured nothing usable come FIRST (retry with the failure
+    # note in the prompt, bounded by idea_max_attempts), then fresh
+    # `proposed` claims.
+    retries = [h for h in backlog if h.get("attempts", 0) > 0]
+    fresh = [h for h in backlog if h.get("attempts", 0) == 0]
+    # DAPS CCR: pick the FRESH candidate whose MECHANISM category is rarest
+    # in the recent hypothesis stream (ties -> oldest), not blindly the
+    # oldest — acceptance pressure otherwise amplifies the proposer's prior.
+    try:
+        recent = await asyncio.to_thread(ctx.memory.recent_hypotheses, 10)
+        backlog_ids = {h["id"] for h in backlog}
+        recent_claims = [r["claim"] for r in recent
+                         if r.get("id") not in backlog_ids]
+        fresh = qd.coverage_order(fresh, recent_claims)
+    except Exception:  # noqa: BLE001 — CCR must never block the deep dive
+        recent = []
+        pass
+    # Discovery frontier (novelty round): when a settled result was marked a
+    # DISCOVERY, its branch children jump the CCR queue. C2 (TTT_DISCOVER.md):
+    # the frontier is scored by the paper's PUCTSampler — Q = MAX descendant
+    # reward, exploitation bonus decays with subtree settles (the structural
+    # cure for rich-get-richer) — and only falls back to BFS order when the
+    # PUCT buffer is degenerate (no settles / single candidate).
+    try:
+        max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        puct_c = float(getattr(ctx.settings, "puct_c", 1.0))
+        eig_w = float(getattr(ctx.settings, "eig_weight", 0.5) or 0.0)
+        frontier = await asyncio.to_thread(
+            ctx.memory.discovery_frontier_puct, 3, max_depth, puct_c,
+            str(getattr(ctx.settings, "reward_scale", "target")), eig_w)
+        if not frontier:
+            frontier = await asyncio.to_thread(
+                ctx.memory.discovery_frontier, 3, max_depth)
+        if frontier:
+            fids = {h["id"] for h in frontier}
+            fmeta = {h["id"]: h for h in frontier}
+            boosted = [h for h in fresh if h["id"] in fids]
+            if boosted:
+                fresh = boosted + [h for h in fresh if h["id"] not in fids]
+                top = fmeta[boosted[0]["id"]]
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "frontier_priority",
+                    {"hyp": boosted[0]["id"],
+                     "claim": boosted[0]["claim"][:160],
+                     "branch": top.get("branch", ""),
+                     "depth": top.get("depth", 0),
+                     "puct_score": top.get("puct_score"),
+                     "puct_q": top.get("puct_q"),
+                     "puct_n": top.get("puct_n"),
+                     "frontier_size": len(boosted)})
+    except Exception:  # noqa: BLE001 — frontier must never block the deep dive
+        pass
+    backlog = retries + fresh
+    hyp = backlog[0]
+    is_retry = hyp.get("attempts", 0) > 0
+    retry_note = ""
+    if is_retry:
+        retry_note = (
+            f"\n\nIMPORTANT: previous attempt #{hyp.get('attempts')} of this "
+            f"protocol failed to measure anything usable: "
+            f"{str(hyp.get('verdict_note') or 'unknown failure')[:400]}. "
+            "Write a CORRECTED protocol — if the failure was trivial (a bug, "
+            "a missing import) fix it; if the measurement approach itself "
+            "was broken, change it. Keep it simple.\n")
+    # DAPS PEM inherit: a registry proposal that is a near-clone of an
+    # already-SETTLED claim inherits that verdict instead of burning a
+    # protocol run on a re-wording (same convention as node_verify's reuse).
+    try:
+        threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+        settled_priors = [r for r in recent
+                          if r.get("status") in ("supported", "refuted")]
+        dup = qd.near_duplicate(hyp["claim"], settled_priors, threshold,
+                                exclude_ids={hyp["id"]})
+    except Exception:  # noqa: BLE001
+        dup = None
+    if dup is not None:
+        score, prior = dup
+        await asyncio.to_thread(
+            ctx.memory.update_hypothesis, hyp["id"], prior["status"],
+            note=(f"inherited verdict of settled h#{prior['id']} "
+                  f"(near-duplicate, jaccard={score:.2f})"))
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_reused",
+            {"hyp": hyp["id"], "claim": hyp["claim"][:160],
+             "settled_by": prior["id"], "status": prior["status"],
+             "jaccard": round(score, 3),
+             "why": "PEM: registry proposal is a near-clone of a settled claim"})
+        state["summary"] = (f"deep-dive: registry h#{hyp['id']} is a near-clone "
+                            f"of settled h#{prior['id']} -> verdict inherited")
+        state["done"] = True
+        return True
+    try:
+        crit = json.loads(hyp.get("criterion") or "{}")
+    except Exception:  # noqa: BLE001
+        crit = {}
+    criterion_desc = (
+        f"metric={crit.get('metric')} op={crit.get('op')} target={crit.get('target')}"
+        + (f" tolerance={crit.get('tolerance')}" if crit.get("tolerance") else "")
+    )
+    prompt = (
+        "A research hypothesis was pre-registered by the swarm but never "
+        "tested. Write its self-contained python protocol.\n\n"
+        f"Hypothesis claim:\n{hyp['claim'][:1500]}\n\n"
+        f"Machine criterion (the protocol MUST print AGENTICS_RESULT with "
+        f"exactly this metric): {criterion_desc}\n"
+        f"{retry_note}\n"
+        # Wave-2 #1: settled protocols compound — start from verified skills
+        f"{skills_block(ctx.memory, hyp['claim'])}\n\n"
+        f"{PROTOCOL_CONTRACT}\n"
+        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+        '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+        '"assumptions": "...", "effect": "..."}}]} '
+        "with EXACTLY ONE entry."
+    )
+    answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    parsed = parse_json_block(answer)
+    specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)]
+    if not specs:
+        if is_retry:
+            # autoresearch: after a failed fix attempt, retire the claim —
+            # the idea (not the protocol) is fundamentally broken.
+            await asyncio.to_thread(
+                ctx.memory.update_hypothesis, hyp["id"], "refuted",
+                note="retired after failed retry: protocol unfixable")
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_retired",
+                {"hyp": hyp["id"], "why": "retry produced no usable protocol"})
+            state["summary"] = (f"deep-dive: retired h#{hyp['id']} after a "
+                                f"failed retry (protocol unfixable)")
+            state["done"] = True
+            return True
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
+            {"hyp": hyp["id"], "why": "LLM returned no parsable protocol"})
+        return False
+    spec = specs[0]
+    code = str(spec.get("protocol", ""))
+    if not code.strip():
+        return False
+    try:
+        criterion = Criterion.from_dict(spec)
+    except ValueError as exc:
+        # Frozen registry criterion wins when the LLM disagrees with it.
+        try:
+            criterion = Criterion.from_dict(crit)
+        except ValueError:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
+                {"hyp": hyp["id"], "why": f"criterion unusable: {exc}"})
+            return False
+    hyp_id = hyp["id"]
+    claim = hyp["claim"]
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis, hyp_id, "testing")
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis_protocol_code, hyp_id, code[:20000])
+    sig = spec.get("signature")
+    if isinstance(sig, dict) and sig:
+        await asyncio.to_thread(
+            ctx.memory.set_hypothesis_signature, hyp_id, sig)
+    await asyncio.to_thread(ctx.workspace.sync_main)   # workspace must exist
+    path = f"experiments/verify_h{hyp_id}.py"
+    try:
+        await asyncio.to_thread(ctx.workspace.write_file, path, code)
+    except ValueError as exc:            # P10 layer 1: protected / traversal
+        await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                "inconclusive", note=str(exc)[:300])
+        await asyncio.to_thread(
+            ctx.memory.record_experiment, ctx.agent_id, hyp_id,
+            "inconclusive", metric=criterion.metric, op=criterion.op,
+            target=criterion.target, verdict_note=str(exc)[:200],
+            protocol_path=path, source="deep_dive", description=claim[:200])
+        state["summary"] = f"deep-dive h#{hyp_id} blocked by guard: {exc}"
+        state["done"] = True
+        return True
+    try:
+        ev = await asyncio.to_thread(run_protocol, ctx.workspace, path, criterion)
+    except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the cycle
+        await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                "inconclusive", note=f"runner error: {exc}"[:300])
+        await asyncio.to_thread(
+            ctx.memory.record_experiment, ctx.agent_id, hyp_id,
+            "inconclusive", metric=criterion.metric, op=criterion.op,
+            target=criterion.target, verdict_note=f"runner error: {exc}"[:200],
+            protocol_path=path, source="deep_dive", description=claim[:200])
+        state["summary"] = f"deep-dive h#{hyp_id} runner error: {exc}"
+        state["done"] = True
+        return True
+
+    def _rerun(fixed_code: str):
+        try:
+            ctx.workspace.write_file(path, fixed_code)
+        except ValueError as exc:
+            return Evidence(
+                cmd=path, exit_code=126, verdict="inconclusive",
+                method="protocol", output=f"repair write refused: {exc}",
+                meta={"note": f"repair write refused: {exc}",
+                      "metrics": {}, "runs": []})
+        return run_protocol(ctx.workspace, path, criterion)
+
+    ev, _fixed = await _repair_protocol_rounds(
+        ctx, state, claim=claim, criterion=criterion, code=code,
+        ev=ev, rerun=_rerun, what=f"registry:h{hyp_id}", hyp_id=hyp_id)
+    ev_id = await asyncio.to_thread(
+        ctx.memory.record_evidence, ctx.agent_id, hyp.get("task_id"),
+        ev.cmd, ev.exit_code, ev.verdict,
+        hypothesis=claim, method=ev.method, output=ev.output,
+        duration_s=ev.duration_s, artifact=path)
+    await asyncio.to_thread(
+        ctx.memory.attach_protocol_outcome, ev_id,
+        ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
+    status = VERIFY_STATUS[ev.verdict]
+    note = str(ev.meta.get("note", ""))
+    # Settle anchor law: `supported` needs at least one verdict input the
+    # agent did not author. The protocol-generation ask's citation URLs are
+    # that external input when Perplexity returns them.
+    status, prov = _settle_law(ctx, hyp_id, claim, status, ev, code,
+                               citations=len(ask_citations))
+    if status == "unanchored" and ev.verdict == "confirmed":
+        note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                f"no external anchor]")[:600]
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis, hyp_id, status,
+        evidence_id=ev_id, note=note, protocol_path=path)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
+        {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
+         "note": note[:200], "evidence": ev_id,
+         "criterion": criterion.as_dict(), "source": "registry_deep_dive",
+         "self_authored_ratio": prov.ratio},
+    )
+    measured = ev.meta.get("metrics", {})
+    # autoresearch ledger: this settle is now part of the keep/discard
+    # history (supported=keep, everything else=discard) — the loop's memory
+    # of what was TRIED, failures included. The row carries the verdict's
+    # PROVENANCE (ratio + anchors) next to the verdict.
+    await asyncio.to_thread(
+        ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
+        metric=criterion.metric,
+        measured=measured.get(criterion.metric), op=criterion.op,
+        target=criterion.target, verdict_note=note[:200],
+        protocol_path=path, source="deep_dive", description=claim[:200],
+        self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
+    # Kosmos world model: the settled registry claim becomes shared state.
+    await asyncio.to_thread(
+        ctx.memory.world_add, ctx.agent_id, _world_kind(status),
+        f"{claim[:180]} -> {status}"
+        + (f" ({note[:120]})" if note else ""),
+        source=f"h#{hyp_id}")
+    if status in ("supported", "refuted", "unanchored"):
+        # bandit-lite feedback FIRST: a branch settle credits/debits its
+        # discovery root before the ideation round re-reads the registry.
+        # (An `unanchored` verdict never reinforces a discovery — its
+        # supported-grade is withheld precisely because it is untrusted.)
+        if status != "unanchored":
+            await _branch_feedback(ctx, hyp_id, status)
+        # Kosmos closed loop: the settled result proposes its follow-ups.
+        measured_txt = (f"{criterion.metric}={measured.get(criterion.metric)}"
+                        if measured else note[:200])
+        await _harvest_insights(ctx, hyp_id, claim, status, measured_txt)
+    state["summary"] = (
+        f"deep-dive: tested registry h#{hyp_id} -> {status} "
+        f"(measured {measured or note[:80]})")
+    state["done"] = True
+    return True
+
+
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings.
 
@@ -629,17 +1988,94 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     # H3: the research LLM must know what the swarm already PROVED by running
     # code — supported facts are common ground, refuted claims are dead ends.
     knowledge = verified_knowledge_text(ctx)
+    # The query carries the issue's own problem statement (bounded excerpt),
+    # not just the title + a fixed recipe — the body is where the concrete
+    # constraints live. Dedup still keys on the title-based topic, so this
+    # cannot weaken the P7 skip guard.
+    body = (state.get("issue_body") or "").strip()
+    # P7: dedup — skip if the swarm already covered this. When the vector
+    # store is offline (chromadb absent / init failed) the SAME gate falls
+    # back to keyword search over the findings table — the SQLite fallback
+    # the policies layer already uses — so dedup survives without embeddings
+    # instead of re-researching every topic blind.
+    known = await _dedup_known(ctx, topic)
+    if len(known) >= 3:
+        # P7 saturation: the topic itself is covered. A lab that only ever
+        # prints "skipping" looks dead from the outside (live 2026-11-13: a
+        # lone researcher idled forever once earlier findings covered the
+        # configured topic). With the vector store online, rotate through
+        # fresh ANGLES of the same domain — an angle already researched
+        # (its label appears in a stored finding title) is skipped, so the
+        # ratchet advances; when every angle is spent the lab honestly
+        # rests. The OFFLINE keyword fallback keeps the plain skip: that
+        # gate is the coarse safety net and must stay conservative.
+        rotated = False
+        if getattr(ctx.vector, "available", False):
+            for label in _ROTATION_ANGLES:
+                if not _angle_researched(ctx, label):
+                    angle_topic = f"{topic} ({label})"
+                    log.info("[%s] topic covered — rotating to angle '%s'",
+                             ctx.agent_id, label)
+                    ctx.memory.journal(ctx.agent_id, "research_topic_rotated",
+                                       {"from": topic[:160], "angle": label})
+                    topic = angle_topic
+                    rotated = True
+                    break
+        if not rotated:
+            # Saturation is NOT the end of the cycle — it is the moment to go
+            # DEEPER: the registry holds `proposed` hypotheses (pre-registered
+            # or tournament-bred) that nothing ever turned into a runnable
+            # experiment. Live 2026-11-14: with 5 findings covering the topic
+            # the researchers skipped for 400+ cycles while 4 proposed
+            # hypotheses sat untested and the evidence ledger grew only
+            # duplicate replays. Work the backlog instead of idling.
+            if await _test_proposed_hypothesis(ctx, state):
+                return state
+            # Registry exhausted too — Kosmos: the world model is a TASK
+            # PROPOSER, not just context. One gap-closing hypothesis gets
+            # registered from the open gaps/questions (gated: PEM + IDEAgent
+            # judge) and the deep-dive works it in the same or next cycle.
+            # Only when even the pivot fails does the lab honestly rest.
+            if await _propose_gap_hypothesis(ctx, state):
+                if await _test_proposed_hypothesis(ctx, state):
+                    return state
+                state["done"] = True
+                return state
+            # Escape hatch #2: even the gap pivot failed — mine the FINDINGS
+            # the lab already holds for quantitative, protocol-checkable
+            # claims (P16bis needs raw material; each stored finding is an
+            # unmined hypothesis source). Registered only, run next cycle.
+            if await _seed_hypotheses_from_findings(ctx, state):
+                return state
+            state["summary"] = f"topic already covered by {len(known)} findings; skipping"
+            _close_saturated_task(ctx, state)
+            state["done"] = True
+            return state
+    # Breadth steering: the swarm's already-cited domains feed back into the
+    # query so the model can seek sources OUTSIDE the existing diet. Failure
+    # isolated — a broken memory degrades to an unsteered query.
+    breadth = ""
+    try:
+        domains = research_diversity.cited_domains(ctx.memory)
+        breadth = research_diversity.breadth_directive(domains)
+        if breadth:
+            ctx.memory.journal(ctx.agent_id, "research_breadth_steered",
+                               {"known_domains": len(domains)})
+    except Exception:  # noqa: BLE001 — steering must never gate research
+        breadth = ""
+    # Kosmos world model: the current shared state steers WHAT to research
+    # next — open gaps and untested leads, not just the static topic string.
+    world = _world_model_text(ctx)
+    world_line = (f"\n\nWorld model (swarm state — build on VERIFIED, avoid "
+                  f"REFUTED, close a GAP):\n{world}") if world else ""
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
+        + (f"\n\nProblem statement from the issue:\n{body[:400]}" if body else "")
         + (f"\n\n{knowledge}" if knowledge else "")
+        + world_line
+        + breadth
     )
-    # P7: dedup — skip if the swarm already covered this
-    known = await papers_mod.dedup_query(ctx.vector, topic)
-    if len(known) >= 3:
-        state["summary"] = f"topic already covered by {len(known)} findings; skipping"
-        state["done"] = True
-        return state
 
     if ctx.llm is None:
         return await _free_tools_fallback(ctx, state, topic,
@@ -650,7 +2086,7 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     # without burning a single budgeted call.
     budget = getattr(ctx, "budget", None)
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose="research")
         if not allowed:
             log.warning("[%s] research blocked by budget: %s", ctx.agent_id, why)
             try:
@@ -667,10 +2103,22 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     try:
         resp = await papers_mod.search_papers(ctx.llm, query, purpose="research")
     except Exception as exc:  # noqa: BLE001 — degrade, don't crash the cycle
+        from agentics.llm.errors import is_llm_refusal
+
         log.warning("[%s] research llm call failed: %s", ctx.agent_id, exc)
-        if budget is not None:
-            budget.record(ctx.agent_id, "research", False, _time.monotonic() - _t0)
-        llm_error = f"research llm call failed: {exc}"
+        if is_llm_refusal(exc):
+            # never reached the provider — telemetry only, no fail-streak
+            llm_error = f"research llm refused: {exc}"
+            try:
+                ctx.memory.journal(ctx.agent_id, "llm_refused",
+                                   {"purpose": "research", "why": str(exc)[:200]})
+            except Exception:  # noqa: BLE001 — telemetry must never gate harder
+                pass
+        else:
+            if budget is not None:
+                budget.record(ctx.agent_id, "research", False,
+                              _time.monotonic() - _t0)
+            llm_error = f"research llm call failed: {exc}"
     if budget is not None and resp is not None and resp.ok:
         budget.record(ctx.agent_id, "research", True, _time.monotonic() - _t0)
     if resp is None or not resp.ok:
@@ -678,6 +2126,21 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
             ctx, state, topic,
             reason=llm_error or "research llm returned an empty answer",
         )
+    # P18b fan-out: extra complementary angles asked in PARALLEL on other
+    # pool identities (different Hyperbrowser tokens / cookie accounts).
+    # Each angle is budget-gated; the merged answer feeds the same finding
+    # pipeline (deduped citations -> one batched BibTeX grounding call).
+    fanout = max(1, int(getattr(ctx.settings, "research_fanout", 1) or 1))
+    if fanout > 1:
+        extras = await _fanout_angles(ctx, query, fanout - 1, budget)
+        if not extras and getattr(ctx.settings, "research_same_view_angle", True):
+            # Pool too small for parallel views — run the angle on the
+            # agent's own identity, sequentially (solo-lab unblock).
+            extras = await _same_view_angles(ctx, query, fanout - 1, budget)
+        if extras:
+            log.info("[%s] research fan-out merged %d extra angle(s)",
+                     ctx.agent_id, len(extras))
+            resp = _merge_research(resp, extras)
     acc = getattr(ctx.llm, "account", None)
     ctx.meta["account"] = getattr(acc, "name", "none") if acc else "none"
     ctx.meta["research_source"] = "llm"
@@ -693,6 +2156,67 @@ VERIFY_STATUS = {
 }
 
 
+# P24 node wiring — the engine is verify/replication.py (P24bis): it writes
+# BOTH ledgers (record_replication bookkeeping + record_replication_detail
+# provenance), refuses self-replication, and closes a refuted replication
+# the P17 way. The wiring only feeds the P24 selector and reports.
+
+
+async def _replicate_settled(ctx: AgentContext, limit: int = 2) -> list[dict]:
+    """P24 — independent replication of the swarm's settled claims (zero LLM).
+
+    One agent's verdict is not knowledge; an INDEPENDENT re-run by another
+    agent is. Feeds the P24 selector (oldest settled 'supported' claims this
+    agent did NOT author, once-per-swarm bookkeeping, 2-attempt retry
+    budget) into the P24bis engine (`verify.replication.replicate_pending`),
+    which re-runs the stored protocol in THIS agent's own workspace through
+    the full two-run reproducibility gate. Never raises — every failure mode
+    is a journaled, queryable outcome."""
+    if not getattr(ctx.workspace, "sync_main", None):
+        return []
+    from agentics.verify.replication import replicate_pending
+    reports = await asyncio.to_thread(
+        replicate_pending, ctx.memory, ctx.workspace, ctx.agent_id, limit)
+    results: list[dict] = []
+    for report in reports:
+        verdict = report.get("verdict")
+        hyp_id = report.get("hypothesis_id")
+        if verdict is None and hyp_id:
+            # Engine decline (write refused / runner crash / unshareable):
+            # the engine journals the blocked event itself but leaves the
+            # LEDGER untouched — mark the attempt inconclusive here so the
+            # P24 retry budget advances and a dead claim stops looping.
+            # Idempotence declines ("already replicated") keep a non-empty
+            # ledger column and are skipped.
+            row = await asyncio.to_thread(ctx.memory.get_hypothesis, hyp_id)
+            if row is not None and not (row.get("replication") or ""):
+                await asyncio.to_thread(
+                    ctx.memory.record_replication, hyp_id, "inconclusive")
+        claim = ""
+        if hyp_id:
+            hyp = await asyncio.to_thread(ctx.memory.get_hypothesis, hyp_id)
+            claim = (hyp or {}).get("claim", "")
+        results.append({
+            "claim": claim, "status": verdict or "inconclusive",
+            "note": (report.get("note") or "")[:200],
+            "replication": bool(report.get("replicated"))
+                           or verdict == "refuted",
+            "hypothesis_id": hyp_id,
+            "evidence_id": report.get("peer_evidence")
+                           or report.get("evidence_id"),
+        })
+    return results
+
+
+def _replication_summary(rep: list[dict]) -> str:
+    """One digest line for the P24 replication block of a verify cycle."""
+    counts: dict[str, int] = {}
+    for r in rep:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+    return f"P24 replicated {len(rep)} claim(s) [{breakdown}]"
+
+
 async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher (P16bis, H2): verify the finding's claims by RUNNING code.
 
@@ -700,10 +2224,22 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
     (metric/op/target); one self-contained protocol per claim is written into
     experiments/ and executed twice through the guarded workspace runner;
     the verdict is a machine comparison (measured vs criterion) — never an
-    LLM's opinion — and lands in shared evidence + verified knowledge (H3)."""
+    LLM's opinion — and lands in shared evidence + verified knowledge (H3).
+
+    P24: BEFORE any of that, this agent may serve as an independent replica —
+    re-running someone else's settled claim from its stored protocol (zero
+    LLM, needs no fresh finding). A researcher cycle with nothing new to
+    verify still advances the swarm's trust in what it already knows."""
     finding_text = state.get("finding_text") or ""
+    # P24 independent replication first — needs neither finding nor LLM.
+    try:
+        repl = await _replicate_settled(ctx)
+    except Exception:  # noqa: BLE001 — replication must never break verification
+        repl = []
     if not finding_text or ctx.llm is None:
-        state["summary"] = "verification skipped (no finding or no LLM)"
+        state["verifications"] = repl
+        state["summary"] = (_replication_summary(repl) if repl else
+                            "verification skipped (no finding or no LLM)")
         state["done"] = True
         return state
     ctx.report(
@@ -717,17 +2253,11 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             "expected_files": [],
         },
     )
-    prompt = (
-        f"Research finding to verify:\n{finding_text[:3000]}\n\n"
-        "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
-        "self-contained python simulation can check (simulate the method on "
-        "synthetic data, measure the metric). For each claim write its "
-        "protocol.\n\n"
-        f"{PROTOCOL_CONTRACT}\n"
-        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
-        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]}'
-    )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    # .replace, not .format: the contract text embeds literal JSON braces
+    # (AGENTICS_RESULT: {"<metric>": <number>}) that .format would parse
+    # as placeholders.
+    prompt = EXTRACT_CLAIMS_PROMPT.replace("{finding}", finding_text[:3000])
+    answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
     parsed = parse_json_block(answer)
     specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:3]
     if not specs:
@@ -737,6 +2267,7 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
     await asyncio.to_thread(ctx.workspace.sync_main)    # workspace must exist
     results: list[dict] = []
+    harvest_target: tuple | None = None   # (hyp_id, claim, status, measured_txt)
     for spec in specs:
         claim = str(spec.get("claim", "")).strip()[:300]
         criterion, malformed = None, ""
@@ -768,10 +2299,23 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
                             "reused": True, "hypothesis_id": prior["id"],
                             "evidence_id": prior["evidence_id"]})
             continue
+        # DAPS PEM: reject a NEW hypothesis that is a near-clone of one
+        # already in the stream — surface novelty (new wording) must not be
+        # counted as a new discovery (IDEAgent diversity floor, live decay).
+        if not _pem_gate(ctx, claim):
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": "rejected by PEM diversity gate "
+                                    "(near-duplicate of a recent hypothesis)",
+                            "near_duplicate": True})
+            continue
         hyp_id = await asyncio.to_thread(
             ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
             task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
-            status="testing")
+            status="testing", protocol_code=protocol_code[:20000])
+        sig = spec.get("signature")
+        if isinstance(sig, dict) and sig:
+            await asyncio.to_thread(
+                ctx.memory.set_hypothesis_signature, hyp_id, sig)
         path = f"experiments/verify_h{hyp_id}.py"
         try:
             await asyncio.to_thread(ctx.workspace.write_file, path, protocol_code)
@@ -789,6 +2333,24 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             results.append({"claim": claim, "status": "inconclusive",
                             "note": f"runner error: {exc}"[:200]})
             continue
+
+        # P16-R — bounded self-repair (see node_implement): the author sees
+        # the machine failure note and fixes its own protocol once; the
+        # re-adjudication is the same run_protocol, same frozen criterion.
+        def _rerun_verify(fixed_code: str):
+            try:
+                ctx.workspace.write_file(path, fixed_code)
+            except ValueError as exc:
+                return Evidence(
+                    cmd=path, exit_code=126, verdict="inconclusive",
+                    method="protocol", output=f"repair write refused: {exc}",
+                    meta={"note": f"repair write refused: {exc}",
+                          "metrics": {}, "runs": []})
+            return run_protocol(ctx.workspace, path, criterion)
+
+        ev, _fixed = await _repair_protocol_rounds(
+            ctx, state, claim=claim, criterion=criterion, code=protocol_code,
+            ev=ev, rerun=_rerun_verify, what=f"verify:h{hyp_id}", hyp_id=hyp_id)
         ev_id = await asyncio.to_thread(
             ctx.memory.record_evidence, ctx.agent_id, state.get("issue_number"),
             ev.cmd, ev.exit_code, ev.verdict,
@@ -799,6 +2361,17 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
         status = VERIFY_STATUS[ev.verdict]
         note = str(ev.meta.get("note", ""))
+        # Settle anchor law: `supported` needs at least one verdict input
+        # the agent did not author. External inputs here: citation URLs
+        # from the verify ask + the research citations the finding was
+        # grounded in (state), a pinned-hash dataset, P24 replication,
+        # owner approval.
+        status, prov = _settle_law(
+            ctx, hyp_id, claim, status, ev, protocol_code,
+            citations=len(ask_citations) + len(state.get("citations") or []))
+        if status == "unanchored" and ev.verdict == "confirmed":
+            note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                    f"no external anchor]")[:600]
         await asyncio.to_thread(
             ctx.memory.update_hypothesis, hyp_id, status,
             evidence_id=ev_id, note=note, protocol_path=path)
@@ -806,16 +2379,285 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
             {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
              "note": note[:200], "evidence": ev_id,
-             "criterion": criterion.as_dict()},
+             "criterion": criterion.as_dict(),
+             "self_authored_ratio": prov.ratio},
         )
+        # Kosmos world model: the settled fact becomes shared state with
+        # provenance — every next cycle's prompts read it back. An
+        # `unanchored` verdict enters as a provisional `finding`, never as
+        # `verified` (common ground only grows from anchored verdicts).
+        await asyncio.to_thread(
+            ctx.memory.world_add, ctx.agent_id, _world_kind(status),
+            f"{claim[:180]} -> {status}"
+            + (f" ({note[:120]})" if note else ""),
+            source=f"h#{hyp_id}")
         results.append({"claim": claim, "status": status, "note": note,
-                        "hypothesis_id": hyp_id, "evidence_id": ev_id})
+                        "hypothesis_id": hyp_id, "evidence_id": ev_id,
+                        "self_authored_ratio": prov.ratio,
+                        "replication": False})
+        # autoresearch ledger + discovery feedback + Kosmos harvest: the
+        # MAIN verify path used to settle claims silently — no ledger row,
+        # no novelty judgment, no branching. Every settle now feeds the
+        # loop the same way the deep-dive path does (one harvest per cycle:
+        # prefer the first supported settle, then an unanchored one, else
+        # the first refuted). The ledger row carries the verdict's
+        # PROVENANCE (ratio + anchors) next to the verdict.
+        if status in ("supported", "refuted", "unanchored"):
+            measured = ev.meta.get("metrics", {})
+            await asyncio.to_thread(
+                ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
+                metric=criterion.metric,
+                measured=measured.get(criterion.metric), op=criterion.op,
+                target=criterion.target, verdict_note=note[:200],
+                protocol_path=path, source="verify", description=claim[:200],
+                self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
+            if status != "unanchored":
+                await _branch_feedback(ctx, hyp_id, status)
+            measured_txt = (f"{criterion.metric}="
+                            f"{measured.get(criterion.metric)}"
+                            if measured else note[:200])
+            rank = {"supported": 2, "unanchored": 1}.get(status, 0)
+            if harvest_target is None or rank > {
+                    "supported": 2, "unanchored": 1}.get(
+                        harvest_target[2], 0):
+                harvest_target = (hyp_id, claim, status, measured_txt)
+    if harvest_target is not None:
+        await _harvest_insights(ctx, *harvest_target)
+    # P24: the independent-replication block rides along on this cycle too
+    if repl:
+        results = repl + results
+        state["summary"] = (
+            f"P16bis verified {len(results) - len(repl)} claim(s); "
+            + _replication_summary(repl))
+    else:
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
+        state["summary"] = f"P16bis verified {len(results)} claim(s) [{breakdown}]"
     state["verifications"] = results
+    state["done"] = True
+    return state
+
+
+def pending_replication(ctx: AgentContext, limit: int = 1) -> list[dict]:
+    """Settled claims the P24 selector offers ME for independent replication.
+
+    Routing helper — must never crash a cycle (same contract as
+    pending_defense): a read failure simply means "nothing to replicate"."""
+    try:
+        limit = int(limit or 0)
+        if limit <= 0:
+            return []
+        return ctx.memory.hypotheses_needing_replication(ctx.agent_id,
+                                                         limit=limit)
+    except Exception:  # noqa: BLE001 — routing must never crash on a read
+        return []
+
+
+# ---------------------------------------------------------------- tournament
+async def node_tournament(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """Co-Scientist tournament node (ported from Gottweis et al. 2026).
+
+    Runs AFTER the researcher's verify node: the cycle just produced or
+    re-adjudicated hypotheses, so this is the moment to (a) debate a
+    bounded batch of pairs through the Elo tournament, (b) breed the next
+    generation from the top ratings, and (c) every N debates distil the
+    win/loss patterns into a meta-review steering note.
+
+    A QUALITY loop on top of the TRUTH loop: Elo never settles a claim —
+    only P16 exit-code verification does. Every ask passes the P20 budget
+    gate; the whole node is failure-isolated (a tournament outage logs a
+    journal event and the cycle ends normally)."""
+    state["done"] = True
+    settings = getattr(ctx, "settings", None)
+    if settings is None:
+        return state
+    if not bool(getattr(settings, "tournament_enabled", True)):
+        return state
+    if ctx.llm is None:
+        return state
+    n_matches = int(getattr(settings, "tournament_matches_per_cycle", 0) or 0)
+    n_evolve = int(getattr(settings, "evolution_per_cycle", 0) or 0)
+    if n_matches < 1 and n_evolve < 1:
+        return state
+    goal = str(getattr(settings, "research_topic", "") or "")
+    try:
+        from agentics.coscientist import evolution as evo_mod
+        from agentics.coscientist import metareview as meta_mod
+        from agentics.coscientist import tournament as tour_mod
+
+        # Dual-model jury (anti "one model judges everything"): when
+        # configured, attach the independent ChatGPT judge to the context
+        # so every tournament match is debated by BOTH model families in
+        # parallel. Failure-isolated: a missing cookie file or client
+        # outage degrades to the single-jury behaviour with a journal note.
+        if str(getattr(settings, "judge_second_provider", "") or ""
+               ).strip().lower() == "chatgpt":
+            try:
+                from agentics.llm.chatgpt_client import get_judge_client
+                judge = get_judge_client(settings)
+                if judge is not None:
+                    ctx.judge_llm = judge
+            except Exception as exc:  # noqa: BLE001 — judge is optional
+                try:
+                    ctx.memory.journal(ctx.agent_id, "judge_second_unavailable",
+                                       {"error": str(exc)[:200]})
+                except Exception:  # noqa: BLE001
+                    pass
+
+        results: list[dict] = []
+        if n_matches > 0:
+            results = await tour_mod.run_batch(ctx, n_matches, goal)
+        evolved = None
+        if n_evolve > 0:
+            evolved = await evo_mod.evolve_top(
+                ctx, goal,
+                top_k=int(getattr(settings, "evolution_top_k", 3) or 3))
+        if meta_mod.should_synthesize(
+                ctx.memory,
+                int(getattr(settings, "meta_review_window", 4) or 4)):
+            await meta_mod.synthesize_feedback(
+                ctx, goal,
+                int(getattr(settings, "meta_review_window", 4) or 4))
+        parts = []
+        if results:
+            decided = [r for r in results if r.get("winner")]
+            invalid = [r for r in results if r.get("mode") == "invalid"]
+            contested = [r for r in results if r.get("mode") == "contested"]
+            parts.append(f"{len(decided)} debate(s)"
+                         + (f", {len(invalid)} unparseable" if invalid else "")
+                         + (f", {len(contested)} contested" if contested else ""))
+        if evolved:
+            parts.append(f"evolved h#{evolved['hypothesis_id']} "
+                         f"({evolved['strategy']})")
+        state["tournament_summary"] = "; ".join(parts)
+        if parts:
+            state["summary"] = f"tournament: {'; '.join(parts)}"
+    except Exception as exc:  # noqa: BLE001 — the tournament must never kill a cycle
+        try:
+            ctx.memory.journal(ctx.agent_id, "tournament_error",
+                               {"error": str(exc)[:300]})
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("[%s] tournament node degraded: %s", ctx.agent_id, exc)
+    return state
+
+
+async def _repair_protocol_rounds(ctx: AgentContext, state: ResearchState, *,
+                                  claim: str, criterion, code: str, ev,
+                                  rerun, what: str, hyp_id: int | None = None):
+    """P16-R — bounded Reflexion-style self-repair for inconclusive protocols.
+
+    The machine verdict (exit codes, metric parsing, reproducibility gate)
+    was always correct; the lab's weak spot was that a self-written protocol
+    breaking the AGENTICS_RESULT contract settled as `inconclusive` and the
+    failure output was discarded. Here the author reads its own failure note
+    and rewrites the protocol (criterion stays FROZEN — no goalpost move),
+    then the SAME machine adjudication re-runs. Bounded by
+    VERIFY_PROTOCOL_REPAIR_ROUNDS (default 1, 0=off); every round is
+    journalled with the before/after verdicts. Returns (final_evidence,
+    final_code); when the stored hypothesis id is known, the stored protocol
+    source is refreshed so P23/P24 replay the SETTLED file, not the draft.
+
+    `rerun(fixed_code) -> Evidence` is the call-site's own runner (the
+    hypothesis-contract path re-writes hyp.code; the verify path re-writes
+    the protocol file) — one adjudication core, two persistence shapes."""
+    from agentics.verify.repair import build_repair_prompt, extract_fixed_code
+
+    rounds = int(getattr(getattr(ctx, "settings", None),
+                         "verify_protocol_repair_rounds", 1) or 0)
+    if rounds < 1 or ev.verdict != "inconclusive" or \
+            getattr(ctx, "llm", None) is None:
+        return ev, code
+    for rnd in range(1, rounds + 1):
+        prompt = build_repair_prompt(claim, criterion, code, ev)
+        answer, _ = await _llm_ask(ctx, prompt, mode="concise",
+                                   purpose="repair", state=state)
+        fixed = extract_fixed_code(answer, code)
+        if fixed is None:
+            try:
+                ctx.memory.journal(ctx.agent_id, "p16_protocol_repair", {
+                    "what": what, "round": rnd, "outcome": "no_usable_fix",
+                    "verdict": ev.verdict})
+            except Exception:  # noqa: BLE001
+                pass
+            break
+        ev2 = await asyncio.to_thread(rerun, fixed)
+        note = ""
+        if isinstance(getattr(ev2, "meta", None), dict):
+            note = str(ev2.meta.get("note") or "")
+        try:
+            ctx.memory.journal(ctx.agent_id, "p16_protocol_repair", {
+                "what": what, "round": rnd,
+                "verdict_before": ev.verdict, "verdict_after": ev2.verdict,
+                "note": note[:200]})
+        except Exception:  # noqa: BLE001
+            pass
+        ev, code = ev2, fixed
+        if ev.verdict != "inconclusive":
+            break
+    if hyp_id is not None and code != "":
+        try:
+            ctx.memory.update_hypothesis_protocol_code(hyp_id, code)
+        except Exception:  # noqa: BLE001 — replay bookkeeping must never gate
+            pass
+    return ev, code
+
+
+async def node_replicate(ctx: AgentContext, state: ResearchState) -> ResearchState:
+    """Reviewer (P24bis): replicate a settled claim INDEPENDENTLY.
+
+    The swarm's common knowledge used to rest on ONE agent's protocol run —
+    the dedup gate made every other agent REUSE it, so a buggy or gaming
+    protocol poisoned verified_knowledge forever. This node gives the swarm
+    the scientific fix: a peer rebuilds the shareable protocol in its own
+    workspace (no LLM involved), runs the two-run reproducibility gate, and
+    the machine verdict is written to BOTH ledgers (P24 bookkeeping +
+    provenance detail) and broadcast (H3). A refuted replication closes the
+    ledger the P17 way: evidence re-verdicted, hypothesis downgraded; an
+    inconclusive one never refutes (P17 asymmetry) and the P24 retry budget
+    keeps the claim available for another peer."""
+    limit = int(getattr(ctx.settings, "replication_limit", 1) or 0)
+    if limit <= 0:
+        state["summary"] = "replication disabled (REPLICATION_LIMIT=0)"
+        state["done"] = True
+        return state
+    candidates = pending_replication(ctx, limit=limit)
+    if not candidates:
+        state["summary"] = "no claim awaiting independent replication"
+        state["done"] = True
+        return state
+    ctx.report(
+        node="replicate",
+        intent={
+            "goal": (f"Independently replicate {len(candidates)} settled "
+                     "claim(s) from their stored protocols"),
+            "why": ("P24bis: a supported claim must survive a DIFFERENT "
+                    "agent's re-run, not just its author's"),
+            "steps": ["pick oldest unreplicated claim", "rebuild protocol in "
+                      "my workspace", "run the 2-run gate", "record both "
+                      "ledgers + broadcast"],
+            "expected_files": [],
+        },
+    )
+    from agentics.verify.replication import replicate_pending
+    # the peer's workspace must be a real clone BEFORE the engine writes the
+    # protocol into it — write_file creates directories eagerly, and a
+    # later sync_main would then refuse to clone into the non-empty dir
+    # (the local_mode_demo caught exactly this ordering bug).
+    await asyncio.to_thread(ctx.workspace.sync_main)
+    reports = await asyncio.to_thread(
+        replicate_pending, ctx.memory, ctx.workspace, ctx.agent_id,
+        limit=limit)
     counts: dict[str, int] = {}
-    for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    for r in reports:
+        v = r.get("verdict") or ("skipped" if not r.get("replicated") else "?")
+        counts[v] = counts.get(v, 0) + 1
     breakdown = ", ".join(f"{s}:{n}" for s, n in sorted(counts.items()))
-    state["summary"] = f"P16bis verified {len(results)} claim(s) [{breakdown}]"
+    state["replication_verdict"] = breakdown
+    state["summary"] = (f"P24bis replicated {len(reports)} claim(s) "
+                        f"[{breakdown}]")
     state["done"] = True
     return state
 
@@ -833,9 +2675,10 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         ctx.memory, f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}")
     # v2 memory loops: the planner sees its OWN relevant lessons (personal
     # memory) and the swarm's RELATED stored findings (vector recall) — both
-    # bounded, both defensive, both empty at cold start.
+    # bounded, both defensive, both empty at cold start. v3: lessons recorded
+    # on this very issue rank first (the retry/rework finds its own history).
     _query = f"{state.get('issue_title', '')} {state.get('issue_body', '')[:200]}"
-    lessons_txt = _lessons_text(ctx, _query)
+    lessons_txt = _lessons_text(ctx, _query, issue=state.get("issue_number"))
     recall_txt = finding_recall_text(ctx, _query)
     personal_rule = (
         f"\nYour own lessons from past cycles (personal memory — never repeat "
@@ -854,6 +2697,25 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                       f"your plan must be consistent with these and your verify_cmds "
                       f"must check the NEW claims):\n{knowledge_txt}\n"
                       if knowledge_txt else "")
+    # Kosmos world model: the plan advances the swarm's CURRENT state — open
+    # gaps and verified facts steer the approach, refuted ones block it.
+    world_txt = _world_model_text(ctx)
+    world_rule = (
+        f"\nWorld model (the swarm's current structured state — plan must "
+        f"build on VERIFIED facts, close a GAP, never re-assert REFUTED):\n"
+        f"{world_txt}\n"
+        if world_txt else ""
+    )
+    # A2X swarm lessons: OTHER agents' failures aggregated into signatures —
+    # (xN) means the approach was tried N times by DIFFERENT agents and never
+    # worked (Voyager lesson loop / Reflexion, at swarm scale).
+    swarm_txt = swarm_lessons(ctx.memory, category, exclude_agent=ctx.agent_id)
+    swarm_rule = (
+        f"\nSwarm-wide failure patterns in this category (aggregated over ALL "
+        f"agents' failed/rejected attempts — (xN) repeats mean it NEVER worked; "
+        f"choose a different approach):\n{swarm_txt}\n"
+        if swarm_txt else ""
+    )
     evolution_rule = (
         "\nThis is a SELF-EVOLUTION issue: you may ONLY change these paths: "
         + ", ".join(EVOLUTION_ALLOWED_PATHS) + ".\n"
@@ -874,11 +2736,29 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{personal_rule}{recall_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
+        f"{tools_txt}\n{personal_rule}{recall_rule}{swarm_rule}{evolution_rule}{rework_rule}{knowledge_rule}{world_rule}\n"
         f"{PLAN_INSTRUCTION}"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
     parsed = parse_json_block(answer)
+    if not parsed and not state.get("error"):
+        # One strict retry: the live model occasionally answers in prose or
+        # wraps the object in commentary (a real live run lost its plan this
+        # way). Provider-level failures (state error set) do NOT retry — a
+        # cooling-down cookie needs time, not another immediate ask.
+        retry_answer, _ = await _llm_ask(
+            ctx,
+            prompt + "\n\nIMPORTANT: your previous reply was not one JSON "
+            "object. Reply AGAIN with ONLY the JSON object — no prose, no "
+            "markdown fence, nothing else.",
+            mode="concise", purpose="plan", state=state)
+        parsed = parse_json_block(retry_answer)
+        if parsed:
+            try:
+                ctx.memory.journal(ctx.agent_id, "plan_retry_recovered",
+                                   {"task": state.get("issue_number")})
+            except Exception:  # noqa: BLE001 — telemetry must never gate
+                pass
     if not parsed:
         state["error"] = state.get("error") or "plan parsing failed"
         state["done"] = True
@@ -886,7 +2766,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # The model proposed the plan (approach-first, extras of its own naming);
     # normalize_plan extracts just the machine contract the lab consumes.
     core = normalize_plan(parsed)
-    state["plan"] = json.dumps(core.parsed, ensure_ascii=False)[:8000]
+    state["plan"] = plan_state_json(core)
     state["commit_message"] = core.commit_message
     state["verify_cmds"] = core.verify_cmds
     state["hypotheses"] = core.hypotheses
@@ -894,7 +2774,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     state["expected_files"] = core.expected_files
     state["plan_approach"] = core.approach
     if core.extras:
-        state["plan_extras"] = json.dumps(core.extras, ensure_ascii=False)[:2000]
+        state["plan_extras"] = extras_state_json(core.extras)
     for name in core.reuses:
         ctx.memory.bump_tool_use(name)      # no-op if the name is not registered
     ctx.report(
@@ -989,6 +2869,47 @@ def normalize_verify_cmds(cmds: list) -> list[list[str]]:
     return out[:5]
 
 
+def _implement_brief(state: ResearchState, plan: dict) -> str:
+    """The planner's OWN words, carried into every per-file implement ask.
+
+    The per-file prompt used to be a fixed minimal template: the implementer
+    wrote code without knowing why the plan exists or what will judge it.
+    Now the prompt is conditioned on the model's own proposal — the declared
+    approach, the P16 checks that will run against the code and the
+    pre-registered hypotheses — everything the planner itself wrote, bounded
+    by defensive caps. An empty brief (a minimal/legacy plan) reproduces the
+    old prompt byte for byte."""
+    parts: list[str] = []
+    approach = str(state.get("plan_approach")
+                   or plan.get("approach") or "").strip()
+    if approach:
+        parts.append(
+            "Your declared approach (from your own plan — follow it):\n"
+            + approach[:700])
+    cmds = [str(c) for c in (plan.get("verify_cmds") or [])
+            if str(c).strip()][:5]
+    if cmds:
+        parts.append(
+            "These checks WILL run against this code (P16 — the verdict "
+            "comes from their exit codes, so make them pass by doing the "
+            "real work, never by faking output):\n"
+            + "\n".join(f"- {c[:160]}" for c in cmds))
+    hyps = [h for h in (plan.get("hypotheses") or [])
+            if isinstance(h, dict)][:2]
+    if hyps:
+        lines = []
+        for h in hyps:
+            claim = str(h.get("claim", ""))[:200]
+            pred = str(h.get("prediction", ""))[:200]
+            lines.append(f"- claim: {claim}"
+                         + (f" | predicted: {pred}" if pred else ""))
+        parts.append(
+            "Hypotheses the lab will measure on this code (P16 protocol — "
+            "pre-registered criteria, run twice and re-adjudicated):\n"
+            + "\n".join(lines))
+    return ("\n\n".join(parts) + "\n\n") if parts else ""
+
+
 async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Coder: write code from plan into a local branch, run tests, push (P2/P3/P10)."""
     branch = state["branch"]
@@ -999,7 +2920,16 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
     else:
         await asyncio.to_thread(ctx.workspace.checkout_new_branch, branch)
 
-    plan = json.loads(state.get("plan") or "{}")
+    try:
+        plan = json.loads(state.get("plan") or "{}")
+    except json.JSONDecodeError:
+        state["error"] = "plan state is not valid JSON (corrupted dump)"
+        state["done"] = True
+        return state
+    # The implement prompt is conditioned on the model's OWN proposal, not a
+    # fixed template: every per-file ask carries the approach the planner
+    # declared and the P16 checks/hypotheses that will judge the code.
+    brief = _implement_brief(state, plan)
     for spec in plan.get("files", []):
         if state.get("error"):           # LLM died mid-plan: push nothing
             state["done"] = True
@@ -1015,6 +2945,10 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         prompt = (
             f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
+            f"{brief}"
+            # Wave-2 #1: compounding skills — verified approaches for this
+            # kind of task, distilled from the lab's own settled protocols.
+            f"{skills_block(ctx.memory, state.get('issue_title', ''))}\n\n"
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
@@ -1196,9 +3130,25 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             hyp_id = await asyncio.to_thread(
                 register_hypothesis, ctx.memory, ctx.agent_id, hyp)
             ev = await asyncio.to_thread(run_hypothesis, ctx.workspace, hyp)
+
+            # P16-R — bounded self-repair: an inconclusive protocol feeds its
+            # OWN failure note back to the author, which rewrites the script
+            # once (criterion frozen), and the SAME machine adjudication
+            # re-runs. The settled verdict still comes from exit codes and
+            # measured metrics — repair fixes the script, never the verdict.
+            def _rerun_contract(fixed_code: str):
+                hyp.code = fixed_code            # run_hypothesis re-writes it
+                return run_hypothesis(ctx.workspace, hyp)
+
+            ev, _final_code = await _repair_protocol_rounds(
+                ctx, state, claim=hyp.claim, criterion=hyp.criterion,
+                code=hyp.code, ev=ev, rerun=_rerun_contract,
+                what=f"implement:{hyp.hypothesis_id}", hyp_id=hyp_id)
             await asyncio.to_thread(
                 settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
-                method="hypothesis_contract")
+                method="hypothesis_contract",
+                require_anchor=bool(getattr(ctx.settings,
+                                            "settle_require_anchor", True)))
             # the protocol file rides the branch — the MR record must list it,
             # or the reviewer sees a diff file the record does not explain
             # (the protocol IS the evidence's source code)
@@ -1534,9 +3484,23 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                            + "\n".join(ev_lines))
                 if rerun_note:
                     ev_desc += f"\n\nReviewer's own re-runs: {rerun_note}"
+            # A2X dossier: the reviewer inherits the task's FULL history —
+            # earlier attempts and prior objections (the communication bridge:
+            # the verifier must know what already failed on this task).
+            dossier_txt = ""
+            try:
+                dossier_txt = review_dossier(
+                    ctx.memory, candidate.get("task_id"), mr_id=mr_id)
+            except Exception:  # noqa: BLE001 — a dossier read must never kill the review
+                dossier_txt = ""
+            dossier_desc = (
+                f"\n\nTask history (earlier attempts and prior objections — check "
+                f"this MR does not repeat a known-failed approach):\n{dossier_txt}"
+                if dossier_txt else ""
+            )
             prompt = (
                 f"Review MR #{mr_id}: {candidate['title']}\n{candidate.get('body') or ''}\n\n"
-                f"Files:\n{files_desc}\n\n"
+                f"Files:\n{files_desc}\n{dossier_desc}\n\n"
                 f"Verification recorded by the author: {candidate.get('verification') or '(none)'}"
                 f"{ev_desc}\n\n"
                 + ("Mechanical check: tier-2 tests PASSED on main+MR (you ran them "

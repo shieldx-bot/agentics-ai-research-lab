@@ -6,6 +6,7 @@ All tests are offline — no session is created (sessions only spawn inside
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,10 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
     ]))
     s = Settings()
     s.accounts_dir = acc
+    # Same isolation as test_session_host: the machine's .env/lab.yaml may
+    # run the lab on the hyperbrowser backend, but these unit tests assert
+    # raw-socket behaviour unless a case explicitly overrides it.
+    s.browser_backend = overrides.pop("browser_backend", "local")
     for k, v in overrides.items():
         setattr(s, k, v)
     return s
@@ -240,3 +245,305 @@ def test_provider_ui_outage_does_not_cool_down_cookie_account(tmp_path, monkeypa
         asyncio_run(host.ask("test", purpose="research"))
     assert calls == []
     assert not pool.health[account.name].in_cooldown()
+
+
+# ------------------------------------------------------ composer self-recovery
+def test_composer_recovers_after_one_reload(tmp_path, monkeypatch):
+    """A slow SPA hydration must not open the shared circuit breaker: one
+    in-place reload + re-wait heals the transient miss (2026-11-12 incident
+    class: composer TimeoutError killed the whole swarm's availability)."""
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path, hb_input_timeout=5),
+    )
+
+    class FlakyComposer:
+        def __init__(self):
+            self.calls = 0
+
+        def locator(self, _selector):
+            locator = self
+
+            class Locator:
+                @property
+                def first(self):
+                    return self
+
+                async def wait_for(self, **_kwargs):
+                    locator.calls += 1
+                    if locator.calls == 1:
+                        raise TimeoutError("not hydrated yet")
+
+            return Locator()
+
+    client._page = FlakyComposer()
+    reloads = []
+
+    async def fake_goto_home():
+        reloads.append(1)
+
+    monkeypatch.setattr(client, "_goto_home", fake_goto_home)
+    box = asyncio_run(client._wait_for_composer())
+    assert box is not None
+    assert len(reloads) == 1
+    assert hb._BACKEND_COOLDOWN_UNTIL == 0.0      # no circuit opened
+
+
+def test_composer_failure_after_reload_still_classifies(tmp_path, monkeypatch):
+    """Recovery is one-shot: a page that fails twice still reaches the
+    predecessor's diagnostics (challenge -> backend circuit, sign-in -> auth
+    error, generic miss -> UI error)."""
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path, hb_input_timeout=5),
+    )
+
+    class MissingComposer:
+        def locator(self, _selector):
+            class Locator:
+                @property
+                def first(self):
+                    return self
+
+                async def wait_for(self, **_kwargs):
+                    raise TimeoutError("no composer")
+            return Locator()
+
+    client._page = MissingComposer()
+
+    async def diagnostics():
+        return {"url": "u", "title": "t", "body": "some text"}
+
+    async def failing_goto_home():
+        raise TimeoutError("reload also failed")
+
+    monkeypatch.setattr(client, "_page_diagnostics", diagnostics)
+    monkeypatch.setattr(client, "_goto_home", failing_goto_home)
+    with pytest.raises(hb.HyperbrowserUIError):
+        asyncio_run(client._wait_for_composer())
+    assert hb._BACKEND_COOLDOWN_UNTIL > 0
+
+
+# ------------------------------------------------------------ empty-answer guard
+def test_ask_raises_ui_error_on_silent_empty_answer(tmp_path, monkeypatch):
+    """A submit that silently produces NO answer must raise a UI outage, not
+    return LLMResponse(answer='') that crashes node_plan's json.loads."""
+    import agentics.llm.hyperbrowser_client as hb
+
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(hb, "_BACKEND_COOLDOWN_REASON", "")
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path),
+    )
+
+    async def ok(*_args, **_kwargs):
+        return None
+
+    async def empty_answer():
+        return ("", [])
+
+    monkeypatch.setattr(client, "_ensure_session", ok)
+    monkeypatch.setattr(client, "_goto_home", ok)
+    monkeypatch.setattr(client, "_submit", ok)
+    monkeypatch.setattr(client, "_collect_answer", empty_answer)
+    torn_down = []
+
+    async def fake_teardown():
+        torn_down.append(1)
+
+    monkeypatch.setattr(client, "_teardown", fake_teardown)
+    with pytest.raises(hb.HyperbrowserUIError, match="no answer text"):
+        asyncio_run(client.ask("hello"))
+    assert torn_down == [1]           # session rebuilt on the next ask
+
+
+# ------------------------------------------------- orphan session sweep
+class _FakeSessions:
+    """sessions.create/list/stop fake — records every call."""
+
+    def __init__(self, create_error=None, active_ids=(), stop_ok=True):
+        self.create_error = create_error
+        self.active_ids = list(active_ids)
+        self.stop_ok = stop_ok
+        self.created = 0
+        self.stopped: list[str] = []
+
+    def create(self, _params):
+        self.created += 1
+        if self.create_error is not None and self.created <= 1:
+            raise self.create_error
+
+        class _S:
+            id = f"s{self.created}"
+            ws_endpoint = "wss://cdp"
+        return _S()
+
+    def list(self, _params):
+        ids = list(self.active_ids)   # bind before the nested class (its
+        class _R:                     # self would be _R, not the fake)
+            def model_dump(self):     # their helper reads model_dump()
+                return {"sessions": [{"id": sid, "status": "active"}
+                                     for sid in ids]}
+        return _R()
+
+    def stop(self, sid):
+        if not self.stop_ok:
+            raise RuntimeError("already stopped")
+        self.stopped.append(sid)
+
+
+def _client_with(tmp_path, sessions, monkeypatch):
+    """A client whose Hyperbrowser SDK constructor returns the fake."""
+    import agentics.llm.hyperbrowser_client as hb
+    import hyperbrowser as hb_sdk
+
+    fake_hb = type("HB", (), {"sessions": sessions})()
+    # _ensure_session does `from hyperbrowser import Hyperbrowser` at call
+    # time, so the SDK module itself must be patched.
+    monkeypatch.setattr(hb_sdk, "Hyperbrowser", lambda api_key=None: fake_hb)
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]),
+        _settings(tmp_path, browser_backend="hyperbrowser",
+                  hyperbrowser_api_key="hb_x"),
+    )
+    hb._ACTIVE_BY_KEY.pop(client.api_key, None)
+    return client
+
+
+def _stop_at_playwright(monkeypatch):
+    """_ensure_session builds the CDP connection after create — stop there."""
+    import playwright.async_api as papi
+
+    class _NoPW:
+        async def start(self):
+            raise RuntimeError("stop at playwright")
+
+    monkeypatch.setattr(papi, "async_playwright", lambda: _NoPW())
+
+
+def test_ensure_session_sweeps_orphans_and_retries(tmp_path, monkeypatch):
+    """The live incident: a killed process leaves its session running; the
+    token's single slot is busy; create fails with 'Maximum number of
+    active sessions (1) reached'. The client sweeps and retries ONCE."""
+    _stop_at_playwright(monkeypatch)
+    fake = _FakeSessions(
+        create_error=RuntimeError(
+            "Maximum number of active sessions (1) reached. Please close "
+            "some sessions before creating new ones."),
+        active_ids=("orphan-1", "orphan-2"),
+    )
+    client = _client_with(tmp_path, fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="stop at playwright"):
+        asyncio_run(client._ensure_session())
+    assert fake.created == 2                       # create -> sweep -> retry
+    # the sweep stops exactly the two orphans; the later teardown also stops
+    # the freshly created session, so only the first two entries matter
+    assert fake.stopped[:2] == ["orphan-1", "orphan-2"]
+
+
+def test_ensure_session_only_sweeps_on_the_session_cap_error(tmp_path, monkeypatch):
+    fake = _FakeSessions(create_error=RuntimeError("quota exhausted"))
+    client = _client_with(tmp_path, fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="quota"):
+        asyncio_run(client._ensure_session())
+    assert fake.created == 1 and fake.stopped == []
+
+
+def test_ensure_session_retries_even_when_the_sweep_frees_nothing(tmp_path, monkeypatch):
+    """Their loop always retries once after the sweep — even when the server
+    lists no active sessions (a stop may still be propagating)."""
+    _stop_at_playwright(monkeypatch)
+    fake = _FakeSessions(
+        create_error=RuntimeError("Maximum number of active sessions (1) reached."),
+        active_ids=(),                                # server lists nothing
+    )
+    client = _client_with(tmp_path, fake, monkeypatch)
+    with pytest.raises(RuntimeError, match="stop at playwright"):
+        asyncio_run(client._ensure_session())
+    assert fake.created == 2                      # retried once regardless
+
+
+def test_sweep_tolerates_a_failing_stop(tmp_path, monkeypatch):
+    fake = _FakeSessions(stop_ok=False, active_ids=("ghost",))
+    client = _client_with(tmp_path, fake, monkeypatch)
+    assert asyncio_run(client._stop_leaked_sessions()) is None  # never raises
+    assert fake.stopped == []
+
+
+# ------------------------------------------------- proactive session recycle
+def test_ensure_session_recycles_an_aged_session(tmp_path, monkeypatch):
+    """Free-plan sessions die at a hard ~10-min duration cap — mid-ask, all
+    at once (live 2026-11-13: six sessions aged 9m37s-10m06s died inside one
+    30s window, wrecking every in-flight call). An aged session must be
+    recycled BETWEEN asks, while healthy, instead of waiting for the cap."""
+    _stop_at_playwright(monkeypatch)
+    fake = _FakeSessions()
+    client = _client_with(tmp_path, fake, monkeypatch)
+    client._recycle_s = 100.0
+    client._page = object()                            # looks healthy...
+    client._session_id = "s-old"
+    client._session_started = time.monotonic() - 101   # ...but is past the guard
+    torn = []
+
+    async def fake_teardown():
+        torn.append(1)
+
+    monkeypatch.setattr(client, "_teardown", fake_teardown)
+    with pytest.raises(RuntimeError, match="stop at playwright"):
+        asyncio_run(client._ensure_session())          # fell through to create
+    assert torn == [1, 1]                         # recycle teardown + playwright-fail teardown
+    assert fake.created == 1
+    assert client._session_id == "s1"                  # a FRESH session id
+
+
+def test_ensure_session_keeps_a_young_session(tmp_path, monkeypatch):
+    fake = _FakeSessions()
+    client = _client_with(tmp_path, fake, monkeypatch)
+    client._recycle_s = 100.0
+    client._page = object()
+    client._session_id = "s-young"
+    client._session_started = time.monotonic() - 10
+    asyncio_run(client._ensure_session())
+    assert fake.created == 0 and client._session_id == "s-young"
+
+
+def test_recycle_disabled_keeps_any_session(tmp_path, monkeypatch):
+    """HB_SESSION_RECYCLE_S=0 must restore the legacy never-recycle behavior."""
+    fake = _FakeSessions()
+    client = _client_with(tmp_path, fake, monkeypatch)
+    client._recycle_s = 0.0
+    client._page = object()
+    client._session_id = "s-old"
+    client._session_started = time.monotonic() - 10_000
+    asyncio_run(client._ensure_session())
+    assert fake.created == 0 and client._session_id == "s-old"
+
+
+def test_recycle_threshold_is_jittered_per_client(tmp_path):
+    """A swarm recycling in sync would 429-storm the rebuild path (the very
+    burst under test) — the per-client threshold must spread around the
+    configured base."""
+    s = _settings(tmp_path, hb_session_recycle_s=480)
+    seen = {
+        HyperbrowserClient(
+            CookieAccount(name="account-01", cookies=[]), s)._recycle_s
+        for _ in range(20)
+    }
+    assert all(432.0 <= v <= 552.0 for v in seen)
+    assert len(seen) > 1                          # actually jittered
+
+
+def test_recycle_guard_disabled_via_settings(tmp_path):
+    s = _settings(tmp_path, hb_session_recycle_s=0)
+    client = HyperbrowserClient(
+        CookieAccount(name="account-01", cookies=[]), s)
+    assert client._recycle_s == 0.0

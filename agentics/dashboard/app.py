@@ -65,6 +65,13 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             "counts": memory.hypothesis_counts(),
             "recent": memory.list_hypotheses(limit=12),
         },
+        # P24bis — independent replication: who re-ran whose claim, machine
+        # verdict, measured metrics. The ledger counts follow the canonical
+        # hypotheses.replication column.
+        "replications": {
+            "counts": memory.replication_counts(),
+            "recent": memory.recent_replications(limit=12),
+        },
         # P21 — immutable trail (compliance) + P20 budget dial: how much of
         # the shared LLM pool the swarm has burned this hour.
         "audit": {"total": memory.audit_count(),
@@ -73,13 +80,28 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             "calls_last_hour": memory.llm_calls_in_window(3600.0),
             "cap_per_hour": settings.llm_max_calls_per_hour,
         },
+        # C4 (TTT_DISCOVER.md) — the discovery objective: best continuous
+        # reward among anchored-supported settles (r_sota) + the newest
+        # record-setting events, the analogue of the paper's Figure 1 curve.
+        "discovery": {
+            "best_reward": round(memory.best_reward(), 4),
+            "sota_events": [
+                e for e in memory.recent_journal(limit=200)
+                if e.get("event") == "new_state_of_the_art"][:8],
+            "qd_cells": len(memory.qd_cells_list(limit=400)),
+        },
         "alerts": [
             e for e in memory.recent_journal(limit=120)
             if e.get("event") in ("integrity_drift", "scope_violation",
                                   "lock_conflict", "task_repair",
                                   "merge_failed", "p16_inconclusive",
                                   "p16_hypothesis_invalid",
-                                  "panel_rejected", "panel_sweep")
+                                  "panel_rejected", "panel_sweep",
+                                  # P23: the swarm's knowledge disagrees
+                                  # with itself, or a settled claim drifted
+                                  "claim_contradiction", "claim_falsified",
+                                  "claim_overturned", "claim_unstable",
+                                  "claim_replay_blocked")
         ][:12],
         "memory": memory.memory_stats(),
         "activity": memory.recent_journal(limit=40),
@@ -173,7 +195,10 @@ _HTML = """<!doctype html>
     <table id="evidence" style="margin-top:8px"><thead><tr><th>ID</th><th>Task</th><th>Agent</th><th>Verdict</th><th>Lệnh kiểm chứng</th><th>Exit</th></tr></thead><tbody></tbody></table></div>
   <div class="card" style="grid-column:1/-1"><h2>Giả thuyết đã đăng ký (P16bis — tiêu chí chốt TRƯỚC khi chạy, máy chấm sau khi đo)</h2>
     <div class="kv" id="hypcounts"></div>
-    <table id="hypotheses" style="margin-top:8px"><thead><tr><th>ID</th><th>Trạng thái</th><th>Giả thuyết</th><th>Tiêu chí</th><th>Đo được</th></tr></thead><tbody></tbody></table></div>
+    <table id="hypotheses" style="margin-top:8px"><thead><tr><th>ID</th><th>Trạng thái</th><th>Giả thuyết</th><th>Tiêu chí</th><th>Đo được</th><th>Lặp lại độc lập</th></tr></thead><tbody></tbody></table></div>
+  <div class="card" style="grid-column:1/-1"><h2>Lặp lại độc lập (P24bis — agent KHÁC tác giả chạy lại protocol, máy chấm, phát sóng cho cả đàn)</h2>
+    <div class="kv" id="repcounts"></div>
+    <table id="replications" style="margin-top:8px"><thead><tr><th>ID</th><th>H#</th><th>Agent lặp lại</th><th>Kết quả</th><th>Đo được</th><th>Thời gian (s)</th></tr></thead><tbody></tbody></table></div>
   <div class="card"><h2>Cảnh báo hệ thống (guard P10/P13/P14 · sửa chữa task · P16 nghi ngờ)</h2>
     <div class="acts" id="alerts"></div></div>
   <div class="card"><h2>Bộ nhớ (trí nhớ chung)</h2>
@@ -255,11 +280,26 @@ function render(s){
     const c = h.criterion || {};
     const crit = c.metric ? `${esc(c.metric)} ${esc(c.op)} ${c.target}` : '-';
     const measured = (h.verdict_note||'').replace(/^measured /,'');
+    const rep = h.replication || '';
     return `<tr><td>#${h.id}</td>
     <td><span class="pill ${h.status==='supported'?'merged':h.status==='refuted'?'failed':h.status==='proposed'?'open':'claimed'}">${esc(h.status)}</span></td>
     <td class="dt">${esc(h.claim)}</td><td class="dt">${crit}</td>
-    <td class="dt">${esc(measured||'-')}</td></tr>`;}).join("")
-    || '<tr><td colspan="5" class="kv">trống</td></tr>';
+    <td class="dt">${esc(measured||'-')}</td>
+    <td>${rep?`<span class="pill ${rep==='confirmed'?'merged':rep==='refuted'?'failed':'claimed'}">${esc(rep)}</span>`:'<span class="kv">chưa</span>'}</td></tr>`;}).join("")
+    || '<tr><td colspan="6" class="kv">trống</td></tr>';
+  const rep = s.replications || {counts:{}, recent:[]};
+  const rc = rep.counts || {};
+  document.getElementById("repcounts").innerHTML =
+    `<span class="pill merged">đã lặp lại: <b>${rc.replicated??0}</b></span> ` +
+    `<span class="pill failed">bị bác bỏ bởi peer: <b>${rc.refuted??0}</b></span> ` +
+    `<span class="pill claimed">đang chờ peer: <b>${rc.pending??0}</b></span>`;
+  document.querySelector("#replications tbody").innerHTML = (rep.recent||[]).map(r=>{
+    const m = r.measured && Object.keys(r.measured).length
+      ? JSON.stringify(r.measured) : '-';
+    return `<tr><td>#${r.id}</td><td>h#${r.hypothesis_id}</td><td>${esc(r.replicator)}</td>
+    <td><span class="pill ${r.verdict==='confirmed'?'merged':r.verdict==='refuted'?'failed':'claimed'}">${esc(r.verdict)}</span></td>
+    <td class="dt">${esc(m)}</td><td>${Number(r.duration_s).toFixed(1)}</td></tr>`;}).join("")
+    || '<tr><td colspan="6" class="kv">chưa có lần lặp lại độc lập nào — reviewer sẽ chạy lại claim cổ nhất còn thiếu peer (P24bis)</td></tr>';
   const alerts = s.alerts||[];
   document.getElementById("alerts").innerHTML = alerts.length
     ? alerts.slice().reverse().map(e=>`
@@ -324,6 +364,29 @@ def create_app(memory: SharedMemory, settings: Settings):
             return JSONResponse(_state(memory, settings))
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.get("/health")
+    def health():
+        """Liveness probe for external monitoring (uptime check, k8s probe,
+        systemd watchdog). Cheap by design — never builds the full state:
+        answers 'is the dashboard alive AND can it read shared memory', plus
+        a heartbeat age so stale swarms page before they break."""
+        import time as _time
+        try:
+            agents = memory.active_agents(stale_after_s=300)
+            fresh = memory.recent_journal(limit=1)
+            return JSONResponse({
+                "status": "ok",
+                "db": "ok",
+                "active_agents": len(agents),
+                "last_heartbeat_age_s": (int(_time.time() - agents[0]["last_ts"])
+                                         if agents else None),
+                "last_event_age_s": (int(_time.time() - fresh[0]["ts"])
+                                      if fresh else None),
+            })
+        except Exception as exc:  # noqa: BLE001 — probe must answer honestly
+            return JSONResponse({"status": "degraded", "db": "error",
+                                 "error": str(exc)}, status_code=503)
 
     @app.post("/stop")
     def stop():

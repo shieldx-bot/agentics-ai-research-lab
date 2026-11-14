@@ -164,12 +164,17 @@ def show(mem: SharedMemory, title: str) -> None:
 
 
 async def main() -> None:
+    global TOPIC
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="keep the demo data dir")
+    ap.add_argument("--topic", default=TOPIC,
+                    help="research topic for the demo (default: the built-in NFV one)")
     args = ap.parse_args()
+    TOPIC = args.topic
 
     root = Path(tempfile.mkdtemp(prefix="agentics-demo-"))
     print(f"demo sandbox: {root}")
+    print(f"demo topic: {TOPIC}")
     settings = Settings(data_dir=root / "data", research_topic=TOPIC,
                         evolution_every_n_cycles=0)
     settings.ensure_dirs()
@@ -213,8 +218,9 @@ async def main() -> None:
                            local, ownership)
     reviewer = build_context("a07", Role.REVIEWER, settings, mem,
                              supervisor.vector, local, ownership)
-    # P19: an MR is judged by a PANEL (default size 2), not one reviewer —
-    # a second peer completes each panel's quorum.
+    # P19 needs a PANEL: quorum accept votes (default 2) from DIFFERENT
+    # agents, and P24bis spends a reviewer cycle on replication first — one
+    # lone reviewer can never reach quorum, so the demo fields two.
     reviewer2 = build_context("a08", Role.REVIEWER, settings, mem,
                               supervisor.vector, local, ownership)
     integrator = build_context("a09", Role.INTEGRATOR, settings, mem,
@@ -262,15 +268,12 @@ async def main() -> None:
     await run_cycle(writer)
     show(mem, "after writer cycle")
 
-    # 6) the P19 panel cross-reviews both MRs -----------------------------------
-    # round 1: a07 votes both MRs (1/2 each — waiting); round 2: a08 completes
-    # both panels (2/2 -> unanimous approval). One vote per reviewer per round.
-    await run_cycle(reviewer)
-    await run_cycle(reviewer)
-    show(mem, "after reviewer a07 (both panels at 1/2, waiting)")
-    await run_cycle(reviewer2)
-    await run_cycle(reviewer2)
-    show(mem, "after reviewer a08 (both MRs unanimously approved)")
+    # 6) reviewers cross-review both MRs (P5) + replicate settled claims (P24bis)
+    #    Rounds alternate the two reviewers until BOTH panels reach quorum.
+    for _ in range(4):
+        await run_cycle(reviewer)
+        await run_cycle(reviewer2)
+    show(mem, "after reviews (panel voted both MRs)")
 
     # 7) integrator drains the queue ----------------------------------------------
     await run_cycle(integrator)

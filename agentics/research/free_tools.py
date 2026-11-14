@@ -14,14 +14,18 @@ ground truth, never generated. They complement the cookie-based LLM pools:
 
 Sources (all keyless, free; no account, no token):
 
-| Source      | Endpoint                          | Politeness                     |
-| ----------- | --------------------------------- | ------------------------------ |
-| arXiv       | export.arxiv.org/api/query        | 3 s between calls, shared lock |
-| OpenAlex    | api.openalex.org/works            | mailto polite-pool parameter   |
-| Crossref    | api.crossref.org/works, doi.org   | mailto polite-pool parameter   |
-| HuggingFace | huggingface.co/api/datasets       | plain GET                      |
-| Wikipedia   | en.wikipedia.org/api/rest_v1      | plain GET                      |
-| DuckDuckGo  | html.duckduckgo.com/html/         | best-effort, graceful failure  |
+| Source           | Endpoint                                 | Politeness                     |
+| ---------------- | ---------------------------------------- | ------------------------------ |
+| arXiv            | export.arxiv.org/api/query               | 3 s between calls, shared lock |
+| OpenAlex         | api.openalex.org/works                   | mailto polite-pool parameter   |
+| Crossref         | api.crossref.org/works, doi.org          | mailto polite-pool parameter   |
+| SemanticScholar  | api.semanticscholar.org/graph/v1/paper   | anonymous pool, 429 retried    |
+| EuropePMC        | ebi.ac.uk/europepmc/webservices/rest     | plain GET, generous budget     |
+| HuggingFace      | huggingface.co/api/{datasets,models}     | plain GET                      |
+| Wikipedia        | en.wikipedia.org/api/rest_v1             | plain GET                      |
+| DuckDuckGo       | html.duckduckgo.com/html/                | best-effort, graceful failure  |
+| GitHub (repos)   | api.github.com/search/repositories       | 1 call / 6.5 s, shared lock    |
+| PyPI             | pypi.org/pypi/<name>/json                | plain GET                      |
 
 Transport is ``aiohttp`` (already a core dependency) with a per-request
 timeout; every function degrades gracefully (returns ``[]``/``None``) so a
@@ -32,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 import urllib.parse
@@ -49,10 +54,24 @@ _TIMEOUT_S = 15.0
 _ARXIV_MIN_INTERVAL_S = 3.0          # arXiv asks for 1 call / 3 s
 _CACHE_TTL_S = 600.0                 # process-wide result cache
 _MAX_LOOKUPS = 8                     # per-call enrichment cap
+# Per-HOST politeness for the shared-anonymous-budget APIs. Live 07:08:
+# 7 agents fired S2/OpenAlex/Crossref searches in parallel and all three
+# answered 429 within the first minute — the swarm looks like ONE client
+# to them, so the pace must be swarm-wide, not per-agent.
+_MIN_INTERVALS: dict = {
+    "api.semanticscholar.org": 1.0,   # anonymous pool, 1 rps-ish
+    "api.openalex.org": 1.0,          # polite pool / datacenter IPs
+    "api.crossref.org": 1.0,          # + mailto when provided
+}
+_pacer_last: dict = {}
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _ARXIV_ID_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5})(v\d+)?", re.I)
 _DOI_RE = re.compile(r"doi\.org/(10\.\S+?)(?:\s|$|[)\]}>,\"])", re.I)
+# arXiv's own DataCite DOI prefix: api.crossref.org will NEVER hold these
+# (10.48550 is registered with DataCite) — route them to the arXiv API.
+_ARXIV_DOI_RE = re.compile(r"^10\.48550/arxiv\.([0-9]{4}\.[0-9]{4,5})(v\d+)?$",
+                           re.I)
 
 _USER_AGENT = "agentics-ai-research-lab (+https://github.com/shieldx-bot/agentics-ai-research-lab)"
 
@@ -107,7 +126,10 @@ async def _request(url: str, *, params: dict | None = None, headers: dict | None
 
     A 429/503 (shared-IP budget exhaustion — common for OpenAlex on
     datacenter hosts) is retried ONCE after the server's Retry-After delay
-    (bounded to 10 s); everything else fails fast to the graceful path."""
+    (bounded to 10 s, jittered so parallel agents do not re-fire in
+    lock-step); everything else fails fast to the graceful path. Calls to
+    hosts in ``_MIN_INTERVALS`` are swarm-wide paced before firing."""
+    await _pace_host(url)
     timeout = aiohttp.ClientTimeout(total=_timeout(settings))
     hdrs = {"User-Agent": _USER_AGENT, **(headers or {})}
     for attempt in (0, 1):
@@ -119,6 +141,7 @@ async def _request(url: str, *, params: dict | None = None, headers: dict | None
                         return await resp.text()
                     if resp.status in (429, 503) and attempt == 0:
                         retry_delay = min(_retry_after(resp) or 2.0, 10.0)
+                        retry_delay *= random.uniform(1.0, 1.5)
                     else:
                         log.warning("free_tools %s %s -> HTTP %s",
                                     method, url.split("?")[0], resp.status)
@@ -131,6 +154,20 @@ async def _request(url: str, *, params: dict | None = None, headers: dict | None
                         url.split("?")[0], retry_delay)
             await asyncio.sleep(retry_delay)
     return None
+
+
+async def _pace_host(url: str) -> None:
+    """Swarm-wide politeness: at most one call per _MIN_INTERVALS window
+    per host (single event loop, all agents included). Hosts not listed
+    are unpaced."""
+    host = urllib.parse.urlsplit(url).netloc.lower()
+    interval = _MIN_INTERVALS.get(host, 0.0)
+    if interval <= 0:
+        return
+    wait = interval - (time.monotonic() - _pacer_last.get(host, 0.0))
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _pacer_last[host] = time.monotonic()
 
 
 def _retry_after(resp: "aiohttp.ClientResponse") -> float | None:
@@ -386,6 +423,106 @@ async def crossref_bibtex(doi: str, settings=None) -> str:
     return (body or "").strip()
 
 
+# ---------------------------------------------------------------- Semantic Scholar
+async def semantic_scholar_search(query: str, max_results: int = 8, settings=None) -> list[PaperHit]:
+    """Search Semantic Scholar's public graph — real citation counts, TLDR.
+
+    OpenAlex is documented to 429 on shared datacenter IPs (FREE_TOOLS.md
+    §5); Semantic Scholar runs a separate anonymous pool, so it fills the
+    same scholarly role from an independent budget. DOI/arXiv ids from
+    ``externalIds`` keep the citation URLs resolvable for BibTeX grounding.
+    """
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("s2", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    data = await _get_json(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        params={
+            "query": query,
+            "limit": max(1, min(int(max_results), 20)),
+            "fields": "title,abstract,year,authors,url,venue,citationCount,externalIds",
+        },
+        settings=settings,
+    )
+    hits: list[PaperHit] = []
+    for p in ((data or {}).get("data") or [])[: max(1, int(max_results))]:
+        title = " ".join((p.get("title") or "").split())
+        if not title:
+            continue
+        ext = p.get("externalIds") or {}
+        doi = (ext.get("DOI") or "").strip()
+        arx = (ext.get("ArXiv") or "").strip()
+        url = f"https://doi.org/{doi}" if doi else (
+            f"https://arxiv.org/abs/{arx}" if arx else (p.get("url") or ""))
+        hits.append(PaperHit(
+            source="semanticscholar",
+            title=title,
+            url=url,
+            year=p.get("year"),
+            authors=[(a.get("name") or "") for a in (p.get("authors") or [])],
+            abstract=" ".join((p.get("abstract") or "").split())[:1200],
+            venue=(p.get("venue") or "").strip() or "Semantic Scholar",
+            doi=doi,
+            cited_by=p.get("citationCount"),
+        ))
+    _cache_put(key, hits)
+    return hits
+
+
+# ---------------------------------------------------------------- Europe PMC
+async def europepmc_search(query: str, max_results: int = 8, settings=None) -> list[PaperHit]:
+    """Search Europe PMC — full abstracts + preprints from a third budget.
+
+    Covers biomed/CS/math literature OpenAlex and Crossref index thinly;
+    ``authorString`` is real metadata, never invented. Second-tier filler
+    in ``search_all`` so a finding still exists when the other pools are
+    exhausted.
+    """
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("europepmc", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    data = await _get_json(
+        "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+        params={
+            "query": query,
+            "format": "json",
+            "pageSize": max(1, min(int(max_results), 25)),
+        },
+        settings=settings,
+    )
+    hits: list[PaperHit] = []
+    results = (((data or {}).get("resultList") or {}).get("result") or [])[: max(1, int(max_results))]
+    for r in results:
+        title = " ".join((r.get("title") or "").split())
+        if not title:
+            continue
+        doi = (r.get("doi") or "").strip()
+        src = (r.get("source") or "").strip()
+        aid = (r.get("id") or "").strip()
+        url = f"https://doi.org/{doi}" if doi else (
+            f"https://europepmc.org/article/{src}/{aid}" if src and aid else "")
+        pub_year = (r.get("pubYear") or "").strip()
+        hits.append(PaperHit(
+            source="europepmc",
+            title=title,
+            url=url,
+            year=int(pub_year) if pub_year.isdigit() else None,
+            authors=[a.strip() for a in (r.get("authorString") or "").split(",") if a.strip()][:12],
+            abstract=" ".join(re.sub(r"<[^>]+>", " ", r.get("abstractText") or "").split())[:1200],
+            venue=(r.get("journalTitle") or "").strip() or "Europe PMC",
+            doi=doi,
+            cited_by=r.get("citedByCount"),
+        ))
+    _cache_put(key, hits)
+    return hits
+
+
 # ---------------------------------------------------------------- BibTeX enrichment
 def _bibtex_entry(key: str, hit: PaperHit, eprint: str = "") -> str:
     fields = [f"  title = {{{hit.title}}},"]
@@ -426,7 +563,13 @@ async def enriched_bibtex(urls: list[str], settings=None, max_lookups: int = _MA
         if aid and not doi:
             arxiv_ids.setdefault(aid, c.key)
         elif doi:
-            dois.setdefault(doi, c.key)
+            m = _ARXIV_DOI_RE.match(doi)
+            if m:
+                # 10.48550/arxiv.NNNN.NNNNN -> the arXiv batch below; asking
+                # Crossref for it is a guaranteed 404 (DataCite, not Crossref)
+                arxiv_ids.setdefault(m.group(1) + (m.group(2) or ""), c.key)
+            else:
+                dois.setdefault(doi, c.key)
         else:
             legacy_keys.append(c.key)
 
@@ -452,6 +595,9 @@ async def enriched_bibtex(urls: list[str], settings=None, max_lookups: int = _MA
             if hit is None:  # id_list echoes versions; match base id too
                 hit = next((h for k, h in by_id.items() if k.split("v")[0] == aid.split("v")[0]), None)
             if hit:
+                if not hit.doi:
+                    # the citation URL carried the DataCite DOI — keep it
+                    hit.doi = f"10.48550/arxiv.{aid.split('v')[0]}"
                 results[key] = _bibtex_entry(key, hit, eprint=aid)
             else:
                 _to_legacy(key, f"https://arxiv.org/abs/{aid}")
@@ -586,6 +732,170 @@ async def ddg_web_search(query: str, max_results: int = 6, settings=None) -> lis
     return out
 
 
+# ---------------------------------------------------------------- verification toolkit
+# Anonymous GitHub search allows ~10 calls/min process-wide: pace it like arXiv.
+_gh_lock = asyncio.Lock()
+_gh_last: float = 0.0
+_GH_MIN_INTERVAL_S = 6.5
+
+
+async def _github_pace() -> None:
+    """Process-wide politeness: at most one GitHub search every ~6.5 s."""
+    global _gh_last
+    async with _gh_lock:
+        wait = _GH_MIN_INTERVAL_S - (time.monotonic() - _gh_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _gh_last = time.monotonic()
+
+
+async def github_repo_search(query: str, max_results: int = 5, settings=None) -> list[dict]:
+    """Search public GitHub repos — 'does this idea already have code?'
+
+    Directly serves hypothesis verification (H1/H2): a reference
+    implementation an agent can clone into the workspace sandbox is the
+    fastest path from idea to a runnable protocol. Keyless (10 req/min
+    anonymous budget), real stargazer/language/license metadata.
+    """
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("github", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    await _github_pace()
+    data = await _get_json(
+        "https://api.github.com/search/repositories",
+        params={"q": query, "per_page": max(1, min(int(max_results), 20))},
+        settings=settings,
+    )
+    out: list[dict] = []
+    for it in ((data or {}).get("items") or [])[: max(1, int(max_results))]:
+        full = (it.get("full_name") or "").strip()
+        if not full:
+            continue
+        out.append({
+            "repo": full,
+            "url": it.get("html_url") or f"https://github.com/{full}",
+            "description": " ".join((it.get("description") or "").split())[:300],
+            "stars": it.get("stargazers_count"),
+            "language": it.get("language") or "",
+            "license": ((it.get("license") or {}) or {}).get("spdx_id") or "",
+            "pushed_at": (it.get("pushed_at") or "")[:10],
+        })
+    _cache_put(key, out)
+    return out
+
+
+async def pypi_package_info(package: str, settings=None) -> dict | None:
+    """Real PyPI metadata for one package — exists? latest version? python?
+
+    Verification protocols must pin REAL dependency versions (P16
+    reproducibility): this checks a package actually exists before an
+    agent writes ``pip install ...`` into a ``verify_cmds`` protocol, and
+    returns the latest published version to pin. Unknown/typo names
+    return None — never an invented version.
+    """
+    name = urllib.parse.quote((package or "").strip().strip("/"))
+    if not _enabled(settings) or not name:
+        return None
+    key = ("pypi", name)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached or None
+    data = await _get_json(f"https://pypi.org/pypi/{name}/json", settings=settings)
+    out = None
+    if isinstance(data, dict) and (data.get("info") or {}).get("name"):
+        info = data["info"]
+        out = {
+            "name": info.get("name", ""),
+            "version": info.get("version", ""),
+            "summary": " ".join((info.get("summary") or "").split())[:300],
+            "requires_python": info.get("requires_python") or "",
+            "home_page": info.get("home_page")
+                         or ((info.get("project_urls") or {}).get("Homepage") or ""),
+            "license": (info.get("license") or "")[:120],
+        }
+    _cache_put(key, out or ())
+    return out
+
+
+async def hf_models_search(query: str, max_results: int = 5, settings=None) -> list[dict]:
+    """Find public models on Hugging Face — real pretrained weights for a
+    verification protocol (complements ``hf_datasets_search``)."""
+    if not _enabled(settings) or not query.strip():
+        return []
+    key = ("hf-models", query, max_results)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    data = await _get_json(
+        "https://huggingface.co/api/models",
+        params={"search": query, "limit": max(1, min(int(max_results), 20)),
+                "sort": "downloads", "direction": -1},
+        settings=settings,
+    )
+    out = []
+    for d in (data or [])[:max_results] if isinstance(data, list) else []:
+        out.append({
+            "id": d.get("id", ""),
+            "downloads": d.get("downloads"),
+            "likes": d.get("likes"),
+            "pipeline_tag": d.get("pipeline_tag") or "",
+            "last_modified": d.get("lastModified", ""),
+            "url": f"https://huggingface.co/{d.get('id', '')}",
+        })
+    _cache_put(key, out)
+    return out
+
+
+async def verification_toolkit(query: str, settings=None) -> dict | None:
+    """Repos + datasets + models that make a hypothesis checkable NOW.
+
+    Bundles the three tool-discovery sources into one cached call so a
+    finding ships with runnable code paths and real data instead of only
+    a literature list. Every element degrades independently; the whole
+    bundle returns None when nothing is found.
+    """
+    if not _enabled(settings) or not query.strip():
+        return None
+    key = ("toolkit", query)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached or None
+    repos, datasets, models = await asyncio.gather(
+        github_repo_search(query, 3, settings=settings),
+        hf_datasets_search(query, 3, settings=settings),
+        hf_models_search(query, 3, settings=settings),
+    )
+    out = None
+    if repos or datasets or models:
+        out = {"repos": repos, "datasets": datasets, "models": models}
+    _cache_put(key, out or ())
+    return out
+
+
+def _toolkit_text(toolkit: dict) -> str:
+    lines = ["Reference implementations & data (real metadata — clone/download "
+             "only after checking the license and availability):"]
+    for r in toolkit.get("repos") or []:
+        stars = f", stars {r['stars']}" if r.get("stars") is not None else ""
+        lang = r.get("language") or "unknown lang"
+        lic = f", {r['license']}" if r.get("license") else ""
+        line = f"- [repo] {r['repo']} ({lang}{stars}{lic}) — {r['url']}"
+        if r.get("description"):
+            line += f": {r['description']}"
+        lines.append(line)
+    for d in toolkit.get("datasets") or []:
+        downloads = d.get("downloads") if d.get("downloads") is not None else 0
+        lines.append(f"- [dataset] {d['id']} ({downloads} downloads) — {d['url']}")
+    for m in toolkit.get("models") or []:
+        downloads = m.get("downloads") if m.get("downloads") is not None else 0
+        tag = f", {m['pipeline_tag']}" if m.get("pipeline_tag") else ""
+        lines.append(f"- [model] {m['id']} ({downloads} downloads{tag}) — {m['url']}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- composition
 def _dedup(hits: list[PaperHit]) -> list[PaperHit]:
     seen: set[str] = set()
@@ -600,9 +910,10 @@ def _dedup(hits: list[PaperHit]) -> list[PaperHit]:
 
 
 def _answer_text(query: str, hits: list[PaperHit]) -> str:
+    sources = ", ".join(sorted({h.source for h in hits})) or "official APIs"
     lines = [
         f"Ground-truth literature on '{query}' fetched from keyless official APIs "
-        "(arXiv, OpenAlex, Crossref) — metadata below is real and verifiable, "
+        f"({sources}) — metadata below is real and verifiable, "
         "not generated by a language model.",
         "",
     ]
@@ -622,15 +933,21 @@ def _answer_text(query: str, hits: list[PaperHit]) -> str:
 
 
 async def search_all(query: str, max_results: int = 8, settings=None) -> list[PaperHit]:
-    """arXiv + OpenAlex in parallel, Crossref only when they came up short."""
-    arxiv, openalex = await asyncio.gather(
+    """arXiv + OpenAlex + Semantic Scholar in parallel; Crossref and Europe
+    PMC only when the first three came up short (independent rate budgets,
+    so one exhausted pool never empties a finding)."""
+    arxiv, openalex, s2 = await asyncio.gather(
         arxiv_search(query, max_results, settings),
         openalex_search(query, max_results, settings),
+        semantic_scholar_search(query, max_results, settings),
     )
-    merged = _dedup(arxiv + openalex)
+    merged = _dedup(arxiv + openalex + s2)
     if len(merged) < 3:
         crossref = await crossref_works(query, max_results, settings)
         merged = _dedup(merged + crossref)
+    if len(merged) < 3:
+        epmc = await europepmc_search(query, max_results, settings)
+        merged = _dedup(merged + epmc)
     return merged[:max_results]
 
 
@@ -640,10 +957,20 @@ async def fallback_research(query: str, settings=None, max_results: int = 8) -> 
     Shape-compatible with ``LLMResponse`` (``.answer``/``.citations``/``.ok``)
     so ``node_research`` can consume it unchanged. Returns ``ok=False`` when
     every source came up empty — callers keep their existing error handling.
+    The literature list is enriched with the verification toolkit (repos,
+    datasets, models): the finding tells downstream plan/verify nodes what
+    code and data actually exist, so a hypothesis can go straight to a
+    runnable protocol.
     """
-    hits = await search_all(query, max_results=max_results, settings=settings)
+    hits, toolkit = await asyncio.gather(
+        search_all(query, max_results=max_results, settings=settings),
+        verification_toolkit(query, settings=settings),
+    )
     if not hits:
         return FreeResearch(answer="", citations=[])
     citations = [h.url for h in hits if h.url]
     bibtex = await enriched_bibtex(citations, settings=settings)
-    return FreeResearch(answer=_answer_text(query, hits), citations=citations, bibtex=bibtex)
+    answer = _answer_text(query, hits)
+    if toolkit:
+        answer += "\n\n" + _toolkit_text(toolkit)
+    return FreeResearch(answer=answer, citations=citations, bibtex=bibtex)

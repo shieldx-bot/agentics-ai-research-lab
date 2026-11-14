@@ -10,9 +10,14 @@ from agentics.memory.vector_store import VectorStore
 log = logging.getLogger("research.papers")
 
 SEARCH_SYSTEM = (
-    "You are a meticulous academic research assistant. Prefer peer-reviewed "
-    "sources (arXiv, IEEE, ACM, Springer, journals). Always surface concrete "
-    "facts: method names, datasets, metrics, numbers. Never invent a paper."
+    "You are a meticulous academic research assistant. Ground the survey in "
+    "VARIED kinds of sources: peer-reviewed papers (arXiv, IEEE, ACM, "
+    "Springer, journals) plus, where they carry the ground truth, official "
+    "specifications or standards, technical and benchmark reports, and "
+    "practitioner engineering postmortems. Spread citations across DIFFERENT "
+    "sites instead of several pages from one site. Always surface concrete "
+    "facts: method names, datasets, metrics, numbers. Never invent a paper "
+    "or a source."
 )
 
 

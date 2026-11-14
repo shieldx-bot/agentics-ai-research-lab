@@ -74,6 +74,42 @@ def test_dashboard_http_endpoints(mem, settings):
     assert payload["agents"][0]["intent"]["goal"] == "scan backlog"
 
 
+def test_health_probe_reports_liveness_and_staleness(mem, settings):
+    """External monitors need a cheap endpoint: alive + DB readable +
+    heartbeat age — NOT the full state (it must stay cheap under probing)."""
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(mem, settings))
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok" and body["db"] == "ok"
+    assert body["active_agents"] == 0 and body["last_heartbeat_age_s"] is None
+
+    mem.heartbeat("a04", "coder", 3, "working")   # live agent in the swarm
+    body = client.get("/health").json()
+    assert body["active_agents"] == 1
+    assert body["last_heartbeat_age_s"] is not None and body["last_heartbeat_age_s"] < 60
+
+
+def test_health_probe_reports_degraded_when_db_is_broken(settings):
+    """A probe that lies is worse than no probe: a corrupt/unreadable DB must
+    come back 503 'degraded', never a fake 200 'ok'."""
+    from fastapi.testclient import TestClient
+
+    class DeadMemory:
+        def active_agents(self, stale_after_s=300.0):
+            raise RuntimeError("disk I/O error")
+
+        def recent_journal(self, limit=1):
+            raise RuntimeError("disk I/O error")
+
+    client = TestClient(create_app(DeadMemory(), settings))
+    resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "degraded"
+
+
 def test_report_keeps_previous_fields_when_not_given(mem):
     mem.report("a03", "coder", node="claim", task_id=5, task_title="T",
                intent={"goal": "g"})

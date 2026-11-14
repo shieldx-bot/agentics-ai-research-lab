@@ -16,6 +16,14 @@ hypothesis.py + experiment.py the researcher states a falsifiable claim,
 pre-registers it, runs a protocol in its own workspace, and settles the
 claim into shared verified knowledge every agent's prompt can see.
 """
+from agentics.verify.anchors import (
+    ANCHOR_KINDS,
+    AUTHORED_INPUTS,
+    VerdictProvenance,
+    apply_settle_law,
+    detect_pinned_data,
+    provenance_for_settle,
+)
 from agentics.verify.experiment import (
     register_hypothesis,
     run_hypothesis,
@@ -36,13 +44,19 @@ from agentics.verify.hypothesis import (
 
 __all__ = [
     "ALLOWED_OPS",
+    "ANCHOR_KINDS",
+    "AUTHORED_INPUTS",
     "EXPERIMENT_DIR",
     "HYPOTHESIS_PROMPT_CONTRACT",
     "PROTOCOL_CONTRACT",
     "Hypothesis",
+    "VerdictProvenance",
+    "apply_settle_law",
     "claim_hash",
+    "detect_pinned_data",
     "hypothesis_from_json",
     "parse_hypothesis",
+    "provenance_for_settle",
     "slugify",
     "stable_id",
     "register_hypothesis",

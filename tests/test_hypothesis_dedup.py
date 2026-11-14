@@ -83,7 +83,7 @@ def _verify_ctx(mem, ws, agent_id="agent-b"):
         agent_id=agent_id, role=Role.RESEARCHER, memory=mem,
         workspace=ws, cycle=2, meta={},
         llm=SimpleNamespace(),        # truthy: the extraction call is faked below
-        settings=SimpleNamespace(research_topic="NFV"),
+        settings=SimpleNamespace(research_topic="NFV", settle_require_anchor=False),
         heartbeat=lambda status="working": None,
         report=lambda **kw: None,
     )
@@ -107,17 +107,26 @@ def test_second_cycle_reuses_the_settled_verdict(tmp_path, monkeypatch):
     assert [r["status"] for r in first["verifications"]] == ["supported"]
     assert first["verifications"][0].get("reused") is None   # really ran
 
-    # a second agent/cycle meets the SAME claim (reworded) — reuse, no re-run
+    # a second agent/cycle meets the SAME claim (reworded). P24 composes:
+    # agent-c FIRST independently replicates the settled claim (one agent's
+    # verdict is not knowledge), THEN the dedup gate still reuses the
+    # original verdict for the fresh-finding block — reuse, no re-run.
     _set_llm_answer(_verify_spec(claim="Single-pass  MIN/MAX equals the naive scan"))
     ctx_b = _verify_ctx(mem, ws, agent_id="agent-c")
     second = asyncio.run(nodes.node_verify(ctx_b, {
         "finding_id": 2, "finding_text": "finding text", "issue_number": 5}))
-    v = second["verifications"][0]
+    assert "P24 replicated 1 claim(s)" in second["summary"]
+    repl, v = second["verifications"][0], second["verifications"][1]
+    assert repl["replication"] is True and repl["status"] == "confirmed"
+    assert repl["evidence_id"] != rows[0]["id"]        # the replica's own row
     assert v["reused"] is True and v["status"] == "supported"
+    # the confirmed replication only ANNOTATES (P17 asymmetry): the claim's
+    # evidence pointer stays at the author's original row, and reuse points
+    # there too
     assert v["evidence_id"] == rows[0]["id"]
-    assert mem.evidence_for_task(5) == rows            # ledger untouched
-    assert any(j["event"] == "hypothesis_reused"
-               for j in mem.recent_journal(limit=10))
+    events = [j["event"] for j in mem.recent_journal(limit=15)]
+    assert "hypothesis_reused" in events
+    assert "replication_confirmed" in events
 
 
 def test_a_genuinely_new_claim_still_runs(tmp_path, monkeypatch):

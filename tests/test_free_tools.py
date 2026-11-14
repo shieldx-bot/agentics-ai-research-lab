@@ -1,9 +1,10 @@
 """Free keyless research tools — offline suite (no network in tests).
 
 Covers: arXiv Atom parsing, OpenAlex inverted-index abstracts, Crossref
-metadata, the batched BibTeX enrichment (arXiv id_list = ONE call), the
-composition layer (search_all dedup + fallback_research), the general
-tools (HF datasets / Wikipedia / DuckDuckGo) and the node_research wiring
+metadata, Semantic Scholar + Europe PMC (scholarly redundancy), the batched
+BibTeX enrichment (arXiv id_list = ONE call), the composition layer
+(search_all dedup + fill chain), the verification toolkit (GitHub repos /
+PyPI pins / HF models + fallback enrichment) and the node_research wiring
 (fallback on dead LLM pools, grounded BibTeX on the LLM path).
 """
 
@@ -28,9 +29,12 @@ from agentics.agents.roles import Role  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _fast_clean(monkeypatch):
-    """No result cache bleed between tests, no 3 s arXiv politeness sleep."""
+    """No result cache bleed between tests, no 3 s arXiv / 6.5 s GitHub
+    politeness sleep."""
     ft.clear_cache()
     monkeypatch.setattr(ft, "_ARXIV_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ft, "_GH_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ft, "_MIN_INTERVALS", {})   # no 1 s host pacing
     yield
     ft.clear_cache()
 
@@ -181,6 +185,111 @@ def test_crossref_works_fields(monkeypatch):
     assert h.abstract == "Clean markup test."     # JATS tags stripped
 
 
+# ---------------------------------------------------------------- Semantic Scholar / Europe PMC
+def test_semantic_scholar_fields(monkeypatch):
+    data = {"total": 2, "data": [
+        {"paperId": "aaa111", "title": "NFV Failure Prediction",
+         "abstract": " Deep learning  on NFV telemetry. ",
+         "year": 2024, "venue": "IEEE NetSoft", "citationCount": 17,
+         "authors": [{"name": "Jane Doe"}, {"name": "John Roe"}],
+         "externalIds": {"DOI": "10.1/s2", "ArXiv": "2401.99999"},
+         "url": "https://www.semanticscholar.org/paper/aaa111"},
+        {"paperId": "bbb222", "title": "No DOI Preprint",
+         "year": 2023, "externalIds": {"ArXiv": "2312.00001"},
+         "authors": [], "citationCount": 0},
+        {"paperId": "ccc333", "title": "  "},        # blank title dropped
+    ]}
+
+    async def fake_json(url, params=None, **kw):
+        assert "semanticscholar" in url
+        assert params["fields"].startswith("title,abstract")
+        assert params["limit"] == 5
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    hits = asyncio.run(ft.semantic_scholar_search("nfv", 5))
+    assert len(hits) == 2                          # blank title skipped
+    h = hits[0]
+    assert h.source == "semanticscholar" and h.cited_by == 17 and h.year == 2024
+    assert h.doi == "10.1/s2"
+    assert h.url == "https://doi.org/10.1/s2"      # DOI beats arXiv id for the URL
+    assert h.authors == ["Jane Doe", "John Roe"] and h.venue == "IEEE NetSoft"
+    assert h.abstract == "Deep learning on NFV telemetry."
+    assert hits[1].url == "https://arxiv.org/abs/2312.00001"  # arXiv fallback
+
+
+def test_semantic_scholar_disabled_or_empty(monkeypatch):
+    calls = []
+
+    async def fake_json(url, **kw):
+        calls.append(url)
+        return {"data": []}
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.semantic_scholar_search("q", 3, off)) == []
+    assert asyncio.run(ft.semantic_scholar_search("", 3)) == []
+    asyncio.run(ft.semantic_scholar_search("q", 3))
+    asyncio.run(ft.semantic_scholar_search("q", 3))   # cache hit -> one call only
+    assert len(calls) == 1
+
+
+def test_europepmc_fields(monkeypatch):
+    data = {"hitCount": 1, "resultList": {"result": [{
+        "id": "42943362", "source": "MED", "pmid": "42943362",
+        "title": "Auto-scaling NFV with Reinforcement Learning",
+        "authorString": "Jane Doe, John Roe, Extra Author",
+        "abstractText": "<p>RL scaling of <i>VNF</i> targets.</p>",
+        "pubYear": "2025", "journalTitle": "IEEE TNSM",
+        "doi": "10.1/epmc", "citedByCount": 4,
+    }]}}
+
+    async def fake_json(url, params=None, **kw):
+        assert "europepmc" in url
+        assert params["format"] == "json" and params["pageSize"] == 5
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    hits = asyncio.run(ft.europepmc_search("nfv scaling", 5))
+    h = hits[0]
+    assert h.source == "europepmc" and h.year == 2025 and h.cited_by == 4
+    assert h.doi == "10.1/epmc" and h.url == "https://doi.org/10.1/epmc"
+    assert h.venue == "IEEE TNSM"
+    assert h.abstract == "RL scaling of VNF targets."  # markup stripped
+    assert h.authors == ["Jane Doe", "John Roe", "Extra Author"]
+
+
+def test_europepmc_no_doi_uses_article_url(monkeypatch):
+    data = {"resultList": {"result": [{
+        "id": "PPR001", "source": "PPR", "title": "Preprint Only",
+        "pubYear": "2024", "authorString": "Alan Smithee",
+    }]}}
+
+    async def fake_json(url, **kw):
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    hits = asyncio.run(ft.europepmc_search("preprint", 3))
+    assert hits[0].url == "https://europepmc.org/article/PPR/PPR001"
+    assert hits[0].doi == "" and hits[0].cited_by is None
+
+
+def test_europepmc_disabled_or_empty(monkeypatch):
+    calls = []
+
+    async def fake_json(url, **kw):
+        calls.append(url)
+        return None
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.europepmc_search("q", 3, off)) == []
+    assert asyncio.run(ft.europepmc_search("", 3)) == []
+    assert asyncio.run(ft.europepmc_search("q", 3)) == []
+    assert asyncio.run(ft.europepmc_search("q", 3)) == []  # cached miss
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------- BibTeX enrichment
 SECOND_ARXIV_ENTRY = """  <entry>
     <id>http://arxiv.org/abs/2401.67890</id>
@@ -266,6 +375,9 @@ def test_search_all_dedups_and_fills_from_crossref(monkeypatch):
         return [_hit("openalex", "Same Paper", "https://doi.org/10.1/x", "10.1/x"),
                 _hit("openalex", "Only OpenAlex", "https://doi.org/10.1/y", "10.1/y")]
 
+    async def s2(query, max_results=8, settings=None):
+        return [_hit("semanticscholar", "Same Paper", "https://doi.org/10.1/x", "10.1/x")]
+
     crossref_called = []
 
     async def crossref(query, max_results=8, settings=None):
@@ -274,10 +386,39 @@ def test_search_all_dedups_and_fills_from_crossref(monkeypatch):
 
     monkeypatch.setattr(ft, "arxiv_search", arxiv)
     monkeypatch.setattr(ft, "openalex_search", openalex)
+    monkeypatch.setattr(ft, "semantic_scholar_search", s2)
     monkeypatch.setattr(ft, "crossref_works", crossref)
     merged = asyncio.run(ft.search_all("q", 8))
     assert [h.title for h in merged] == ["Same Paper", "Only OpenAlex", "Crossref Fill"]
     assert crossref_called == ["q"]
+
+
+def test_search_all_fills_from_europepmc_when_first_tiers_short(monkeypatch):
+    """Crossref ALSO exhausted (e.g. shared-IP budget) -> Europe PMC licks in.
+    Three independent budgets, one never empties the finding."""
+
+    async def empty(query, max_results=8, settings=None):
+        return []
+
+    async def epmc(query, max_results=8, settings=None):
+        return [_hit("europepmc", "EPMC Survival", "https://europepmc.org/article/MED/1"),
+                _hit("europepmc", "EPMC Second", "https://doi.org/10.2/a", "10.2/a")]
+
+    for name in ("arxiv_search", "openalex_search", "semantic_scholar_search",
+                 "crossref_works"):
+        monkeypatch.setattr(ft, name, empty)
+    monkeypatch.setattr(ft, "europepmc_search", epmc)
+    merged = asyncio.run(ft.search_all("q", 8))
+    assert [h.title for h in merged] == ["EPMC Survival", "EPMC Second"]
+
+
+def test_answer_text_lists_sources_dynamically():
+    """The fallback answer names the sources that ACTUALLY answered."""
+    hits = [_hit("semanticscholar", "S2 Paper", "https://doi.org/10.3/s", "10.3/s"),
+            _hit("europepmc", "EPMC Paper", "https://doi.org/10.3/e", "10.3/e")]
+    text = ft._answer_text("nfv", hits)
+    assert "europepmc, semanticscholar" in text
+    assert "not generated by a language model" in text
 
 
 def test_fallback_research_shape(monkeypatch):
@@ -290,24 +431,65 @@ def test_fallback_research_shape(monkeypatch):
     async def bib(urls, settings=None, **kw):
         return "@misc{real, title={Real}}"
 
+    async def toolkit(query, settings=None):
+        return {"repos": [{"repo": "owner/ref-impl", "url": "https://github.com/owner/ref-impl",
+                           "description": "Reference NFV scheduler", "stars": 12,
+                           "language": "Python", "license": "MIT", "pushed_at": "2026-01-02"}],
+                "datasets": [], "models": []}
+
     monkeypatch.setattr(ft, "search_all", search_all)
     monkeypatch.setattr(ft, "enriched_bibtex", bib)
+    monkeypatch.setattr(ft, "verification_toolkit", toolkit)
     fb = asyncio.run(ft.fallback_research("nfv scaling"))
     assert fb.ok and fb.source == "free-tools"
     assert "Real Paper" in fb.answer and "Second Paper" in fb.answer
+    assert "[repo] owner/ref-impl" in fb.answer          # toolkit appended to the answer
+    assert "Reference NFV scheduler" in fb.answer
     assert fb.citations == ["https://arxiv.org/abs/2401.1", "https://doi.org/10.1/b"]
     assert fb.bibtex == "@misc{real, title={Real}}"
     # LLMResponse-compatible duck typing
     assert isinstance(fb.ok, bool) and hasattr(fb, "answer") and hasattr(fb, "citations")
 
 
+def test_fallback_research_without_toolkit(monkeypatch):
+    """Empty toolkit -> answer keeps only the literature section."""
+    hits = [_hit("arxiv", "Real Paper", "https://arxiv.org/abs/2401.1", "10.1/a")]
+
+    async def search_all(query, max_results=8, settings=None):
+        return hits
+
+    async def bib(urls, settings=None, **kw):
+        return ""
+
+    async def toolkit(query, settings=None):
+        return None
+
+    monkeypatch.setattr(ft, "search_all", search_all)
+    monkeypatch.setattr(ft, "enriched_bibtex", bib)
+    monkeypatch.setattr(ft, "verification_toolkit", toolkit)
+    fb = asyncio.run(ft.fallback_research("nfv"))
+    assert "Reference implementations" not in fb.answer
+    assert "Real Paper" in fb.answer
+
+
 def test_fallback_research_empty_sources(monkeypatch):
+    """Empty literature -> error state kept, even if the toolkit found repos
+    (node_research's contract: no papers = no finding)."""
+
     async def search_all(query, max_results=8, settings=None):
         return []
 
+    async def toolkit(query, settings=None):
+        return {"repos": [{"repo": "owner/x", "url": "https://github.com/owner/x",
+                           "description": "", "stars": 1, "language": "Python",
+                           "license": "", "pushed_at": ""}],
+                "datasets": [], "models": []}
+
     monkeypatch.setattr(ft, "search_all", search_all)
+    monkeypatch.setattr(ft, "verification_toolkit", toolkit)
     fb = asyncio.run(ft.fallback_research("nothing out there"))
     assert fb.ok is False and fb.citations == []
+    assert fb.answer == ""          # toolkit section NOT smuggled into a dead finding
 
 
 # ---------------------------------------------------------------- general tools
@@ -319,6 +501,142 @@ def test_hf_datasets_search(monkeypatch):
     rows = asyncio.run(ft.hf_datasets_search("intrusion", 3))
     assert rows[0]["id"] == "user/ds" and rows[0]["downloads"] == 224
     assert rows[0]["url"] == "https://huggingface.co/datasets/user/ds"
+
+
+# ---------------------------------------------------------------- verification toolkit
+def test_github_repo_search_fields(monkeypatch):
+    data = {"total_count": 2, "items": [
+        {"full_name": "owner/ref-impl", "html_url": "https://github.com/owner/ref-impl",
+         "description": "  Reference  scheduler  impl. ",
+         "stargazers_count": 512, "language": "Python",
+         "license": {"spdx_id": "MIT"}, "pushed_at": "2026-02-10T03:00:00Z"},
+        {"full_name": "", "html_url": "https://github.com/none/x"},   # dropped
+    ]}
+
+    async def fake_json(url, params=None, **kw):
+        assert "api.github.com/search/repositories" in url
+        assert params["q"] == "nfv scheduler" and params["per_page"] == 3
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    monkeypatch.setattr(ft, "_GH_MIN_INTERVAL_S", 0.0)
+    rows = asyncio.run(ft.github_repo_search("nfv scheduler", 3))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["repo"] == "owner/ref-impl" and r["stars"] == 512
+    assert r["language"] == "Python" and r["license"] == "MIT"
+    assert r["pushed_at"] == "2026-02-10"           # date only
+    assert r["description"] == "Reference scheduler impl."
+
+
+def test_github_repo_search_disabled_or_paced(monkeypatch):
+    calls = []
+
+    async def fake_json(url, **kw):
+        calls.append(url)
+        return {"items": []}
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.github_repo_search("q", 3, off)) == []
+    assert asyncio.run(ft.github_repo_search("", 3)) == []
+    asyncio.run(ft.github_repo_search("q", 3))
+    asyncio.run(ft.github_repo_search("q", 3))       # cache hit -> one call only
+    assert len(calls) == 1
+
+
+def test_github_repo_search_graceful_failure(monkeypatch):
+    async def fake_json(url, **kw):
+        return None                                  # rate limit / outage
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    monkeypatch.setattr(ft, "_GH_MIN_INTERVAL_S", 0.0)
+    assert asyncio.run(ft.github_repo_search("q", 3)) == []
+
+
+def test_pypi_package_info_fields(monkeypatch):
+    data = {"info": {"name": "scikit-learn", "version": "1.7.2",
+                     "summary": " A set of python modules for machine learning ",
+                     "requires_python": ">=3.10",
+                     "home_page": "", "license": "new BSD",
+                     "project_urls": {"Homepage": "https://scikit-learn.org"}}}
+
+    async def fake_json(url, **kw):
+        assert url == "https://pypi.org/pypi/scikit-learn/json"
+        return data
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    info = asyncio.run(ft.pypi_package_info("scikit-learn"))
+    assert info["name"] == "scikit-learn" and info["version"] == "1.7.2"
+    assert info["requires_python"] == ">=3.10"
+    assert info["home_page"] == "https://scikit-learn.org"   # project_urls fallback
+
+
+def test_pypi_package_unknown_is_none_and_cached(monkeypatch):
+    calls = []
+
+    async def fake_json(url, **kw):
+        calls.append(url)
+        return None                                  # 404 path -> None
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    assert asyncio.run(ft.pypi_package_info("no-such-pkg-xyz")) is None
+    assert asyncio.run(ft.pypi_package_info("no-such-pkg-xyz")) is None  # cached miss
+    assert len(calls) == 1
+    assert asyncio.run(ft.pypi_package_info("")) is None
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.pypi_package_info("scikit-learn", off)) is None
+
+
+def test_hf_models_search(monkeypatch):
+    async def fake_json(url, params=None, **kw):
+        assert "huggingface.co/api/models" in url
+        return [{"id": "google-bert/bert-base-uncased", "downloads": 31346528,
+                 "likes": 3071, "pipeline_tag": "fill-mask",
+                 "lastModified": "2025-05-06"}]
+
+    monkeypatch.setattr(ft, "_get_json", fake_json)
+    rows = asyncio.run(ft.hf_models_search("bert", 3))
+    assert rows[0]["id"] == "google-bert/bert-base-uncased"
+    assert rows[0]["pipeline_tag"] == "fill-mask"
+    assert rows[0]["url"] == "https://huggingface.co/google-bert/bert-base-uncased"
+
+
+def test_verification_toolkit_bundle(monkeypatch):
+    async def repos(query, max_results=3, settings=None):
+        return [{"repo": "owner/x", "url": "https://github.com/owner/x",
+                 "description": "d", "stars": 1, "language": "Python",
+                 "license": "MIT", "pushed_at": "2026-01-01"}]
+
+    async def datasets(query, max_results=3, settings=None):
+        return [{"id": "u/ds", "downloads": 5, "likes": 1, "last_modified": "",
+                 "url": "https://huggingface.co/datasets/u/ds"}]
+
+    async def models(query, max_results=3, settings=None):
+        return []                                    # one empty leg must not kill it
+
+    monkeypatch.setattr(ft, "github_repo_search", repos)
+    monkeypatch.setattr(ft, "hf_datasets_search", datasets)
+    monkeypatch.setattr(ft, "hf_models_search", models)
+    out = asyncio.run(ft.verification_toolkit("nfv"))
+    assert out["repos"] and out["datasets"] and out["models"] == []
+    text = ft._toolkit_text(out)
+    assert "[repo] owner/x (Python, stars 1, MIT) — https://github.com/owner/x: d" in text
+    assert "[dataset] u/ds (5 downloads)" in text
+    assert "license" in text                        # clone-before-check reminder
+
+
+def test_verification_toolkit_all_empty_is_none(monkeypatch):
+    async def empty(query, max_results=3, settings=None):
+        return []
+
+    for name in ("github_repo_search", "hf_datasets_search", "hf_models_search"):
+        monkeypatch.setattr(ft, name, empty)
+    assert asyncio.run(ft.verification_toolkit("q")) is None
+    assert asyncio.run(ft.verification_toolkit("q")) is None   # miss cached
+    off = SimpleNamespace(free_tools_enabled=False)
+    assert asyncio.run(ft.verification_toolkit("q", off)) is None
+    assert asyncio.run(ft.verification_toolkit("")) is None
 
 
 def test_wikipedia_summary(monkeypatch):
@@ -412,7 +730,10 @@ def test_request_retries_once_on_429(monkeypatch):
     monkeypatch.setattr(ft.aiohttp, "ClientSession", FakeSess)
     monkeypatch.setattr(ft.asyncio, "sleep", fake_sleep)
     out = asyncio.run(ft._request("https://api.example.org/x"))
-    assert out == "body" and len(sleeps) == 1 and sleeps[0] == 0.01
+    assert out == "body" and len(sleeps) == 1
+    # 429 retries are jittered (1.0-1.5x the Retry-After) so parallel
+    # agents never re-fire in lock-step
+    assert 0.01 <= sleeps[0] <= 0.0151
 
 
 def test_request_no_retry_on_404(monkeypatch):

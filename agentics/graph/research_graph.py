@@ -26,12 +26,15 @@ from agentics.graph.nodes import (
     node_open_pr,
     node_plan,
     node_reflect,
+    node_replicate,
     node_research,
     node_review,
     node_scan,
     node_start,
+    node_tournament,
     node_verify,
     pending_defense,
+    pending_replication,
 )
 from agentics.graph.state import ResearchState
 
@@ -65,8 +68,16 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     async def verify_node(state: ResearchState) -> ResearchState:
         return await node_verify(ctx, state)
 
+    async def replicate_node(state: ResearchState) -> ResearchState:
+        return await node_replicate(ctx, state)
+
+    async def tournament_node(state: ResearchState) -> ResearchState:
+        return await node_tournament(ctx, state)
+
     g.add_node("research", research_node)
     g.add_node("verify", verify_node)
+    g.add_node("replicate", replicate_node)
+    g.add_node("tournament", tournament_node)
     g.add_node("plan", plan_node)
     g.add_node("implement", implement_node)
     g.add_node("open_pr", lambda s: node_open_pr(ctx, s))
@@ -93,6 +104,14 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
                 return "defend"
         except Exception:  # noqa: BLE001 — a routing read must never kill the cycle
             pass
+        # P24bis: an unreplicated settled claim outranks ordinary review —
+        # common knowledge resting on ONE agent's run is the reviewer's
+        # most urgent problem, and the replication needs no LLM (cheap).
+        try:
+            if ctx.role == Role.REVIEWER and pending_replication(ctx):
+                return "replicate"
+        except Exception:  # noqa: BLE001 — a routing read must never kill the cycle
+            pass
         return {
             Role.SUPERVISOR: "scan",
             Role.RESEARCHER: "research",
@@ -105,7 +124,7 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     g.add_conditional_edges("start", route_from_start, {
         "scan": "scan", "research": "research", "claim": "claim",
         "review": "review", "integrate": "integrate", "defend": "defend",
-        "reflect": "reflect",
+        "replicate": "replicate", "reflect": "reflect",
     })
     g.add_edge("scan", "reflect")
     # A node that sets `done` (nothing to do, lost a race, yielded) or `error` must
@@ -126,7 +145,9 @@ def build_research_graph(ctx: AgentContext) -> StateGraph:
     g.add_conditional_edges("research", route_after_research,
                             {"verify": "verify", "plan": "plan",
                              "reflect": "reflect"})
-    g.add_edge("verify", "reflect")
+    g.add_edge("verify", "tournament")
+    g.add_edge("tournament", "reflect")
+    g.add_edge("replicate", "reflect")
     g.add_edge("open_pr", "reflect")
     g.add_edge("review", "reflect")
     g.add_edge("integrate", "reflect")
@@ -140,7 +161,12 @@ def _node_digest(node: str, out: dict) -> str:
     task = out.get("issue_number")
     head = f"#{task} " if task else ""
     if node == "claim":
-        return f"{head}claimed '{out.get('issue_title', '')}'"[:200]
+        # The claim node also ends with "no unclaimed tasks; resting" — a
+        # digest that still says "claimed ''" is a lie the owner reads
+        # (live 2026-11-14 dashboard). Fall back to the cycle summary.
+        if out.get("issue_title"):
+            return f"{head}claimed '{out['issue_title']}'"[:200]
+        return f"{head}{out.get('summary') or 'no task claimed — resting'}"[:200]
     if node == "research":
         return f"{head}researched '{out.get('issue_title', '')[:80]}'"[:200]
     if node == "plan":
@@ -155,6 +181,10 @@ def _node_digest(node: str, out: dict) -> str:
         return f"{head}opened MR !{out.get('pr_number')}"
     if node == "review":
         return f"reviewed !{out.get('pr_number', '')}: {out.get('review_verdict', '')}"[:200]
+    if node == "replicate":
+        return f"replicated claim(s): {out.get('replication_verdict', '')}"[:200]
+    if node == "tournament":
+        return f"tournament: {out.get('tournament_summary', 'idle')}"[:200]
     if node == "defend":
         return f"defended !{out.get('pr_number', '')}: {out.get('defense_outcome', '')}"[:200]
     if node == "integrate":
@@ -171,7 +201,8 @@ def _node_payload(node: str, out: dict) -> dict:
     payload: dict = {"node": node, "action": out.get("action", "")}
     for key in ("issue_number", "pr_number", "yield_reason",
                 "experiment_verdict", "mechanical_review", "review_verdict",
-                "panel_decision", "defense_outcome", "panel_digest"):
+                "panel_decision", "defense_outcome", "panel_digest",
+                "replication_verdict"):
         if out.get(key):
             payload[key] = out[key]
     if out.get("error"):
