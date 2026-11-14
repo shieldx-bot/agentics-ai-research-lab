@@ -169,6 +169,42 @@ _HTML = """<!doctype html>
   .kv b { color:var(--fg); }
   .err { color:var(--bad); padding:20px; }
   footer { color:var(--dim); font-size:11px; padding:0 20px 20px; }
+  /* ---- owner chat ---- */
+  #chatbtn { position:fixed; right:20px; bottom:20px; z-index:50;
+             width:52px; height:52px; border-radius:50%; border:1px solid var(--acc);
+             background:var(--card); color:var(--acc); font-size:22px; cursor:pointer; }
+  #chatbtn:hover { background:#1c2735; }
+  #chatpanel { position:fixed; right:20px; bottom:84px; z-index:50; width:min(420px, calc(100vw - 32px));
+               height:min(560px, calc(100vh - 120px)); display:none; flex-direction:column;
+               background:var(--card); border:1px solid var(--edge); border-radius:12px;
+               box-shadow:0 12px 40px rgba(0,0,0,.55); }
+  #chatpanel.open { display:flex; }
+  #chatpanel .chead { display:flex; align-items:center; gap:8px; padding:10px 12px;
+                      border-bottom:1px solid var(--edge); }
+  #chatpanel .chead b { font-size:13px; }
+  #chatpanel .chead .sub { color:var(--dim); font-size:11px; }
+  #chatclose { margin-left:auto; background:none; border:none; color:var(--dim);
+               font-size:16px; cursor:pointer; }
+  #chatclose:hover { color:var(--bad); }
+  #chatmsgs { flex:1; overflow-y:auto; padding:10px 12px; display:flex;
+              flex-direction:column; gap:8px; }
+  .msg { max-width:92%; padding:7px 10px; border-radius:8px; font-size:13px;
+         white-space:pre-wrap; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:#1c2c3f; border:1px solid #2a4a6b; }
+  .msg.bot { align-self:flex-start; background:#10151c; border:1px solid var(--edge); }
+  .msg .meta { display:block; margin-top:4px; font-size:10px; color:var(--dim); }
+  .msg.err { border-color:var(--bad); color:var(--bad); }
+  #chatchips { padding:6px 12px; border-top:1px solid var(--edge); display:flex;
+               gap:6px; flex-wrap:wrap; }
+  .chip { font-size:11px; padding:2px 9px; border-radius:99px; cursor:pointer;
+          border:1px solid var(--edge); color:var(--acc); background:none; }
+  .chip:hover { border-color:var(--acc); }
+  #chatinputrow { display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--edge); }
+  #chatin { flex:1; background:#0b0f14; border:1px solid var(--edge); color:var(--fg);
+            border-radius:8px; padding:8px 10px; font-size:13px; }
+  #chatsend { background:var(--acc); color:#0d1117; border:none; border-radius:8px;
+              padding:8px 14px; font-size:13px; cursor:pointer; font-weight:600; }
+  #chatsend:disabled { opacity:.5; cursor:default; }
 </style>
 </head>
 <body>
@@ -207,6 +243,18 @@ _HTML = """<!doctype html>
     <div class="acts" id="acts"></div></div>
 </main>
 <footer>Local-only mode — không dữ liệu nào rời khỏi máy này. Làm mới mỗi 2.5s.</footer>
+<button id="chatbtn" title="Chat AI — hỏi về agent hoặc bất kỳ điều gì">💬</button>
+<div id="chatpanel">
+  <div class="chead"><b>Chat AI — mắt owner</b>
+    <span class="sub">model cục bộ · không đốt cookie</span>
+    <button id="chatclose">✕</button></div>
+  <div id="chatmsgs"><div class="msg bot">Hỏi bất kỳ điều gì về lab — ví dụ: “a03 đang làm gì?”, “ngân sách LLM còn bao nhiêu?”, “giả thuyết #2 thế nào rồi?”, “vì sao implement bị block?”</div></div>
+  <div id="chatchips"><span class="sub" style="color:var(--dim);font-size:11px">hỏi nhanh:</span></div>
+  <div id="chatinputrow">
+    <input id="chatin" placeholder="Nhập câu hỏi… (Enter để gửi)">
+    <button id="chatsend">Gửi</button>
+  </div>
+</div>
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -342,6 +390,85 @@ document.getElementById("stopbtn").addEventListener("click", async () => {
   }
 });
 tick(); setInterval(tick, 2500);
+// ---------------------------------------------- owner chat
+const chatpanel = document.getElementById("chatpanel");
+const chatmsgs  = document.getElementById("chatmsgs");
+const chatin    = document.getElementById("chatin");
+const chatsend  = document.getElementById("chatsend");
+const chatchips = document.getElementById("chatchips");
+document.getElementById("chatbtn").addEventListener("click", () => {
+  chatpanel.classList.toggle("open");
+  if (chatpanel.classList.contains("open")) chatin.focus();
+});
+document.getElementById("chatclose").addEventListener("click",
+  () => chatpanel.classList.remove("open"));
+function chatChip(label, q){
+  const b = document.createElement("button");
+  b.className = "chip"; b.textContent = label;
+  b.addEventListener("click", () => sendChat(q));
+  chatchips.appendChild(b);
+}
+chatChip("Tất cả", "Tổng quan lab đang thế nào?");
+chatChip("Budget", "Ngân sách LLM pool hiện tại thế nào?");
+let chatAgentsBuilt = false;
+function buildAgentChips(s){
+  if (chatAgentsBuilt) return;
+  for (const a of (s.agents||[]))
+    chatChip(a.agent, `${a.agent} đang làm gì, vì sao?`);
+  chatAgentsBuilt = true;   // chỉ build 1 lần để không xóa chip người dùng
+}
+function addMsg(cls, text, meta){
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  if (meta){
+    const m = document.createElement("span");
+    m.className = "meta"; m.textContent = meta;
+    d.appendChild(m);
+  }
+  chatmsgs.appendChild(d);
+  chatmsgs.scrollTop = chatmsgs.scrollHeight;
+  return d;
+}
+let chatBusy = false;
+async function sendChat(q){
+  q = (q ?? chatin.value).trim();
+  if (!q || chatBusy) return;
+  chatin.value = "";
+  addMsg("user", q);
+  chatBusy = true; chatsend.disabled = true;
+  const pending = addMsg("bot", "đang nghĩ… (model cục bộ, có thể mất vài giây)");
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q }),
+    });
+    const j = await r.json();
+    pending.remove();
+    if (r.ok) {
+      const src = j.source === "local" ? "model cục bộ"
+        : "không LLM — dữ liệu thô";
+      const focus = j.focused ? ` · focus ${j.focused}` : "";
+      addMsg("bot", j.answer, `${src}${focus} · ${j.elapsed_s}s`);
+    } else {
+      addMsg("err", j.error || `lỗi (${r.status})`);
+    }
+  } catch(e) {
+    pending.remove();
+    addMsg("err", "mất kết nối tới dashboard API");
+  } finally {
+    chatBusy = false; chatsend.disabled = false;
+    chatin.focus();
+  }
+}
+chatsend.addEventListener("click", () => sendChat());
+chatin.addEventListener("keydown", e => {
+  if (e.key === "Enter") sendChat();
+});
+// hook agent chips into the existing 2.5s tick (render runs first)
+const _render = render;
+render = function(s){ _render(s); buildAgentChips(s); };
 </script>
 </body>
 </html>"""
@@ -352,7 +479,10 @@ def create_app(memory: SharedMemory, settings: Settings):
     from fastapi import FastAPI
     from fastapi.responses import HTMLResponse, JSONResponse
 
+    from agentics.dashboard.chat import ChatSession
+
     app = FastAPI(title="Agentics Lab Dashboard", docs_url=None, redoc_url=None)
+    chat_session = ChatSession()
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -362,6 +492,21 @@ def create_app(memory: SharedMemory, settings: Settings):
     def state():
         try:
             return JSONResponse(_state(memory, settings))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.post("/api/chat")
+    async def chat(payload: dict):
+        """Owner chat — hỏi về agent cụ thể hoặc bất kỳ điều gì lab đang thấy.
+        Read-only, local-model only (xem agentics/dashboard/chat.py docstring):
+        không đốt cookie pool, không ghi vào shared memory. Model cục bộ
+        vắng mặt thì degrade sang digest thô thay vì lỗi."""
+        question = str((payload or {}).get("question", "")).strip()
+        if not question:
+            return JSONResponse({"error": "câu hỏi rỗng"}, status_code=400)
+        try:
+            return JSONResponse(await chat_session.ask(memory, settings,
+                                                       question))
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": str(exc)}, status_code=500)
 
