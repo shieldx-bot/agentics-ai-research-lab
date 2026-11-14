@@ -235,6 +235,16 @@ class Settings:
     # entirely (Ollama >= 0.9; older runtimes just ignore the field).
     local_llm_think: bool = field(
         default_factory=lambda: _env_bool("LOCAL_LLM_THINK", False))
+    # Request-level keep_alive (overrides any OLLAMA_KEEP_ALIVE server
+    # default). "30m" keeps the model warm between cycles; lower it
+    # ("10m"/"5m") on RAM-tight hosts — llama.cpp's prompt cache can grow
+    # to ~8 GiB while the model is loaded (upstream ollama#17351: the
+    # cache limit is NOT configurable), and a global OOM kill of
+    # llama-server is what took the local edge down 2026-11-14 10:35.
+    # Unloading on idle frees the cache with it; a GPU reload costs only
+    # seconds.
+    local_llm_keep_alive: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_KEEP_ALIVE", "30m"))
     # Comma-separated purposes that may route to the local model. Science
     # purposes (research/verify/ideation/implement/review/repair/defend/
     # tournament) can NEVER be listed here — the router refuses them even

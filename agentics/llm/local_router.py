@@ -124,7 +124,16 @@ async def ask(prompt: str, settings=None, purpose: str = "local",
         "model": model,
         "messages": messages,
         "stream": False,
-        "keep_alive": "30m",
+        # Configurable (LOCAL_LLM_KEEP_ALIVE, default 30m): while the model
+        # is loaded, llama.cpp also keeps its prompt cache in RAM — which
+        # can grow to ~8 GiB and is NOT configurable (upstream
+        # ollama#17351). On a RAM-tight host the kernel OOM-killer then
+        # takes down llama-server mid-request (live 2026-11-14 10:35:
+        # global OOM, anon-rss 6 GB, ServerDisconnectedError in the lab).
+        # A shorter keep_alive frees model + cache on idle; a GPU reload
+        # costs only seconds.
+        "keep_alive": str(getattr(settings, "local_llm_keep_alive",
+                                  "30m") or "30m"),
         "options": {
             "temperature": 0.2,
             "num_predict": int(getattr(settings, "local_llm_num_predict",

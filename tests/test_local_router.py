@@ -132,6 +132,30 @@ def test_ask_think_param_respects_env(monkeypatch):
     assert "think" not in captured             # runtime decides, model thinks
 
 
+def test_ask_keep_alive_is_configurable(monkeypatch):
+    """Live 2026-11-14 10:35: the kernel OOM-killed llama-server (global
+    OOM, anon-rss 6 GB) — while the model is loaded, llama.cpp's prompt
+    cache grows toward ~8 GiB and the limit is NOT configurable upstream
+    (ollama#17351). A RAM-tight host must be able to shorten keep_alive
+    so model + cache unload on idle; the request-level value overrides
+    any OLLAMA_KEEP_ALIVE server default, so it has to come from here."""
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured.update(payload)
+        return {"message": {"content": "ok"}}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_keep_alive="5m")
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["keep_alive"] == "5m"
+
+    # empty/None env must not send a None keep_alive to Ollama
+    s = _settings(local_llm_keep_alive="")
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["keep_alive"] == "30m"
+
+
 def test_ask_strips_think_blocks(monkeypatch):
     async def fake_post(url, payload, settings=None):
         return {"message": {

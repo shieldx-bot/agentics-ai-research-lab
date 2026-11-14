@@ -41,7 +41,8 @@ Environment knobs (all read from `agentics/config.py`):
 | `LOCAL_LLM_TIMEOUT` | `120.0` | per-request timeout, seconds — CPU-realistic: the FIRST call also loads the model into RAM |
 | `LOCAL_LLM_NUM_PREDICT` | `512` | bounded generation so CPU inference finishes in seconds |
 | `LOCAL_LLM_THINK` | `0` | `1` lets qwen3-family models think (slower; `<think>` blocks are stripped either way) |
-| `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis` | comma-separated purposes allowed to route local |
+| `LOCAL_LLM_KEEP_ALIVE` | `30m` | request-level model residency (overrides any `OLLAMA_KEEP_ALIVE`); lower to `10m`/`5m` on RAM-tight hosts — see the OOM failure mode below |
+| `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis,prompt_evolve,reflect,skill_distill` | comma-separated purposes allowed to route local |
 
 Two routing behaviors (in `agentics/graph/nodes.py:_llm_ask` and
 `agentics/research/kg_extract.py`):
@@ -196,6 +197,20 @@ FROM journal WHERE event='discovery_confirmed';
 * **Silent `failed: ` warnings are timeouts**: `TimeoutError` stringifies
   to empty — the router now logs `failed: TimeoutError: `. If you see it,
   raise `LOCAL_LLM_TIMEOUT` or lower `LOCAL_LLM_NUM_PREDICT`.
+* **Kernel OOM-killer takes down llama-server** (live 2026-11-14 10:35:
+  `Out of memory: Killed process (llama-server)` mid-request, lab saw
+  `ServerDisconnectedError` then `Connect call failed`, systemd restarted
+  Ollama at 10:35:17). While the model is loaded, llama.cpp keeps its
+  PROMPT CACHE in RAM — ~240-400 MiB per distinct prompt at 4096 ctx,
+  capped at ~8 GiB, and that cap is NOT configurable upstream
+  (ollama#17351). The lab sends a fresh ~3k-token plan prompt nearly every
+  cycle, so a RAM-tight host (MySQL + desktop + lab Python on the same
+  box) reaches global OOM in about an hour of churn. Mitigations, in
+  order of preference: `LOCAL_LLM_KEEP_ALIVE=10m` (idle unloads free the
+  cache with the model; GPU reload costs seconds), `OLLAMA_KV_CACHE_TYPE=q8_0`
+  in the systemd unit (halves per-prompt state size), add swap so the
+  global OOM never fires. Diagnosis: `systemctl show ollama -p NRestarts
+  -p ExecMainStartTimestamp`, then `sudo dmesg | grep -iE "oom|killed"`.
 * **Ollama down / model missing** → router returns `ok=False`, lab logs a
   warning and continues exactly as before. Nothing to clean up; fix with
   `ollama serve` / `ollama pull`.
