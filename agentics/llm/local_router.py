@@ -236,20 +236,37 @@ async def _ask_ollama(base: str, model: str, prompt: str,
     empty): the FIRST call also loads the model into RAM (1.7B ≈ 30-60s
     on CPU), qwen3 is a reasoning model that would burn hundreds of
     tokens in <think>, and without num_predict Ollama generates up to
-    2048 tokens. So: bounded generation (num_predict), thinking off by
-    default (LOCAL_LLM_THINK=1 to re-enable), a long keep_alive so the
-    model stays warm between cycles, and the default timeout raised to
+    2048 tokens. So: bounded generation (num_predict), a pinned context
+    window (num_ctx, LOCAL_LLM_NUM_CTX — cache slots scale with it),
+    thinking off by default (LOCAL_LLM_THINK=1 to re-enable), a short
+    keep_alive so idle unloads free model + prompt cache
+    (LOCAL_LLM_KEEP_ALIVE), and the default timeout raised to
     120s (LOCAL_LLM_TIMEOUT)."""
     started = time.monotonic()
     payload = {
         "model": model,
         "messages": _messages(prompt, system),
         "stream": False,
-        "keep_alive": "30m",
+        # Configurable (LOCAL_LLM_KEEP_ALIVE, default 5m): while the model
+        # is loaded, llama.cpp also keeps its prompt cache in RAM — which
+        # can grow to ~8 GiB and is NOT configurable (upstream
+        # ollama#17351). On a RAM-tight host the kernel OOM-killer then
+        # takes down llama-server mid-request (live 2026-11-14 10:35 AND
+        # ~13:43: global OOM, anon-rss 6 GB, ServerDisconnectedError in
+        # the lab). A short keep_alive frees model + cache on idle; a GPU
+        # reload costs only seconds.
+        "keep_alive": str(getattr(settings, "local_llm_keep_alive",
+                                  "5m") or "5m"),
         "options": {
             "temperature": 0.2,
             "num_predict": int(getattr(settings, "local_llm_num_predict",
                                        512) or 512),
+            # Prompt-cache slots scale with the context window (~238 MiB
+            # per slot at the model default ctx → ~7 GB RSS across the
+            # ~30-slot LRU → the OOM above). Pin it explicitly; the lab's
+            # prompts are designed for a 4096 ctx anyway.
+            "num_ctx": int(getattr(settings, "local_llm_num_ctx",
+                                   4096) or 4096),
         },
     }
     if not bool(getattr(settings, "local_llm_think", False)):

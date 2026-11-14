@@ -75,8 +75,10 @@ Environment knobs (all read from `agentics/config.py`):
 | `LOCAL_LLM_VL_MODEL` | *(empty)* | vision-tier id (Nemotron 3.5 Super VL) — reserved until an image-bearing purpose exists |
 | `LOCAL_LLM_TIMEOUT` | `120.0` | per-request timeout, seconds — CPU-realistic: the FIRST call also loads the model into RAM |
 | `LOCAL_LLM_NUM_PREDICT` | `512` | bounded generation (`max_tokens`) so inference finishes in seconds |
+| `LOCAL_LLM_NUM_CTX` | `4096` | Ollama-native only: pinned context window — llama.cpp prompt-cache slots scale with ctx, so a tight ctx keeps every slot (and RSS) small (see the OOM failure mode below) |
 | `LOCAL_LLM_THINK` | `0` | `1` lets Nemotron/qwen3-family models think (slower; `<think>` blocks are stripped either way) |
-| `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis` | comma-separated purposes allowed to route local |
+| `LOCAL_LLM_KEEP_ALIVE` | `5m` | request-level model residency (overrides any `OLLAMA_KEEP_ALIVE`); idle unloads free model + cache together on RAM-tight hosts — see the OOM failure mode below |
+| `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis,prompt_evolve,reflect,skill_distill` | comma-separated purposes allowed to route local |
 
 Two routing behaviors (in `agentics/graph/nodes.py:_llm_ask` and
 `agentics/research/kg_extract.py`):
@@ -225,12 +227,40 @@ FROM journal WHERE event='discovery_confirmed';
   first `/api/chat` also loads 1.3 GB into RAM (30-60s on CPU), the
   model would otherwise think and generate up to 2048 tokens. The router
   therefore sends `num_predict: 512`, `think: false` (strips any leftover
-  `<think>` block too) and `keep_alive: 30m` so the model stays warm
-  between cycles. Raise `LOCAL_LLM_NUM_PREDICT` only if local answers
-  get truncated.
+  `<think>` block too), pins `num_ctx: 4096` and `keep_alive: 5m` so idle
+  unloads free model + cache (a GPU reload costs seconds). Raise
+  `LOCAL_LLM_NUM_PREDICT` only if local answers get truncated.
 * **Silent `failed: ` warnings are timeouts**: `TimeoutError` stringifies
   to empty — the router now logs `failed: TimeoutError: `. If you see it,
   raise `LOCAL_LLM_TIMEOUT` or lower `LOCAL_LLM_NUM_PREDICT`.
+* **Kernel OOM-killer takes down llama-server** (live 2026-11-14 10:35
+  AND ~13:43 — killed TWICE the same day: `Out of memory: Killed process
+  (llama-server)` mid-request, lab saw `ServerDisconnectedError` then
+  `Connect call failed`; a no-LLM dashboard question during the outage
+  window degrades to the raw digest, which is by design). While the
+  model is loaded, llama.cpp keeps its PROMPT CACHE in RAM — ~240-400
+  MiB per distinct prompt at the model-default ctx, capped at ~8 GiB,
+  and that cap is NOT configurable upstream (ollama#17351). The lab
+  sends a fresh ~3k-token plan prompt nearly every cycle, so a RAM-tight
+  host (MySQL + desktop + lab Python on the same box) reaches global OOM
+  in about an hour of churn.
+
+  Shipped fix (defaults, no env needed): the router now pins
+  `num_ctx: 4096` (`LOCAL_LLM_NUM_CTX`) — every cache slot scales with
+  the context window, so the model-default ctx produced the ~238 MiB
+  slots × ~30-slot LRU ≈ 7 GB RSS seen in the 10:35 journal — and
+  defaults `LOCAL_LLM_KEEP_ALIVE=5m` so idle unloads free the cache with
+  the model.
+
+  Host-side hardening (recommended once, for the systemd unit): drop
+  `configs/ollama-hardening.conf` into
+  `/etc/systemd/system/ollama.service.d/` — it sets `OLLAMA_NUM_PARALLEL=1`
+  (one cache slot instead of N), `OLLAMA_KV_CACHE_TYPE=q8_0` (halves
+  per-slot state), and a cgroup `MemoryMax` so a runaway llama-server is
+  contained and restarted INSTEAD of a global OOM hitting the whole
+  desktop. Then `sudo systemctl daemon-reload && sudo systemctl restart
+  ollama`. Diagnosis: `systemctl show ollama -p NRestarts
+  -p ExecMainStartTimestamp`, then `sudo dmesg | grep -iE "oom|killed"`.
 * **Ollama down / model missing** → router returns `ok=False`, lab logs a
   warning and continues exactly as before. Nothing to clean up; fix with
   `ollama serve` / `ollama pull`.

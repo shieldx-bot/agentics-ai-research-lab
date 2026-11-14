@@ -115,8 +115,9 @@ def test_ask_payload_is_cpu_bounded(monkeypatch):
     monkeypatch.setattr(local_router, "_post", fake_post)
     s = _settings(local_llm_num_predict=256, local_llm_timeout=120.0)
     assert asyncio.run(local_router.ask("hi", s)) is not None
-    assert captured["keep_alive"] == "30m"
+    assert captured["keep_alive"] == "5m"
     assert captured["options"]["num_predict"] == 256
+    assert captured["options"]["num_ctx"] == 4096      # pinned, not model default
     assert captured["think"] is False          # thinking off by default
 
 
@@ -130,6 +131,52 @@ def test_ask_think_param_respects_env(monkeypatch):
     s = _settings(local_llm_think=True)
     assert asyncio.run(local_router.ask("hi", s)) is not None
     assert "think" not in captured             # runtime decides, model thinks
+
+
+def test_ask_keep_alive_is_configurable(monkeypatch):
+    """Live 2026-11-14 10:35: the kernel OOM-killed llama-server (global
+    OOM, anon-rss 6 GB) — while the model is loaded, llama.cpp's prompt
+    cache grows toward ~8 GiB and the limit is NOT configurable upstream
+    (ollama#17351). A RAM-tight host must be able to shorten keep_alive
+    so model + cache unload on idle; the request-level value overrides
+    any OLLAMA_KEEP_ALIVE server default, so it has to come from here."""
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured.update(payload)
+        return {"message": {"content": "ok"}}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_keep_alive="30m")
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["keep_alive"] == "30m"
+
+    # empty/None env must not send a None keep_alive to Ollama
+    s = _settings(local_llm_keep_alive="")
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["keep_alive"] == "5m"
+
+
+def test_ask_num_ctx_is_capped_and_configurable(monkeypatch):
+    """Live 2026-11-14 10:35 + ~13:43 (killed TWICE): llama.cpp cache slots
+    scale with the context window — the 10:35 journal showed ~238 MiB
+    slots x ~30 LRU ≈ 7 GB RSS → global OOM. num_ctx must be pinned in
+    EVERY payload (never left to the model default) and configurable."""
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured.update(payload)
+        return {"message": {"content": "ok"}}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_num_ctx=8192)
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["options"]["num_ctx"] == 8192
+
+    # empty/0 env must degrade to the 4096 design default, not None/0
+    s = _settings(local_llm_num_ctx=0)
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["options"]["num_ctx"] == 4096
 
 
 def test_ask_strips_think_blocks(monkeypatch):
@@ -150,6 +197,16 @@ def test_timeout_default_is_cpu_realistic():
     cfg = config.Settings()
     assert cfg.local_llm_timeout >= 60.0        # 20s starved the first call
     assert cfg.local_llm_num_predict > 0
+
+
+def test_defaults_fit_a_ram_tight_host():
+    """2026-11-14 OOM postmortem: the shipped defaults must already be the
+    safe ones — keep_alive short enough that idle unloads the prompt
+    cache, num_ctx pinned to the lab's 4096 design budget."""
+    import agentics.config as config
+    cfg = config.Settings()
+    assert cfg.local_llm_keep_alive == "5m"
+    assert cfg.local_llm_num_ctx == 4096
 
 
 def test_post_never_raises_on_garbage(monkeypatch):
