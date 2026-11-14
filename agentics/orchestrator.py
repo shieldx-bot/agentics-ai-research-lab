@@ -110,7 +110,22 @@ class Orchestrator:
 
             guard = IntegrityGuard(PROJECT_ROOT, self.settings.integrity_path)
             existed, drift = guard.ensure_baseline()
-            if drift:
+            reanchor = getattr(guard, "last_reanchor", None)
+            if reanchor:
+                # The tree changed BECAUSE the git HEAD moved (owner pulled a
+                # new commit, or the guarded merge queue advanced main) — the
+                # baseline is stale by definition, not tampered with. Re-
+                # anchor to the new HEAD and say so; only drift WITHOUT a
+                # HEAD move stays an owner-visible alert.
+                msg = ("integrity baseline re-anchored to %s (%d file(s) "
+                       "changed with the new HEAD)" % (
+                           reanchor["to"][:12], reanchor["changed"]))
+                self.memory.journal("orchestrator", "integrity_reanchored",
+                                    {"from": reanchor["from"][:12],
+                                     "to": reanchor["to"][:12],
+                                     "changed": reanchor["changed"]})
+                log.info(msg)
+            elif drift:
                 msg = (
                     "Runtime integrity drift: %d file(s) differ from the baseline "
                     "- run `agentics verify` (owner decision)" % len(drift)
@@ -169,6 +184,12 @@ class Orchestrator:
                     fail_streak_limit=self.settings.llm_fail_streak_limit,
                     cooldown_s=self.settings.llm_breaker_cooldown_s,
                     agent_id=agent_id,
+                    reserve_pct=float(getattr(self.settings,
+                                              "budget_reserve_pct", 0.0) or 0.0),
+                    reserve_purposes=tuple(
+                        p.strip() for p in str(getattr(
+                            self.settings, "budget_reserve_purposes",
+                            "") or "").split(",") if p.strip()),
                 ),
                 panel=PeerPanel(
                     self.memory,

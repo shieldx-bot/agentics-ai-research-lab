@@ -930,6 +930,20 @@ class SharedMemory:
             ).fetchone()
         return int(row[0] if row else 0)
 
+    def llm_kth_oldest_call_ts(self, window_s: float = 3600.0,
+                               k: int = 1) -> float | None:
+        """Timestamp of the k-th OLDEST call inside the sliding window —
+        the anchor for P20's retry hint: when this call exits the window
+        (ts + window_s), `used` drops by one. None when fewer than k calls."""
+        k = max(int(k), 1)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ts FROM llm_usage WHERE ts > ? ORDER BY ts ASC "
+                "LIMIT 1 OFFSET ?",
+                (time.time() - window_s, k - 1),
+            ).fetchone()
+        return float(row[0]) if row else None
+
     def llm_fail_streak(self, agent: str) -> int:
         """Consecutive failed calls by one agent (newest backwards) — the
         circuit breaker counts provider failures, not 'answered but slow'."""

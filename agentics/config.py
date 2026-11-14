@@ -172,6 +172,22 @@ class Settings:
         default_factory=lambda: _env_int("LLM_FAIL_STREAK_LIMIT", 5))
     llm_breaker_cooldown_s: int = field(
         default_factory=lambda: _env_int("LLM_BREAKER_COOLDOWN_S", 900))
+    # P20b — science reserve: the last slice of the pool cap that ONLY the
+    # reserve purposes may spend, so plumbing (plan/review/research fan-out)
+    # can never starve the verify/ideation escape hatch the way the live
+    # 07:08 run starved it (previous hour drained the pool, the saturation
+    # pivot itself was refused). 0 = off; purposes are a comma-separated tag
+    # list matched against the ask's `purpose`.
+    budget_reserve_pct: float = field(
+        default_factory=lambda: _env_float("BUDGET_RESERVE_PCT", 0.25))
+    budget_reserve_purposes: str = field(
+        default_factory=lambda: _env("BUDGET_RESERVE_PURPOSES",
+                                     "verify,ideation"))
+    # Max seconds a blocked reserve-purpose ask may sleep inside _llm_ask
+    # and retry ONCE (the window slides continuously; waiting beats dying
+    # for the whole hour). 0 = never wait.
+    budget_block_wait_cap_s: float = field(
+        default_factory=lambda: _env_float("BUDGET_BLOCK_WAIT_CAP_S", 45.0))
     # P22 — retention: workspaces of agents inactive longer than this AND
     # with a clean git tree get pruned by the supervisor sweep (0 = off).
     workspace_retention_minutes: int = field(

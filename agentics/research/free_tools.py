@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 import urllib.parse
@@ -53,10 +54,24 @@ _TIMEOUT_S = 15.0
 _ARXIV_MIN_INTERVAL_S = 3.0          # arXiv asks for 1 call / 3 s
 _CACHE_TTL_S = 600.0                 # process-wide result cache
 _MAX_LOOKUPS = 8                     # per-call enrichment cap
+# Per-HOST politeness for the shared-anonymous-budget APIs. Live 07:08:
+# 7 agents fired S2/OpenAlex/Crossref searches in parallel and all three
+# answered 429 within the first minute — the swarm looks like ONE client
+# to them, so the pace must be swarm-wide, not per-agent.
+_MIN_INTERVALS: dict = {
+    "api.semanticscholar.org": 1.0,   # anonymous pool, 1 rps-ish
+    "api.openalex.org": 1.0,          # polite pool / datacenter IPs
+    "api.crossref.org": 1.0,          # + mailto when provided
+}
+_pacer_last: dict = {}
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _ARXIV_ID_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5})(v\d+)?", re.I)
 _DOI_RE = re.compile(r"doi\.org/(10\.\S+?)(?:\s|$|[)\]}>,\"])", re.I)
+# arXiv's own DataCite DOI prefix: api.crossref.org will NEVER hold these
+# (10.48550 is registered with DataCite) — route them to the arXiv API.
+_ARXIV_DOI_RE = re.compile(r"^10\.48550/arxiv\.([0-9]{4}\.[0-9]{4,5})(v\d+)?$",
+                           re.I)
 
 _USER_AGENT = "agentics-ai-research-lab (+https://github.com/shieldx-bot/agentics-ai-research-lab)"
 
@@ -111,7 +126,10 @@ async def _request(url: str, *, params: dict | None = None, headers: dict | None
 
     A 429/503 (shared-IP budget exhaustion — common for OpenAlex on
     datacenter hosts) is retried ONCE after the server's Retry-After delay
-    (bounded to 10 s); everything else fails fast to the graceful path."""
+    (bounded to 10 s, jittered so parallel agents do not re-fire in
+    lock-step); everything else fails fast to the graceful path. Calls to
+    hosts in ``_MIN_INTERVALS`` are swarm-wide paced before firing."""
+    await _pace_host(url)
     timeout = aiohttp.ClientTimeout(total=_timeout(settings))
     hdrs = {"User-Agent": _USER_AGENT, **(headers or {})}
     for attempt in (0, 1):
@@ -123,6 +141,7 @@ async def _request(url: str, *, params: dict | None = None, headers: dict | None
                         return await resp.text()
                     if resp.status in (429, 503) and attempt == 0:
                         retry_delay = min(_retry_after(resp) or 2.0, 10.0)
+                        retry_delay *= random.uniform(1.0, 1.5)
                     else:
                         log.warning("free_tools %s %s -> HTTP %s",
                                     method, url.split("?")[0], resp.status)
@@ -135,6 +154,20 @@ async def _request(url: str, *, params: dict | None = None, headers: dict | None
                         url.split("?")[0], retry_delay)
             await asyncio.sleep(retry_delay)
     return None
+
+
+async def _pace_host(url: str) -> None:
+    """Swarm-wide politeness: at most one call per _MIN_INTERVALS window
+    per host (single event loop, all agents included). Hosts not listed
+    are unpaced."""
+    host = urllib.parse.urlsplit(url).netloc.lower()
+    interval = _MIN_INTERVALS.get(host, 0.0)
+    if interval <= 0:
+        return
+    wait = interval - (time.monotonic() - _pacer_last.get(host, 0.0))
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _pacer_last[host] = time.monotonic()
 
 
 def _retry_after(resp: "aiohttp.ClientResponse") -> float | None:
@@ -530,7 +563,13 @@ async def enriched_bibtex(urls: list[str], settings=None, max_lookups: int = _MA
         if aid and not doi:
             arxiv_ids.setdefault(aid, c.key)
         elif doi:
-            dois.setdefault(doi, c.key)
+            m = _ARXIV_DOI_RE.match(doi)
+            if m:
+                # 10.48550/arxiv.NNNN.NNNNN -> the arXiv batch below; asking
+                # Crossref for it is a guaranteed 404 (DataCite, not Crossref)
+                arxiv_ids.setdefault(m.group(1) + (m.group(2) or ""), c.key)
+            else:
+                dois.setdefault(doi, c.key)
         else:
             legacy_keys.append(c.key)
 
@@ -556,6 +595,9 @@ async def enriched_bibtex(urls: list[str], settings=None, max_lookups: int = _MA
             if hit is None:  # id_list echoes versions; match base id too
                 hit = next((h for k, h in by_id.items() if k.split("v")[0] == aid.split("v")[0]), None)
             if hit:
+                if not hit.doi:
+                    # the citation URL carried the DataCite DOI — keep it
+                    hit.doi = f"10.48550/arxiv.{aid.split('v')[0]}"
                 results[key] = _bibtex_entry(key, hit, eprint=aid)
             else:
                 _to_legacy(key, f"https://arxiv.org/abs/{aid}")

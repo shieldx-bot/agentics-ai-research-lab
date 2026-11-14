@@ -250,7 +250,24 @@ async def _llm_ask(
     budget = getattr(ctx, "budget", None)
     started = time.monotonic()
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose)
+        if not allowed and purpose and why.startswith("P20 pool budget"):
+            # P20b — a science-critical ask (verify/ideation reserve) that
+            # is merely AHEAD of the sliding window should wait seconds and
+            # retry ONCE instead of dying for the rest of the hour: the
+            # window frees continuously, so a short bounded wait usually
+            # gets the escape hatch through. Wait only when the retry hint
+            # is small (window nearly drained anyway); otherwise give up
+            # fast and let the cycle degrade as before.
+            wait_cap = float(getattr(ctx.settings, "budget_block_wait_cap_s",
+                                     0.0) or 0.0)
+            if wait_cap > 0:
+                wait = budget.retry_in_s(ctx.agent_id, purpose)
+                if 0 < wait <= wait_cap:
+                    log.info("[%s] %s waits %.0fs for the budget window "
+                             "to slide", ctx.agent_id, purpose, wait)
+                    await asyncio.sleep(wait)
+                    allowed, why = budget.can_ask(ctx.agent_id, purpose)
         if not allowed:
             log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
             if state is not None and not state.get("error"):
@@ -704,7 +721,7 @@ async def _ask_angle(ctx: AgentContext, view, angle: tuple[str, str],
     None instead of breaking the finding."""
     label, hint = angle
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose="research")
         if not allowed:
             log.info("[%s] fan-out angle '%s' skipped by budget: %s",
                      ctx.agent_id, label, why)
@@ -1887,7 +1904,7 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     # without burning a single budgeted call.
     budget = getattr(ctx, "budget", None)
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose="research")
         if not allowed:
             log.warning("[%s] research blocked by budget: %s", ctx.agent_id, why)
             try:

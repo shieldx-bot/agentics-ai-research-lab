@@ -178,7 +178,8 @@ def test_llm_ask_blocked_by_budget_never_reaches_provider():
             pass
 
     budget = BudgetPolicy(None, max_calls_per_hour=0)
-    budget.can_ask = lambda agent: (False, "P20 pool budget exhausted (test)")
+    budget.can_ask = lambda agent, purpose="": (
+        False, "P20 pool budget exhausted (test)")
     budget.record = lambda *a, **k: None
     ctx = SimpleNamespace(llm=SimpleNamespace(ask=fake_ask, account=None),
                           agent_id="a03", role=Role.CODER, settings=SimpleNamespace(
