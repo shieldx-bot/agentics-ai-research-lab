@@ -239,11 +239,11 @@ def _fake_session_factory(methods_seen: list, status: int = 200):
         def __init__(self, *a, **k):
             pass
 
-        def get(self, url):
+        def get(self, url, headers=None):
             methods_seen.append("GET")
             return _Ctx()
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, headers=None):
             methods_seen.append("POST")
             return _Ctx()
 
@@ -295,7 +295,7 @@ def test_available_false_on_405_style_failure(monkeypatch, caplog):
         def __init__(self, *a, **k):
             pass
 
-        def get(self, url):
+        def get(self, url, headers=None):
             methods.append("GET")
             return _Ctx()
 
@@ -479,3 +479,63 @@ def test_default_config_points_at_omniroute_and_nemotron():
     assert cfg.local_llm_backend == "auto"
     assert cfg.local_llm_url.rstrip("/").endswith("/v1")
     assert "nemotron" in cfg.local_llm_model.lower()
+
+
+# --------------------------------------- gateway auth (OmniRoute API Keys)
+def test_headers_bearer_only_when_key_set():
+    """LOCAL_LLM_API_KEY empty (the localhost default) must send NO
+    Authorization header at all; a set key becomes a Bearer header
+    (whitespace-stripped)."""
+    assert local_router._headers(_settings()) == {}
+    assert local_router._headers(_settings(local_llm_api_key="")) == {}
+    assert local_router._headers(
+        _settings(local_llm_api_key=" omni-key-123 ")) == {
+            "Authorization": "Bearer omni-key-123"}
+
+
+def test_post_carries_bearer_when_key_set(monkeypatch):
+    """The OmniRoute gateway can require its API Key for non-localhost
+    access (LAN 192.168.x.x:20128 / tunnels) — every POST must carry it."""
+    seen = {}
+
+    class _Resp:
+        status = 200
+
+        async def json(self, *a, **k):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, headers=None):
+            seen["headers"] = headers or {}
+            return _Ctx()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(local_router.aiohttp, "ClientTimeout",
+                        lambda *a, **k: 1.0)
+    monkeypatch.setattr(local_router.aiohttp, "ClientSession", _Session)
+    _clear_mode_cache()
+    s = _settings(local_llm_url="http://127.0.0.1:20128/v1",
+                  local_llm_api_key="omni-key-123")
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert seen["headers"].get("Authorization") == "Bearer omni-key-123"
+
+    # no key configured -> no Authorization header (plain localhost gateway)
+    seen.clear()
+    s2 = _settings(local_llm_url="http://127.0.0.1:20128/v1")
+    assert asyncio.run(local_router.ask("hi", s2)) is not None
+    assert "Authorization" not in seen["headers"]

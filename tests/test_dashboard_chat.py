@@ -3,7 +3,7 @@
 Contract being tested:
 * build_context: fresh digest, agent-focus narrowing, never invents data.
 * ask_lab: local-model happy path (history carried forward), graceful
-  digest fallback when Ollama is absent/raising, and history ring bounds.
+  digest fallback when the local model tier is absent/raising, and history ring bounds.
 * endpoint: POST /api/chat answers, empty question is 400, and the whole
   feature stays read-only over shared memory.
 """

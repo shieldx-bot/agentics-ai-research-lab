@@ -3,7 +3,8 @@
 Design contract (mirrors the dashboard's local-only guarantee):
 
 * **Zero cookie cost** — the question and the memory digest go ONLY to the
-  local router (Ollama). The chat never touches the cookie pool, never
+  local router (OmniRoute tier — any backend the gateway routes). The chat
+  never touches the cookie pool, never
   passes P20 (it is owner plumbing, not swarm work) and never routes to a
   science purpose.
 * **Read-only** — the chat consumes SharedMemory but writes nothing: no
@@ -13,7 +14,7 @@ Design contract (mirrors the dashboard's local-only guarantee):
   shared memory (agents, budget, tasks, evidence, hypotheses, journal).
   The system prompt forbids inventing numbers: what is not in the digest
   must be answered with "không có dữ liệu".
-* **Graceful degradation** — Ollama absent/slow/dead degrades to a raw
+* **Graceful degradation** — the local tier absent/slow/dead degrades to a raw
   digest summary (``source="digest"``), so the endpoint always answers the
   owner something truthful instead of an error page.
 * **Agent focus** — a question naming an agent ("a03 đang làm gì?") filters
@@ -155,7 +156,7 @@ def build_context(memory: SharedMemory, settings: Settings,
 
 def _fallback_answer(digest: str) -> str:
     """No-LLM answer: the digest itself, honestly labelled. Never fails."""
-    return ("[Chế độ không LLM — model cục bộ (Ollama) không khả dụng; "
+    return ("[Chế độ không LLM — model cục bộ (OmniRoute) không khả dụng; "
             "đây là dữ liệu thô từ shared memory]\n\n" + digest[:2500])
 
 

@@ -258,6 +258,14 @@ class Settings:
     # until a vision purpose lands; the knob just pins the model id.
     local_llm_vl_model: str = field(
         default_factory=lambda: _env("LOCAL_LLM_VL_MODEL"))
+    # Optional bearer token for the local gateway itself (LOCAL_LLM_API_KEY,
+    # mirrored in configs/secrets.yaml). OmniRoute ships an "API Keys" page —
+    # required for LAN/tunnel access (the lab on another machine talking to
+    # 192.168.x.x:20128 or a Cloud tunnel), optional for plain localhost.
+    # Empty = NO Authorization header at all, exactly what an unauthenticated
+    # localhost gateway expects.
+    local_llm_api_key: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_API_KEY"))
     # CPU-realistic defaults (live 2026-11-14 08:51: the first /api/chat
     # also LOADS the model into RAM and qwen3 would think/generate for
     # minutes — 20s timed out with an empty error string every cycle).

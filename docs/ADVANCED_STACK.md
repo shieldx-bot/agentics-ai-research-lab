@@ -78,6 +78,7 @@ Environment knobs (all read from `agentics/config.py`):
 | `LOCAL_LLM_NUM_CTX` | `4096` | Ollama-native only: pinned context window — llama.cpp prompt-cache slots scale with ctx, so a tight ctx keeps every slot (and RSS) small (see the OOM failure mode below) |
 | `LOCAL_LLM_THINK` | `0` | `1` lets Nemotron/qwen3-family models think (slower; `<think>` blocks are stripped either way) |
 | `LOCAL_LLM_KEEP_ALIVE` | `5m` | request-level model residency (overrides any `OLLAMA_KEEP_ALIVE`); idle unloads free model + cache together on RAM-tight hosts — see the OOM failure mode below |
+| `LOCAL_LLM_API_KEY` | *(empty)* | optional bearer for the gateway's own auth (OmniRoute "API Keys" page — needed for LAN/tunnel access); empty sends NO Authorization header |
 | `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis,prompt_evolve,reflect,skill_distill` | comma-separated purposes allowed to route local |
 
 Two routing behaviors (in `agentics/graph/nodes.py:_llm_ask` and

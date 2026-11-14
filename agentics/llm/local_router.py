@@ -73,6 +73,15 @@ def _openai_base(base: str) -> str:
     return base if base.endswith("/v1") else f"{base}/v1"
 
 
+def _headers(settings=None) -> dict[str, str]:
+    """Auth header ONLY when LOCAL_LLM_API_KEY is set — OmniRoute's API
+    Keys page can require a bearer for LAN/tunnel access (the lab on
+    another machine talking to 192.168.x.x:20128), while an unauthenticated
+    localhost gateway must not receive a bare Authorization line."""
+    key = str(getattr(settings, "local_llm_api_key", "") or "").strip()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def _mode(base: str, settings=None) -> str:
     """Which protocol answers at ``base`` — cached when `available()` probed,
     else the URL-shape heuristic (no network in the ask path):
@@ -92,7 +101,8 @@ async def _post(url: str, payload: dict,
     try:
         timeout = aiohttp.ClientTimeout(total=_timeout(settings))
         async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.post(url, json=payload) as resp:
+            async with sess.post(url, json=payload,
+                                 headers=_headers(settings)) as resp:
                 if resp.status != 200:
                     log.warning("local_router %s -> HTTP %s",
                                 url, resp.status)
@@ -111,7 +121,7 @@ async def _get(url: str, settings=None) -> dict | None:
     try:
         timeout = aiohttp.ClientTimeout(total=_timeout(settings))
         async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(url) as resp:
+            async with sess.get(url, headers=_headers(settings)) as resp:
                 if resp.status != 200:
                     log.warning("local_router %s -> HTTP %s", url, resp.status)
                     return None
