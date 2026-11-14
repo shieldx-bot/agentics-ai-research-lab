@@ -60,13 +60,15 @@ async def maybe_variant(ctx, role: str, category: str,
         return champion, 0
     try:
         pool = memory.prompt_variants(role, category)
-        pool_size = int(_flag(settings, "prompt_variant_pool", 3) or 3)
+        pool_size = getattr(settings, "prompt_variant_pool", 3)
+        pool_size = 3 if pool_size is None else int(pool_size)
         if len(pool) < pool_size:
             await _mutate_into_pool(ctx, role, category, champion, pool_size)
             pool = memory.prompt_variants(role, category)
         if not pool:
             return champion, 0
-        explore_p = float(_flag(settings, "prompt_explore_p", 0.25) or 0.25)
+        explore_p = getattr(settings, "prompt_explore_p", 0.25)
+        explore_p = 0.25 if explore_p is None else float(explore_p)
         if random.random() >= explore_p:
             return champion, 0
         arm = max(pool, key=lambda v: random.betavariate(
