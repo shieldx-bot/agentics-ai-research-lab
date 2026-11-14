@@ -12,13 +12,40 @@ All queries below assume the shared memory database at `data/shared_memory.db`
 |---|------------|---------|-------------|
 | 1 | PUCT discovery frontier + entropic credit | **on** | nothing (tune via `PUCT_C`, `ENTROPIC_BONUS_MAX`) |
 | 2 | MAP-Elites archive + islands (`qd_cells`) | **on** | nothing |
-| 3 | Local small-model router (Ollama) | **off** | `LOCAL_LLM_ENABLED=1 LOCAL_LLM_MODEL=qwen3:1.7b` |
+| 3 | Local small-model router (OmniRoute → NVIDIA Nemotron; Ollama legacy) | **off** | `LOCAL_LLM_ENABLED=1` — defaults point at the OmniRoute gateway (`http://127.0.0.1:20128/v1`) + `nvidia/nemotron-3-ultra-550b-a55b`; CPU-only setups: `LOCAL_LLM_BACKEND=ollama LOCAL_LLM_URL=http://127.0.0.1:11434 LOCAL_LLM_MODEL=qwen3:1.7b` |
 | 4 | GraphRAG-lite (`kg_entities` / `kg_edges`) | **on** (needs #3 for extraction) | nothing; extraction starts once #3 is enabled |
 | 5 | Hypothesis Arena (Elo tournament + pairing) | **on** | nothing (tune via `AGENTICS_TOURNAMENT_*`) |
 
 ---
 
-## 1. Quick start — enable the free local edge (Ollama)
+## 1. Quick start — enable the free local edge (OmniRoute, or legacy Ollama)
+
+**OmniRoute (recommended tier)** — a self-hosted OpenAI-compatible gateway
+that routes one endpoint across NVIDIA NIM, vLLM, LM Studio, llama.cpp and
+Ollama, so the local tier can be the owner's big models without the lab
+caring which runtime serves them:
+
+```bash
+# one-time: install and launch the gateway (endpoint http://localhost:20128/v1)
+npm install -g omniroute
+omniroute
+
+# verify the gateway answers and lists the models it can route to
+curl -s http://127.0.0.1:20128/v1/models | head -c 300
+
+# run the lab with the local edge on (defaults already point here:
+# NVIDIA Nemotron 3 Ultra 550B A55B — hybrid Mamba-Transformer MoE, 1M ctx)
+LOCAL_LLM_ENABLED=1 python -m agentics.cli run
+```
+
+Nemotron-3 reasoning models think OFF by default (`chat_template_kwargs:
+{"enable_thinking": false}` — the exact NIM knob); `LOCAL_LLM_THINK=1`
+omits the field and lets the model think. Reasoning emitted separately as
+`message.reasoning_content` is ignored — the lab's parsers want the answer.
+The vision tier (Nemotron 3.5 Super VL) is pinned via `LOCAL_LLM_VL_MODEL`,
+reserved until an image-bearing purpose exists.
+
+**Legacy Ollama (CPU-only)** — the original native path, kept verbatim:
 
 ```bash
 # one-time: pull a small chat model (1.7B runs on CPU, ~1.4 GB)
@@ -27,20 +54,28 @@ ollama pull qwen3:1.7b
 # verify the runtime answers
 curl -s http://127.0.0.1:11434/api/tags | head -c 300
 
-# run the lab with the local edge on
-LOCAL_LLM_ENABLED=1 LOCAL_LLM_MODEL=qwen3:1.7b python -m agentics.cli run
+LOCAL_LLM_ENABLED=1 LOCAL_LLM_BACKEND=ollama \
+  LOCAL_LLM_URL=http://127.0.0.1:11434 LOCAL_LLM_MODEL=qwen3:1.7b \
+  python -m agentics.cli run
 ```
+
+`LOCAL_LLM_BACKEND` = `auto` (default) / `omniroute` / `ollama`. `auto`
+decides by URL shape (`.../v1` → OpenAI chat completions, bare host:port →
+Ollama native) and caches the probe result from `available()`; the ask
+path never probes.
 
 Environment knobs (all read from `agentics/config.py`):
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `LOCAL_LLM_ENABLED` | `0` | master switch; off = no localhost calls at all |
-| `LOCAL_LLM_URL` | `http://127.0.0.1:11434` | OpenAI-compatible/Ollama base URL |
-| `LOCAL_LLM_MODEL` | *(empty)* | model tag, e.g. `qwen3:1.7b`, `qwen3:4b` |
+| `LOCAL_LLM_URL` | `http://127.0.0.1:20128/v1` | OmniRoute/OpenAI-compatible base (append `/v1`); Ollama legacy: `http://127.0.0.1:11434` |
+| `LOCAL_LLM_BACKEND` | `auto` | `auto` \| `omniroute` \| `ollama` — pin the protocol instead of the URL heuristic |
+| `LOCAL_LLM_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | model id as the gateway lists it (`GET /v1/models`), e.g. a `qwen3:1.7b` tag for CPU-only Ollama |
+| `LOCAL_LLM_VL_MODEL` | *(empty)* | vision-tier id (Nemotron 3.5 Super VL) — reserved until an image-bearing purpose exists |
 | `LOCAL_LLM_TIMEOUT` | `120.0` | per-request timeout, seconds — CPU-realistic: the FIRST call also loads the model into RAM |
-| `LOCAL_LLM_NUM_PREDICT` | `512` | bounded generation so CPU inference finishes in seconds |
-| `LOCAL_LLM_THINK` | `0` | `1` lets qwen3-family models think (slower; `<think>` blocks are stripped either way) |
+| `LOCAL_LLM_NUM_PREDICT` | `512` | bounded generation (`max_tokens`) so inference finishes in seconds |
+| `LOCAL_LLM_THINK` | `0` | `1` lets Nemotron/qwen3-family models think (slower; `<think>` blocks are stripped either way) |
 | `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis` | comma-separated purposes allowed to route local |
 
 Two routing behaviors (in `agentics/graph/nodes.py:_llm_ask` and

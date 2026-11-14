@@ -227,14 +227,37 @@ class Settings:
     # closed-form entropy reduction). 0 = pure PUCT order.
     eig_weight: float = field(
         default_factory=lambda: _env_float("EIG_WEIGHT", 0.5))
-    # Local small-model router (Ollama / llama.cpp / LM Studio) — the FREE
-    # edge for cheap purposes so the cookie pool is spent only on science.
-    # Disabled by default: no surprise network calls to localhost.
+    # Local small-model router (OmniRoute / vLLM / LM Studio via the
+    # OpenAI-compatible chat-completions API; native Ollama kept as a legacy
+    # backend) — the FREE edge for cheap purposes so the cookie pool is
+    # spent only on science. Disabled by default: no surprise network calls
+    # to localhost.
     local_llm_enabled: bool = field(
         default_factory=lambda: _env_bool("LOCAL_LLM_ENABLED", False))
+    # OmniRoute (self-hosted gateway, `npm i -g omniroute` -> :20128/v1)
+    # serves an OpenAI-compatible endpoint that routes to NVIDIA NIM,
+    # vLLM, LM Studio, llama.cpp and Ollama alike. `auto` decides by the
+    # URL shape: a base ending in /v1 speaks OpenAI chat completions, a
+    # bare host:port speaks Ollama native /api/chat.
     local_llm_url: str = field(
-        default_factory=lambda: _env("LOCAL_LLM_URL", "http://127.0.0.1:11434"))
-    local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL"))
+        default_factory=lambda: _env("LOCAL_LLM_URL",
+                                     "http://127.0.0.1:20128/v1"))
+    # auto | omniroute | ollama — pin the protocol instead of the URL
+    # heuristic (omniroute/openai both mean the OpenAI-compatible path).
+    local_llm_backend: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_BACKEND", "auto"))
+    # NVIDIA Nemotron 3 Ultra 550B A55B (hybrid Mamba-Transformer MoE, 1M
+    # context, function calling) is the intended local-tier brain behind
+    # OmniRoute/NIM; set LOCAL_LLM_MODEL to any tag the gateway lists
+    # (`GET /v1/models`), e.g. a small qwen3 tag for CPU-only Ollama.
+    local_llm_model: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_MODEL",
+                                     "nvidia/nemotron-3-ultra-550b-a55b"))
+    # Vision tier (Nemotron 3.5 Super VL): reserved for image-bearing
+    # purposes — the graph has no image inputs yet, so nothing routes here
+    # until a vision purpose lands; the knob just pins the model id.
+    local_llm_vl_model: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_VL_MODEL"))
     # CPU-realistic defaults (live 2026-11-14 08:51: the first /api/chat
     # also LOADS the model into RAM and qwen3 would think/generate for
     # minutes — 20s timed out with an empty error string every cycle).

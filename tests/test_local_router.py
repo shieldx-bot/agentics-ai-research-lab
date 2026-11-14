@@ -276,3 +276,149 @@ def test_default_purpose_list_includes_scaffolding():
     assert "plan" in cfg.local_llm_purposes
     assert "role_synthesis" in cfg.local_llm_purposes
     assert "kg_extract" in cfg.local_llm_purposes
+
+
+# ------------------------------- OmniRoute / OpenAI-compatible backend (2026)
+def _clear_mode_cache():
+    local_router._mode_cache.clear()
+
+
+def test_mode_heuristic_by_url_shape():
+    """auto: a base ending /v1 speaks OpenAI chat completions, a bare
+    host:port speaks Ollama native; an explicit LOCAL_LLM_BACKEND pin
+    overrides the URL shape in both directions."""
+    _clear_mode_cache()
+    s = _settings()  # no backend attr -> auto
+    assert local_router._mode("http://127.0.0.1:20128/v1", s) == "openai"
+    assert local_router._mode("http://127.0.0.1:11434", s) == "ollama"
+    assert local_router._mode("http://127.0.0.1:20128/v1",
+                              _settings(local_llm_backend="ollama")) == "ollama"
+    assert local_router._mode("http://127.0.0.1:11434",
+                              _settings(local_llm_backend="omniroute")) == "openai"
+
+
+def test_ask_openai_payload_posts_to_chat_completions(monkeypatch):
+    """OmniRoute tier: one /v1/chat/completions call — OpenAI body shape,
+    bounded generation (max_tokens), Nemotron thinking OFF by default via
+    the NIM chat_template_kwargs knob, no Ollama-only fields."""
+    _clear_mode_cache()
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured["url"] = url
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": "{\"files\": []}"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_url="http://127.0.0.1:20128/v1",
+                  local_llm_model="nvidia/nemotron-3-ultra-550b-a55b")
+    resp = asyncio.run(local_router.ask("plan this", s, purpose="plan"))
+    assert resp is not None and resp.ok
+    assert resp.answer == '{"files": []}'
+    assert resp.citations == []
+    assert captured["url"] == "http://127.0.0.1:20128/v1/chat/completions"
+    p = captured["payload"]
+    assert p["model"] == "nvidia/nemotron-3-ultra-550b-a55b"
+    assert p["stream"] is False
+    assert p["max_tokens"] == 512
+    assert p["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "keep_alive" not in p and "options" not in p and "think" not in p
+
+
+def test_ask_openai_bare_host_gets_v1_appended(monkeypatch):
+    """LOCAL_LLM_BACKEND=omniroute on a bare host still hits /v1/..."""
+    _clear_mode_cache()
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured["url"] = url
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_url="http://127.0.0.1:20128",
+                  local_llm_backend="omniroute")
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["url"] == "http://127.0.0.1:20128/v1/chat/completions"
+
+
+def test_ask_openai_think_env_omits_knob(monkeypatch):
+    _clear_mode_cache()
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured.update(payload)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_url="http://127.0.0.1:20128/v1",
+                  local_llm_think=True)
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert "chat_template_kwargs" not in captured  # model may think
+
+
+def test_ask_openai_reasoning_content_is_not_answer(monkeypatch):
+    """NIM Nemotron emits reasoning separately; the lab's parsers want the
+    answer only — reasoning_content must never leak into `answer`."""
+    _clear_mode_cache()
+
+    async def fake_post(url, payload, settings=None):
+        return {"choices": [{"message": {
+            "content": "", "reasoning_content": "long chain of thought"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_url="http://127.0.0.1:20128/v1")
+    assert asyncio.run(local_router.ask("hi", s)) is None
+
+
+def test_ask_openai_strips_think_blocks(monkeypatch):
+    _clear_mode_cache()
+
+    async def fake_post(url, payload, settings=None):
+        return {"choices": [{"message": {"content": "<think>hmm</think>done"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_url="http://127.0.0.1:20128/v1")
+    resp = asyncio.run(local_router.ask("hi", s))
+    assert resp is not None and resp.answer == "done"
+
+
+def test_available_auto_probes_openai_then_ollama(monkeypatch):
+    """auto health: GET /v1/models first (OmniRoute/vLLM/LM Studio), then
+    GET /api/tags (Ollama native); the confirmed mode is cached so ask()
+    never probes."""
+    seen: list[str] = []
+
+    async def fake_get(url, settings=None):
+        seen.append(url)
+        return {"data": []} if url.endswith("/models") else None
+
+    monkeypatch.setattr(local_router, "_get", fake_get)
+    _clear_mode_cache()
+    s = _settings(local_llm_url="http://127.0.0.1:20128/v1")
+    assert asyncio.run(local_router.available(s)) is True
+    assert seen == ["http://127.0.0.1:20128/v1/models"]
+    assert local_router._mode_cache["http://127.0.0.1:20128/v1"] == "openai"
+
+    seen.clear()
+
+    async def ollama_get(url, settings=None):
+        seen.append(url)
+        return {"models": []} if url.endswith("/api/tags") else None
+
+    monkeypatch.setattr(local_router, "_get", ollama_get)
+    _clear_mode_cache()
+    s2 = _settings(local_llm_url="http://127.0.0.1:11434")
+    assert asyncio.run(local_router.available(s2)) is True
+    assert seen == ["http://127.0.0.1:11434/v1/models",
+                    "http://127.0.0.1:11434/api/tags"]
+    assert local_router._mode_cache["http://127.0.0.1:11434"] == "ollama"
+
+
+def test_default_config_points_at_omniroute_and_nemotron():
+    """The owner's stack: OmniRoute gateway (:20128/v1) + NVIDIA Nemotron
+    3 Ultra 550B as the local-tier model id (env still overrides)."""
+    import agentics.config as config
+    cfg = config.Settings()
+    assert cfg.local_llm_backend == "auto"
+    assert cfg.local_llm_url.rstrip("/").endswith("/v1")
+    assert "nemotron" in cfg.local_llm_model.lower()
