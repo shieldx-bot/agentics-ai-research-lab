@@ -1,169 +1,85 @@
-# ADVANCED WAVE 3 — Đề xuất TOP 5 công nghệ tiên tiến tiếp theo
+# Wave 3 — đối chiếu & hòa hợp hai đề xuất TOP 5
 
-Trả lời yêu cầu của owner (2026-11-14): *"nên ứng dụng thêm các công nghệ
-tiên tiến khác vào để cải thiện, thay vì phải cải tiến phần core"*.
+Owner yêu cầu (2026-11-14): *"nên ứng dụng thêm các công nghệ tiên tiến
+khác vào để cải thiện, thay vì phải cải tiến phần core"*. Hai phiên làm
+việc song song đã trả lời bằng hai bộ TOP 5:
 
-Nguyên tắc chọn: **(1)** không đụng vào core graph / core policy (P1–P24) —
-mỗi đề xuất là một module mớicomposed từ cơ chế sẵn có; **(2)** tín hiệu
-chọn lọc chỉ dùng EXIT-CODE / dữ liệu SQL thật (đúng luật chung của wave 2);
-**(3)** LLM gọi ít nhất có thể — ưu tiên 0-cookie, chỉ dùng local router;
-**(4)** mọi consumer đều degrade về hành vi hiện tại khi feature off.
+* `docs/ADVANCED_STACK_WAVE3.md` (đề xuất của người đi trước — **giữ nguyên
+  làm tài liệu gốc**): best-of-N, Z3 formal track, hermetic replay,
+  federation, auto-ablation.
+* Đề xuất ban đầu của phiên này: statistical experiment design, truth
+  maintenance, literature watchdog, learned prior, paper assembler.
 
-Đã có sẵn (không đề xuất lại): wave 1 (PUCT, MAP-Elites, local router,
-GraphRAG-lite, Hypothesis Arena), wave 2 (skill library, prompt evolution,
-EIG frontier, calibration, reflection tree), P16–P24 (evidence runner,
-replay, replication, panel, audit, retention), world model, QD ideation,
-Co-Scientist tournament, GEA traces, A2X coordination, swarm-eval.
-
----
-
-## TOP 5 — xếp theo đòn bẩy (leverage) giảm dần
-
-| # | Công nghệ | Chi phí LLM | Chạm core? | Compose với |
-|---|-----------|-------------|-----------|-------------|
-| 1 | Thống kê thí nghiệm: two-arm randomized + effect size | **0** | Không | P16 runner, P23 replay, calibration |
-| 2 | Truth maintenance — lan truyền tín nhiệm trên đồ thị claim | **0** | Không | P23 replay, P24 replication, kg_edges |
-| 3 | Literature watchdog — đầu dò tài liệu mới theo kg_entities | **0** (API free) | Không | free_tools, PEM gate, world model |
-| 4 | Learned success prior — meta-model học từ settle ledger | **0** (CPU) | Không | PUCT P, EIG, frontier |
-| 5 | Paper assembler — lắp báo cáo nghiên cứu từ bằng chứng SQL | local only | Không | verified_knowledge, evidence, Elo, citations |
+Tài liệu này **không thay thế** tài liệu gốc — nó đối chiếu 10 ứng viên,
+chỉ rõ chỗ giao nhau, và đề xuất một TOP 5 hợp nhất (có truy nguyên từng
+ý) để owner chọn. Nguyên tắc chung giữ nguyên: không đụng core (P1–P24,
+graph), tín hiệu chọn lọc chỉ là exit-code / dữ liệu SQL thật, LLM local
+trước — cookie sau, mọi consumer degrade khi flag off.
 
 ---
 
-## 1. Statistical experiment design — phán quyết thành thống kê thật
+## 1. Đối chiếu: chỗ giao nhau giữa hai bộ
 
-**Vấn đề còn lại.** P16 phán quyết bằng exit-code + reproduction gate 2 lần
-chạy; điểm số là **point estimate** — một protocol may mắn chạy đúng 2 lần
-vẫn `supported` dù phương sai lớn. Mọi consumer phía dưới (PUCT Q, Elo,
-calibration Wilson) đều ăn con số đó.
+| Ý | Đề xuất của ai | Giao nhau với | Kết luận đối chiếu |
+|---|---|---|---|
+| Two-arm randomized + effect size | phiên này | **auto-ablation** (người đi trước, #5) | TRÙNG bản chất — ablation chính là arm baseline vs treatment. Gộp: giữ tên `auto-ablation` của tài liệu gốc, nhưng **phải xây nền thống kê trước** (mục 3 bên dưới) — delta không có CI là delta nhiễu |
+| N seed + mean/std/CI + sequential sampling | phiên này | hermetic replay (#3 của tài liệu gốc) | BỔ TÚC, không trùng: replay fingerprints định danh **môi trường** của mỗi lần chạy; seed-sweep định lượng **phương sai** của kết quả. Hai lớp cùng làm verdict trung thực |
+| Hermetic replay | người đi trước | — | độc lập, ưu tiên cao (nhỏ effort, bảo vệ ledger) |
+| Best-of-N + machine gate | người đi trước | — | độc lập, nâng chất lượng mọi đường code, free trên local edge |
+| Z3 formal track | người đi trước | — | độc lập, payoff nhận thức cao nhất nhưng chi phí thiết kế cao nhất |
+| Federation bundles | người đi trước | — | độc lập, cần máy thứ hai ghép cặp |
+| Truth maintenance (stale propagation) | phiên này | — | độc lập — **không có gì tương đương trong tài liệu gốc** |
+| Literature watchdog | phiên này | — | độc lập — lab hiện chỉ "thấy" arXiv khi research prompt yêu cầu |
+| Learned success prior | phiên này | — | độc lập — PUCT P hiện là rank prior, chưa học từ ledger |
+| Paper assembler | phiên này | — | độc lập — bề mặt owner, lắp báo cáo từ SQL |
 
-**Công nghệ.** Lớp thiết kế thí nghiệm chuẩn: mỗi claim được chạy **N seed**
-(N khả chỉnh, mặc định 5); report mean / std / CI 95% (bootstrap hoặc
-Welch); với claim dạng cải tiến, runner tự chia **2 arm** — `baseline`
-(protocol hiện có từ skill library) và `treatment` (protocol đề xuất) — và
-ra effect size Cohen's d + p-value Welch's t-test. Quy tắc tăng mẫu tuần
-tự: nếu |d| lớn nhưng CI chắn 0 → tăng thêm N seed thay vì kết luận.
+Không có ý nào của hai bộ mâu thuẫn nhau về thiết kế; duy nhất một cặp
+trùng bản chất (đã gộp ở trên).
 
-**Điểm chạm.** Module mới `agentics/verify/stats.py` (thuần Python, không
-thêm dependency); `verify/experiment.py` gọi vào sau `run_experiment`;
-ledger thêm cột `n_runs, mean, std, ci_lo, ci_hi, effect_d, p_value`;
-settle note thêm dòng `[n=5 mean=… ±…, d=…, p=…]`.
+## 2. TOP 5 hợp nhất — đề xuất cuối
 
-**KPI.** Tỉ lệ verdict đảo chiều sau khi có CI (kỳ vọng: 5–15% claim
-`supported` cũ sẽ tụt thành `inconclusive` — đó là sự trung thực mới);
-calibration floor (wave 2) phải **tăng**, không giảm.
+Xếp theo đòn bẩy / effort / mức độ bảo vệ những gì lab đã xây:
 
-**Degrade.** Không seed được (protocol không nhận tham số) → chạy 1 lần như
-hiện tại, note ghi `unseeded`.
+| # | Công nghệ | Truy nguyên | Chi phí LLM | Effort |
+|---|-----------|-------------|-------------|--------|
+| 1 | Hermetic replay — environment fingerprint cho replication | tài liệu gốc #3 | 0 | S |
+| 2 | Truth maintenance — claim sập → phụ thuộc thành `stale` | phiên này | 0 | S–M |
+| 3 | Statistics substrate — seed sweep + CI cho mọi verdict | phiên này (phần bổ túc) | 0 | M |
+| 4 | Best-of-N với machine-gate chọn người thắng | tài liệu gốc #1 | local free / cookie có budget | M |
+| 5 | Literature watchdog — đầu dò tài liệu mới theo kg_entities | phiên này | 0 (API free) | S–M |
 
-## 2. Truth maintenance — khi một claim sập, mọi claim phụ thuộc phải biết
+**Vì sao auto-ablation (#5 của tài liệu gốc) không nằm trong top 5 hợp
+nhân:** nó phụ thuộc #3 statistics substrate (delta cần CI) và tiêu protocol
+cost gấp đôi cho claim supported — đưa lên **bench ngay sau #3** là đúng
+thứ tự phụ thuộc, không phải từ chối.
 
-**Vấn đề còn lại.** P23 replay + P24 replication phát hiện mâu thuẫn và
-alert cho **chính claim đó**. Nhưng knowledge phụ thuộc (claim B "dựa trên"
-claim A qua `uses`/`improves` trong `kg_edges`, hoặc evidence trích
-verified_knowledge của A) vẫn đứng nguyên trong prompt của mọi agent —
-GraphRAG đang lan truyền thông tin cũ như thể vẫn đúng.
+**Bench (lượt sau, theo thứ tự kích hoạt):** auto-ablation (gốc #5, sau
+statistics substrate) → learned success prior (cần ledger dày, AUC guard
+<0.55 thì tự tắt) → federation (gốc #4, sau hermetic replay) → paper
+assembler (thu hoạch cuối, báo cáo sẵn có CI + stale marker) → Z3 pilot
+(gốc #2, mỏng nhất: `kind=invariant` trên cận số học).
 
-**Công nghệ.** Truth-maintenance / belief revision kiểu TMS: khi claim A bị
-hạ (refuted / replay contradiction / replication fail), BFS trên
-`kg_edges` theo hướng phụ thuộc + quét evidence có tham chiếu A → đánh dấu
-các claim B phụ thuộc thành `stale` (cột mới `stale_since`), **đẩy priority
-vào frontier** (cộng vào score của PUCT/EIG) và alert đúng 1 lần (giống
-luật once-only của calibration). Prompt render ghi rõ `[STALE — phụ thuộc
-claim X vừa bị hạ]`.
+## 3. Thiết kế hợp nhất cho ba ý của phiên này (tóm tắt thao tác)
 
-**Điểm chạm.** `agentics/verify/beliefs.py` (thuần graph walk trên SQLite);
-gọi từ supervisor sweep sau replay; không thêm node graph nào.
+* **Truth maintenance** — `agentics/verify/beliefs.py`: khi replay/replication
+  hạ một claim, BFS theo hướng phụ thuộc trên `kg_edges` (`uses`/`improves`)
+  + quét evidence tham chiếu → cột `stale_since`, priority cộng vào
+  frontier, alert once-only, prompt render ghi `[STALE — phụ thuộc claim X]`.
+  Degrade: kg rỗng → khớp claim-id trong protocol source đã lưu (P23).
+* **Statistics substrate** — `agentics/verify/stats.py` (thuần Python, không
+  thêm dependency): chạy N seed (mặc định 5, protocol nhận tham số seed),
+  mean/std/CI 95% bootstrap, quy tắc tăng mẫu tuần tự khi |d| lớn nhưng CI
+  chắn 0; ledger thêm `n_runs, mean, std, ci_lo, ci_hi`; settle note thêm
+  `[n=5 mean=… ±…]`. Degrade: protocol không nhận seed → 1 lần chạy như
+  hiện tại, note `unseeded`. Auto-ablation (bench) ăn trực tiếp các cột này.
+* **Literature watchdog** — `agentics/research/watchdog.py`: mỗi N cycle
+  supervisor (mặc định 12) query arXiv/S2/OpenAlex bằng top-K `kg_entities`,
+  lọc PEM gate, cái mới liên quan → `world_note kind=literature_alert` +
+  journal + re-check novelty cho hypothesis `proposed` trùng mechanism.
+  Degrade: mất mạng → sweep no-op có journal.
 
-**KPI.** Số claim `stale` được re-verify trong vòng 2 giờ; tỉ lệ stale còn
-tồn khi hết phiên (mục tiêu: 0).
+## 4. Thứ tự triển khai hợp nhất (thay thế lời khuyên riêng của từng tài liệu)
 
-**Degrade.** Kg rỗng (local router off) → fallback: quét phụ thuộc bằng
-khớp claim-id trong protocol source đã lưu (P23 precondition đã lưu
-protocol).
-
-## 3. Literature watchdog — lab biết "thế giới đã đổi"
-
-**Vấn đề còn lại.** Lab chỉ tìm tài liệu khi research prompt yêu cầu; giữa
-các đợt nó **mù** với arXiv. Một paper mới đúng cơ chế nó đang đào có thể
-làm vô dụng cả kiến trúc giả thuyết đang chạy — và lab chỉ phát hiện khi
-owner đọc tiếp cho nó.
-
-**Công nghệ.** Đầu dò định kỳ (mỗi N cycle supervisor, mặc định 12): query
-arXiv API + Semantic Scholar + OpenAlex bằng **top-K `kg_entities`** (không
-tốn cookie — đúng stack free_tools); lọc bằng PEM gate hiện có (chống
-near-dup); cái mới và liên quan → `world_note` kind=`literature_alert` +
-journal `literature_alert` + kích hoạt lại novelty-check cho các hypothesis
-`proposed` trùng mechanism. Source-of-truth cho "đã thấy" là bảng
-citations hiện có.
-
-**Điểm chạm.** `agentics/research/watchdog.py`; hook vào supervisor sweep
-(cùng chỗ replay sweep, không thêm node).
-
-**KPI.** Số alert/tuần; tỉ lệ alert dẫn tới hypothesis bị sửa/hủy (alert
-vô dụng liên tục = ngưỡng quá lỏng).
-
-**Degrade.** Mất mạng → sweep no-op có journal, không crash.
-
-## 4. Learned success prior — frontier học từ chính ledger của nó
-
-**Vấn đề còn lại.** P của PUCT hiện là **rank prior** (thứ hạng trong
-discovery buffer) — không học được rằng, ví dụ, các claim nhóm mechanism
-`X` trên metric `Y` trong lab này gần như luôn `refuted`.
-
-**Công nghệ.** Meta-model cực nhỏ (logistic regression SGD thuần Python,
-~100 dòng, không thêm dependency) train trên settle ledger: features từ
-signature quintuple (mechanism category, angle, metric type, depth, độ dài
-protocol, has_dataset…), label = verdict thật. Retrain mỗi 20 settle khi
-có ≥50 dòng; output `P(supported)` lưu vào cột `learned_prior`, nhân vào
-P của PUCT và vào EIG cost. Mỗi ngày in AUC trên 20% holdout — nếu AUC
-< 0.55 thì prior bị tắt tự động (tránh tự lừa).
-
-**Điểm chạm.** `agentics/evolution/learned_prior.py`; đọc/ghi qua
-SharedMemory; không đụng công thức PUCT (chỉ thay nguồn P).
-
-**KPI.** AUC tuần; frontier_pick `learned_prior` cao nhưng verdict thấp →
-cảnh báo tự động.
-
-**Degrade.** <50 dòng hoặc AUC kém → rank prior như hôm nay.
-
-## 5. Paper assembler — owner cầm được tài liệu nghiên cứu
-
-**Vấn đề còn lại.** Mọi kết quả nằm rải rác trong dashboard/CLI (evidence
-card, panel, Elo, replication). Owner muốn "sản phẩm nghiên cứu" thì phải
-tự lắp.
-
-**Công nghệ.** `agentics paper --window 7d`: template renderer (Jinja-free,
-f-string) đọc **verbatim từ SQL** — verified_knowledge, evidence (kèm n
-runs + CI từ #1), Elo + matches, replication ledger, kg summary, citations
-đầy đủ từ papers DB — ra Markdown (tùy chọn LaTeX). Phần văn xuôi
-(abstract, transition) chạy trên **local router** với luật cứng: mọi con số
-phải trích nguyên văn từ context SQL, không được sinh số mới (validate
-bằng regex so khớp trước khi ghi).
-
-**Điểm chạm.** `agentics/report/` + subcommand CLI + nút dashboard
-"Xuất báo cáo".
-
-**KPI.** Owner dùng báo cáo làm đầu vào họp/tiếp tục research; số claim
-trong báo cáo == số claim trong DB (không lệch).
-
-**Degrade.** Local router off → bản skeleton thuần bảng số liệu, không văn
-xuôi — vẫn hữu ích.
-
----
-
-## Không chọn (và vì sao)
-
-* **Agent Workflow Memory** — trùng skill library (wave 2) về bản chất
-  (recurring pattern tái sử dụng).
-* **Sleep-time consolidation** — P21 retention + P23 replay + reflection
-  tree đã phủ cùng vòng đời.
-* **Shapley/leave-one-out credit** — A2X contract-net awards + dossier đã
-  ghi nhận đóng góp theo cơ chế riêng.
-* **Song song hóa orchestrator** — đụng core, đúng điều owner muốn tránh.
-
-## Thứ tự triển khai đề xuất
-
-1 → 2 → 3 → 4 → 5. #1 và #2 là nền trung thực cho mọi thứ phía trên;
-#3 nạp nguyên liệu ngoài; #4 chỉ đáng train khi ledger đủ dày (cần #1 chạy
-một thời gian); #5 thu hoạch cuối để báo cáo có CI và stale-marker của
-#1/#2 ngay từ đầu.
+1 → 2 → 3 → 4 → 5 theo bảng mục 2; chèn auto-ablation ngay sau #3 khi
+owner duyệt. Mỗi bước: một module mới + test offline + journal event + KPI
+query vào `docs/ADVANCED_STACK.md` (mục wave 3) — đúng khuôn mẫu wave 1/2.
