@@ -24,6 +24,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from agentics.verify.falsify import FalsificationSpec
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion
 
 # Researcher-owned territory (P3 ownership + writable_roots): experiments and
@@ -71,6 +72,10 @@ class Hypothesis:
     code: str                     # full python source of the protocol
     source_finding: int | None = None
     task: int | None = None
+    falsification: "FalsificationSpec | None" = None   # P25: the declared
+    # input class X + metamorphic relations + mutation gate. None = the
+    # claim is verified by the base protocol alone (the default — the P16
+    # contract is unchanged for every caller that does not declare it).
 
     @property
     def script_path(self) -> str:
@@ -82,6 +87,11 @@ class Hypothesis:
         convention: {"value": <number>}); the runner falls back to it when
         the script prints no AGENTICS_RESULT marker."""
         return f"{EXPERIMENT_DIR}/results/{self.hypothesis_id}.json"
+
+    @property
+    def falsifies(self) -> bool:
+        """Whether the claim declared a falsification suite (P25)."""
+        return self.falsification is not None
 
     # Flat aliases over the criterion — the plan contract (node_plan) speaks
     # {metric, comparison, threshold}; the criterion keeps the canonical form.
@@ -107,6 +117,8 @@ class Hypothesis:
                 "code": self.code,
                 "source_finding": self.source_finding,
                 "task": self.task,
+                "falsification": (self.falsification.as_dict()
+                                  if self.falsification is not None else None),
             },
             ensure_ascii=False,
         )
@@ -192,6 +204,15 @@ def parse_hypothesis(raw: object) -> tuple[Hypothesis | None, str]:
     hyp_id = slugify(str(raw.get("hypothesis_id") or claim))
     if len(hyp_id) < 8:                    # too short to stay unique
         hyp_id = stable_id(claim)
+    # P25: the OPTIONAL falsification suite — parsed and validated with the
+    # same mechanical strictness as the criterion (a malformed declaration
+    # is refused with a reason, never guessed through).
+    falsification: FalsificationSpec | None = None
+    if raw.get("falsification") is not None:
+        try:
+            falsification = FalsificationSpec.from_dict(raw.get("falsification"))
+        except ValueError as exc:
+            return None, f"invalid falsification spec: {exc}"
     return (
         Hypothesis(
             hypothesis_id=hyp_id,
@@ -201,6 +222,7 @@ def parse_hypothesis(raw: object) -> tuple[Hypothesis | None, str]:
             code=code.strip(),
             source_finding=int(finding) if isinstance(finding, int) else None,
             task=int(task) if isinstance(task, int) else None,
+            falsification=falsification,
         ),
         "",
     )
@@ -219,8 +241,8 @@ __all__ = [
     "ALLOWED_OPS",
     "EXPERIMENT_DIR",
     "HYPOTHESIS_PROMPT_CONTRACT",
-    "Hypothesis",
     "PROTOCOL_CONTRACT",
+    "Hypothesis",
     "claim_hash",
     "hypothesis_from_json",
     "parse_hypothesis",

@@ -7,7 +7,7 @@
 
 [![python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org)
 [![langgraph](https://img.shields.io/badge/core-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![tests](https://img.shields.io/badge/tests-1118%20passing-brightgreen)](#8-đánh-giá-bầy-đàn--pre-production)
+[![tests](https://img.shields.io/badge/tests-1151%20passing-brightgreen)](#8-đánh-giá-bầy-đàn--pre-production)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
@@ -16,6 +16,19 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
 
 ## Có gì mới (2026-11)
 
+- **Lớp bác bỏ P25 — verified nghĩa là SỐNG SÓT qua toàn bộ phân phối**
+  (2026-11-14): một base run đạt criterion chỉ là "verified" yếu. Giờ mỗi
+  giả thuyết có thể khai báo trường `falsification` — lớp input X (cases)
+  + các quan hệ metamorphic (shuffle/double/negate/subset_half/duplicate/
+  noise) mà phép đo phải chịu đứng. Runner sinh ca, chạy qua đường thực thi
+  hiện có, chấm verdict kiểu Popper: MỘT counterexample → `refuted`; một
+  quan hệ bị vi phạm → `refuted`; ca hỏng → `inconclusive`, không bao giờ
+  `refuted` do đoán. Kèm **mutation quality gate** ("test yếu thì bằng chứng
+  vô giá trị"): lab tự phá protocol bằng 4 mutation operator, mutant sống
+  sót quá nhiều → `confirmed` bị hạ xuống `inconclusive` (kèm điểm mutation
+  score trong ledger). Chi tiết: `docs/VERIFICATION.md` §14. Bổ trợ GEPA +
+  GraphRAG: verdict `refuted` của P25 chính là tín hiệu làm `kg_edges.trusted`
+  mất tín nhiệm và là bài học thất bại máy-đọc-được cho reflective evolution.
 - **GEPA — tối ưu prompt phản chiếu** (`agentics/evolution/gepa.py`): trên nền
   pool challenger wave-2, sinh ứng viên mission từ pareto-front (win-rate ×
   độ dài) + crossover + bài học thất bại thật; LOCAL router khi có, generator
@@ -26,7 +39,6 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
   (`h1:`/`h2:`, lọc trust) chèn vào JUDGE prompt lúc propose; phát hiện
   mâu thuẫn NGỮ NGHĨA giữa các claim đã chốt ngược phán quyết. CLI:
   `agentics kg-query`, `agentics kg-contradictions`.
-
 - **Luật neo verdict — `self_authored_ratio`** (2026-11-14, vòng "verdict
   provenance"): trục kiểm duyệt KHÔNG phải "thuật toán vs AI" — mà là *ai cầm
   bút viết thang điểm, và thang điểm có neo vào thứ nằm ngoài tầm với của

@@ -33,6 +33,7 @@ from agentics.verify.anchors import (
     VerdictProvenance, apply_settle_law, detect_pinned_data,
     provenance_for_settle,
 )
+from agentics.verify.falsify import apply_falsification, case_path
 from agentics.verify.hypothesis import Hypothesis, RESULT_DIR
 from agentics.verify_metrics import (
     RESULT_MARKER, adjudicate, run_protocol,
@@ -85,6 +86,14 @@ def run_hypothesis(workspace, h: Hypothesis, repeat: int = 2,
     must see WHY nothing was measured."""
     try:
         workspace.write_file(h.script_path, h.code)
+        if h.falsification is not None and h.falsification.cases:
+            # P25: park the FIRST declared case before the base run, so a
+            # case-reading protocol measures the input class from the very
+            # first run — the 2-run reproducibility gate stays meaningful
+            # (both base runs measure the same case).
+            workspace.write_file(
+                case_path(h.hypothesis_id),
+                json.dumps(h.falsification.cases[0], ensure_ascii=False))
     except ValueError as exc:
         return Evidence(
             cmd=h.script_path, exit_code=126, verdict="inconclusive",
@@ -112,7 +121,10 @@ def run_hypothesis(workspace, h: Hypothesis, repeat: int = 2,
             verdict, note = adjudicate(metrics, h.criterion)
             evidence_verdict = "confirmed" if verdict == "supported" else verdict
             runs = evidence.meta.get("runs", []) if evidence.meta else []
-            return Evidence(
+            # rebinding (not returning) so the P25 falsification hook below
+            # sees result-file confirmations too — one gate for both output
+            # contracts.
+            evidence = Evidence(
                 cmd=f"{h.script_path} ({h.criterion.describe()}; "
                     f"{len(runs)} run(s), result file)",
                 exit_code=evidence.exit_code, verdict=evidence_verdict,
@@ -123,6 +135,12 @@ def run_hypothesis(workspace, h: Hypothesis, repeat: int = 2,
                 meta={"note": note, "runs": runs, "metrics": metrics,
                       "criterion": h.criterion.as_dict()},
             )
+    # P25 falsification: a confirmed verdict must SURVIVE its declared
+    # input class + metamorphic relations (+ the mutation quality gate).
+    # Only confirmed evidence enters the suite; a refuted/inconclusive run
+    # passes through untouched. The machinery never breaks a settle.
+    if evidence.verdict == "confirmed" and h.falsification is not None:
+        evidence = apply_falsification(workspace, h, evidence, timeout=timeout)
     return evidence
 
 
