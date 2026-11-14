@@ -7,7 +7,7 @@
 
 [![python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org)
 [![langgraph](https://img.shields.io/badge/core-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![tests](https://img.shields.io/badge/tests-1151%20passing-brightgreen)](#8-đánh-giá-bầy-đàn--pre-production)
+[![tests](https://img.shields.io/badge/tests-1179%20passing-brightgreen)](#8-đánh-giá-bầy-đàn--pre-production)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
@@ -51,8 +51,6 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
   (`h1:`/`h2:`, lọc trust) chèn vào JUDGE prompt lúc propose; phát hiện
   mâu thuẫn NGỮ NGHĨA giữa các claim đã chốt ngược phán quyết. CLI:
   `agentics kg-query`, `agentics kg-contradictions`.
-<<<<<<< HEAD
-=======
 - **Wave 2 — tiến hoá & hiệu chuẩn** (2026-11-14, `e00bc29..7319550`): skill
   library kiểu Voyager, tiến hoá prompt DSPy-lite, tầng hiệu chuẩn verify
   (Wilson floor), cây phản tư, frontier EIG (information-gain-per-cost).
@@ -60,7 +58,6 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
   entropic credit, MAP-Elites + islands, local small-model router (Ollama),
   GraphRAG-lite (`kg_entities`/`kg_edges`), Hypothesis Arena (Elo + dual-judge
   ChatGPT độc lập).
->>>>>>> f2647da (feat(advanced): wave-3 — GEPA reflection, static cascade, MCP bridge, shadow risk gate)
 - **Luật neo verdict — `self_authored_ratio`** (2026-11-14, vòng "verdict
   provenance"): trục kiểm duyệt KHÔNG phải "thuật toán vs AI" — mà là *ai cầm
   bút viết thang điểm, và thang điểm có neo vào thứ nằm ngoài tầm với của
