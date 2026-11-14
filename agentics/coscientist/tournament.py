@@ -260,7 +260,11 @@ async def run_batch(ctx, n_matches: int, goal: str) -> list[dict]:
     results: list[dict] = []
     for _ in range(max(0, int(n_matches))):
         pool = ctx.memory.tournament_pool()
-        pair = pairing.select_pair(pool)
+        # Proximity-aware pairing (#5): lexical similarity keeps clone-vs-
+        # clone debates out of the queue (bucket 1 skips near-identical
+        # opponents; bucket 2 weights pairs by 1 - similarity). Degrades to
+        # unweighted selection on any per-pair failure, never an error.
+        pair = pairing.select_pair(pool, similarity=pairing.jaccard_similarity)
         if pair is None:
             break
         res = await run_match(ctx, pair[0], pair[1], goal)

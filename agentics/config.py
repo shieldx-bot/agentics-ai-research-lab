@@ -188,6 +188,30 @@ class Settings:
     # for the whole hour). 0 = never wait.
     budget_block_wait_cap_s: float = field(
         default_factory=lambda: _env_float("BUDGET_BLOCK_WAIT_CAP_S", 45.0))
+    # TTT_DISCOVER.md C2/C3 config — PUCT frontier + entropic credit.
+    puct_c: float = field(default_factory=lambda: _env_float("PUCT_C", 1.0))
+    entropic_bonus_max: float = field(
+        default_factory=lambda: _env_float("ENTROPIC_BONUS_MAX", 8.0))
+    reward_scale: str = field(
+        default_factory=lambda: _env("REWARD_SCALE", "target"))
+    # Local small-model router (Ollama / llama.cpp / LM Studio) — the FREE
+    # edge for cheap purposes so the cookie pool is spent only on science.
+    # Disabled by default: no surprise network calls to localhost.
+    local_llm_enabled: bool = field(
+        default_factory=lambda: _env_bool("LOCAL_LLM_ENABLED", False))
+    local_llm_url: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_URL", "http://127.0.0.1:11434"))
+    local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL"))
+    local_llm_timeout: float = field(
+        default_factory=lambda: _env_float("LOCAL_LLM_TIMEOUT", 20.0))
+    # Comma-separated purposes that may route to the local model. Science
+    # purposes (research/verify/ideation) can NEVER be listed here — the
+    # router refuses them even if someone puts them in the env.
+    local_llm_purposes: str = field(
+        default_factory=lambda: _env("LOCAL_LLM_PURPOSES", "kg_extract"))
+    # GraphRAG-lite: mine findings into the knowledge graph when the local
+    # router is configured; ingest is a no-op without it.
+    kg_enabled: bool = field(default_factory=lambda: _env_bool("KG_ENABLED", True))
     # P22 — retention: workspaces of agents inactive longer than this AND
     # with a clean git tree get pruned by the supervisor sweep (0 = off).
     workspace_retention_minutes: int = field(

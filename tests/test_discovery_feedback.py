@@ -154,12 +154,15 @@ def test_branch_feedback_confirms_and_dead_ends(mem, tmp_path):
                 depth=1, branch="boundary")
     ctx = _ctx(mem, tmp_path, None)
     asyncio.run(_branch_feedback(ctx, good, "supported"))
-    # novelty reinforced +5
-    assert mem.get_hypothesis(disc)["novelty"] == pytest.approx(85.0)
+    # entropic credit (C3): the settle has NO ledger reward row here (the
+    # unit call bypasses the settle path), so the group is empty and the
+    # boost is 0 — a supported branch with no measurable reward must not
+    # pump the discovery's novelty (the old unconditional +5 is gone).
+    assert mem.get_hypothesis(disc)["novelty"] == pytest.approx(80.0)
     assert "discovery_confirmed" in _events(mem)
     asyncio.run(_branch_feedback(ctx, dead, "refuted"))
     # refuted does NOT demote the discovery, it logs the dead angle
-    assert mem.get_hypothesis(disc)["novelty"] == pytest.approx(85.0)
+    assert mem.get_hypothesis(disc)["novelty"] == pytest.approx(80.0)
     assert "branch_dead_end" in _events(mem)
     detail = next(e for e in mem.recent_journal(limit=10, agent="a02")
                   if e["event"] == "branch_dead_end")

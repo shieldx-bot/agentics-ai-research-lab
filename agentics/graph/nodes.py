@@ -269,7 +269,29 @@ async def _llm_ask(
                     await asyncio.sleep(wait)
                     allowed, why = budget.can_ask(ctx.agent_id, purpose)
         if not allowed:
-            log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
+            # P20c (#3 local router): a CHEAP purpose that the pool refuses
+            # can still run on the free local model — the cookies stay
+            # reserved for science. Science purposes never degrade here
+            # (local_router.allowed_for refuses them by construction).
+            try:
+                from agentics.llm import local_router
+                if local_router.allowed_for(ctx.settings, purpose):
+                    local_resp = await local_router.ask(
+                        prompt, settings=ctx.settings, purpose=purpose)
+                    if local_resp is not None and local_resp.ok:
+                        log.info("[%s] %s served by the local model "
+                                 "(pool budget exhausted)",
+                                 ctx.agent_id, purpose)
+                        try:
+                            ctx.memory.journal(ctx.agent_id, "local_fallback",
+                                               {"purpose": purpose})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return local_resp.answer, []
+            except Exception:  # noqa: BLE001 — fallback must never break the gate
+                pass
+            log.warning("[%s] %s blocked by budget: %s",
+                        ctx.agent_id, purpose, why)
             if state is not None and not state.get("error"):
                 state["error"] = f"P20 budget: {why}"
             try:
@@ -869,6 +891,19 @@ async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
         ctx.vector.add, content,
         {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
     )
+    # GraphRAG-lite (#4): mine the finding into the knowledge graph via the
+    # LOCAL router (zero cookie spend). A missing/absent runtime is a no-op
+    # — an honest degradation, never an invented triple.
+    if bool(getattr(ctx.settings, "kg_enabled", True)):
+        try:
+            from agentics.research.kg_extract import ingest_text
+            await asyncio.wait_for(
+                ingest_text(ctx.memory, content, ctx.settings,
+                            source_hyp=None),
+                timeout=float(getattr(ctx.settings, "local_llm_timeout",
+                                      20.0)) + 5.0)
+        except Exception:  # noqa: BLE001 — KG sugar must never break research
+            pass
     if doc_id:
         linker = getattr(ctx.memory, "set_finding_vector_doc", None)
         if linker is not None:
@@ -1017,6 +1052,14 @@ async def _reject_candidate(ctx: AgentContext, claim: str, reason: str,
         pass
     await asyncio.to_thread(
         ctx.memory.add_rejected_pattern, ctx.agent_id, claim, mech, reason)
+    # MAP-Elites: a rejected idea still OCCUPIES its behaviour cell — the
+    # archive keeps one representative of every approach ever tried, so the
+    # saturation pivot steers toward cells that do not exist yet.
+    try:
+        await asyncio.to_thread(
+            ctx.memory.qd_record, mech, "rejected", None, claim, 0.0)
+    except Exception:  # noqa: BLE001 — archive must never break the gate
+        pass
     await asyncio.to_thread(
         ctx.memory.journal, ctx.agent_id, "idea_rejected",
         {"claim": claim[:160], "reason": reason, "mechanism": mech,
@@ -1235,15 +1278,18 @@ async def _harvest_insights(ctx: AgentContext, parent_id: int,
 
 
 async def _branch_feedback(ctx: AgentContext, hyp_id: int, status: str) -> None:
-    """Bandit-lite discovery feedback: a BRANCH settle updates its discovery
-    root (nearest ancestor with discovery=1).
+    """C3 entropic credit assignment (TTT_DISCOVER.md) — a BRANCH settle
+    credits its discovery root (nearest ancestor with discovery=1) by HOW
+    GOOD the settle was, not just that it happened:
 
-    - supported -> discovery_reinforce: the branch CONFIRMED the finding
-      (novelty +5, capped) and `discovery_confirmed` is journaled — evidence
-      the lab is digging in the right place.
-    - refuted -> `branch_dead_end` journaled with the branch ANGLE: the
-      angle failed, which is itself information (the next ideation round
-      sees the dead end through the world model / rejected patterns).
+        q_i = softmax_beta(r_i)   (beta adaptive: KL(q||uniform) = log 2)
+        boost_i = bonus_max * k * q_i / sum(q_j)
+
+    The best branch's reward takes nearly the whole `bonus_max`
+    (settings.entropic_bonus_max, default 8.0); equally-rewarded groups are
+    constant-reward groups — NO information, boost 0 (the old +5-for-every-
+    supported line was exactly the rich-get-richer pump the harsh review
+    convicted). refuted/unanchored rows carry reward 0 and weight ~0.
     The discovery root's own settle is judged by the ideator's novelty
     grading instead (no self-reinforcement). Never raises."""
     if status not in ("supported", "refuted"):
@@ -1254,13 +1300,39 @@ async def _branch_feedback(ctx: AgentContext, hyp_id: int, status: str) -> None:
         if root is None or int(root.get("id") or 0) == int(hyp_id):
             return
         if status == "supported":
+            from agentics.verify.reward import (
+                adaptive_softmax_weights as entropic_weights)
+            bonus_max = float(getattr(ctx.settings, "entropic_bonus_max",
+                                      8.0))
+            scale_mode = str(getattr(ctx.settings, "reward_scale", "target"))
+            rows = await asyncio.to_thread(
+                ctx.memory.discovery_subtree_rewards, int(root["id"]),
+                scale_mode)
+            boost = 0.0
+            if rows:
+                rewards = [float(r.get("reward") or 0.0) for r in rows]
+                weights = entropic_weights(rewards)
+                # constant-reward group (>= 2 identical results) carries NO
+                # information -> zero boost. A SINGLE settle is still
+                # evidence: its weight is 1.0, boost = bonus_max.
+                constant = (len(rewards) > 1
+                            and len(set(round(r, 9) for r in rewards)) == 1)
+                my_rows = [r for r in rows
+                           if int(r.get("hyp_id") or -1) == int(hyp_id)]
+                if my_rows and not constant:
+                    my_reward = max(float(r.get("reward") or 0.0)
+                                    for r in my_rows)
+                    idx = rewards.index(my_reward)
+                    boost = bonus_max * len(rewards) * weights[idx]
             nov = await asyncio.to_thread(
-                ctx.memory.discovery_reinforce, int(root["id"]))
+                ctx.memory.discovery_reinforce, int(root["id"]), boost)
             await asyncio.to_thread(
                 ctx.memory.journal, ctx.agent_id, "discovery_confirmed",
                 {"branch_hyp": hyp_id, "discovery": int(root["id"]),
                  "novelty": round(float(nov), 1),
-                 "why": "branch settled supported — finding reinforced"})
+                 "boost": round(boost, 3),
+                 "group_size": len(rows),
+                 "why": "branch settled supported — entropic credit applied"})
         else:
             row = await asyncio.to_thread(ctx.memory.get_hypothesis, hyp_id)
             await asyncio.to_thread(
@@ -1392,6 +1464,18 @@ async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bo
     try:
         world = ctx.memory.world_render(
             limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        # MAP-Elites steering (#2): mechanisms with NO archived elite are
+        # the pivot's target list — a saturated topic escapes by moving to
+        # an unoccupied behaviour cell, not by re-proposing covered ones.
+        try:
+            from agentics.diversity import _MECHANISM_KEYWORDS
+            from agentics.research.kg_extract import mechanism_hint
+            hint = mechanism_hint(
+                ctx.memory, list(_MECHANISM_KEYWORDS.keys()))
+            if hint:
+                world = (world + "\n\n" + hint)[:2100]
+        except Exception:  # noqa: BLE001 — hint is advisory
+            pass
         rejected = ctx.memory.rejected_render()
         recent = ctx.memory.recent_hypotheses(12)
         recent_claims = [r["claim"] for r in recent]
@@ -1555,13 +1639,20 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         recent = []
         pass
     # Discovery frontier (novelty round): when a settled result was marked a
-    # DISCOVERY, its branch children jump the CCR queue — the swarm digs
-    # into its own breakthrough (BFS, shallowest branch level first) instead
-    # of rotating generic ideas while the finding sits unexplored.
+    # DISCOVERY, its branch children jump the CCR queue. C2 (TTT_DISCOVER.md):
+    # the frontier is scored by the paper's PUCTSampler — Q = MAX descendant
+    # reward, exploitation bonus decays with subtree settles (the structural
+    # cure for rich-get-richer) — and only falls back to BFS order when the
+    # PUCT buffer is degenerate (no settles / single candidate).
     try:
         max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        puct_c = float(getattr(ctx.settings, "puct_c", 1.0))
         frontier = await asyncio.to_thread(
-            ctx.memory.discovery_frontier, 3, max_depth)
+            ctx.memory.discovery_frontier_puct, 3, max_depth, puct_c,
+            str(getattr(ctx.settings, "reward_scale", "target")))
+        if not frontier:
+            frontier = await asyncio.to_thread(
+                ctx.memory.discovery_frontier, 3, max_depth)
         if frontier:
             fids = {h["id"] for h in frontier}
             fmeta = {h["id"]: h for h in frontier}
@@ -1575,6 +1666,9 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
                      "claim": boosted[0]["claim"][:160],
                      "branch": top.get("branch", ""),
                      "depth": top.get("depth", 0),
+                     "puct_score": top.get("puct_score"),
+                     "puct_q": top.get("puct_q"),
+                     "puct_n": top.get("puct_n"),
                      "frontier_size": len(boosted)})
     except Exception:  # noqa: BLE001 — frontier must never block the deep dive
         pass

@@ -391,6 +391,41 @@ CREATE TABLE IF NOT EXISTS tournament_feedback (
     window_matches INTEGER NOT NULL,        -- how many debates it synthesised
     text TEXT NOT NULL
 );
+-- MAP-Elites QD archive (agentics/qd_elites.py): one ELITE per behaviour
+-- cell (mechanism x angle). Rejected/near-duplicate ideas are not thrown
+-- away — they compete INSIDE their cell, so the swarm keeps one good
+-- representative of every approach it ever tried instead of collapsing
+-- onto a single mode. Bounded to 400 cells.
+CREATE TABLE IF NOT EXISTS qd_cells (
+    cell_key TEXT PRIMARY KEY,              -- "mechanism|angle" (lowercased)
+    mechanism TEXT NOT NULL DEFAULT '',
+    angle TEXT NOT NULL DEFAULT '',
+    best_hyp_id INTEGER,
+    best_claim TEXT NOT NULL DEFAULT '',
+    best_quality REAL NOT NULL DEFAULT 0.0, -- gate Q / novelty, max kept
+    island INTEGER NOT NULL DEFAULT 0,      -- round-robin island assignment
+    ts REAL NOT NULL
+);
+-- GraphRAG-lite (agentics/research/kg_extract.py): entities + typed edges
+-- extracted from findings/settles. Context for research/ideation prompts is
+-- a PATH over this graph, not a flat finding list; bounded tables.
+CREATE TABLE IF NOT EXISTS kg_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,              -- lowercased entity name
+    kind TEXT NOT NULL DEFAULT '',          -- method | dataset | metric | concept
+    mentions INTEGER NOT NULL DEFAULT 1,
+    ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kg_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src INTEGER NOT NULL,
+    dst INTEGER NOT NULL,
+    rel TEXT NOT NULL DEFAULT '',           -- improves | uses | measures | ...
+    source_hyp INTEGER,                     -- hypothesis/finding provenance
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kg_edges_src ON kg_edges(src);
+CREATE INDEX IF NOT EXISTS idx_kg_edges_dst ON kg_edges(dst);
 """
 
 
@@ -1660,6 +1695,372 @@ class SharedMemory:
         out.sort(key=lambda h: (h.get("depth", 0), h["id"]))
         return out[:limit]
 
+    # --------------------------------------------- C2: PUCT frontier (TTT)
+    def _subtree_maps(self) -> tuple[dict[int, list[int]], set[int]]:
+        """(children map, discovery roots) over the whole hypothesis table."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, parents, discovery FROM hypotheses").fetchall()
+        children: dict[int, list[int]] = {}
+        discoveries: set[int] = set()
+        for pid, praw, disc in rows:
+            try:
+                for par in json.loads(praw or "[]"):
+                    children.setdefault(int(par), []).append(pid)
+            except json.JSONDecodeError:
+                continue
+            if disc:
+                discoveries.add(pid)
+        return children, discoveries
+
+    def _subtree_settles(self, root_ids: set[int],
+                         children: dict[int, list[int]]) -> dict[int, list[dict]]:
+        """experiment_ledger settle rows GROUPED BY frontier root: every
+        settle whose hyp_id lies inside the subtree of any root. This is
+        the PUCT buffer — n(s), Q(s) read from it, no schema change."""
+        if not root_ids:
+            return {}
+        with self._lock:
+            all_rows = self._conn.execute(
+                "SELECT hyp_id, status, measured, op, target, "
+                "self_authored_ratio, metric, anchors "
+                "FROM experiment_ledger").fetchall()
+        # map ledger hyp_id -> its frontier root
+        roots_of: dict[int, int] = {}
+        for rid in root_ids:
+            for mid in {rid, *self._descendants(rid, children)}:
+                roots_of[mid] = rid
+        led: dict[int, list[dict]] = {}
+        for (hid, status, measured, op, target, ratio, metric, anchors) in all_rows:
+            if hid is None:
+                continue
+            led.setdefault(int(hid), []).append({
+                "hyp_id": int(hid), "status": status,
+                "measured": measured, "op": op or "", "target": target,
+                "self_authored_ratio": ratio, "metric": metric or "",
+                "anchors": anchors or "",
+            })
+        out: dict[int, list[dict]] = {}
+        for hid, rows in led.items():
+            root = roots_of.get(hid)
+            if root is not None:
+                out.setdefault(root, []).extend(rows)
+        return out
+
+    @staticmethod
+    def _descendants(rid: int, children: dict[int, list[int]]) -> set[int]:
+        out: set[int] = set()
+        stack = list(children.get(rid, []))
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            out.add(cur)
+            stack.extend(children.get(cur, []))
+        return out
+
+    def discovery_frontier_puct(self, limit: int = 3, max_depth: int = 4,
+                                c: float = 1.0,
+                                reward_scale: str = "target") -> list[dict]:
+        """C2 (TTT_DISCOVER.md): the discovery frontier scored by the
+        paper's PUCTSampler instead of plain BFS order.
+
+            score(s) = Q(s) + c * scale * P(s) * sqrt(1+T) / (1 + n(s))
+
+        Q(s) = MAX reward among settled descendants (best outcome reachable
+        FROM a state, never the average); unexpanded states proxy Q by
+        novelty/100. P(s) = rank prior over the buffer's Q values. n(s) =
+        settles in s's subtree — the exploitation bonus DECAYS as a branch
+        is dug into, which is the structural cure for rich-get-richer.
+        Falls back to the BFS order for every degenerate buffer (no
+        settles, single candidate, zero Q range)."""
+        from agentics.verify.reward import reward_from_row, reward_stats
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                "WHERE status='proposed' AND protocol_code='' AND depth <= ? "
+                "ORDER BY id ASC", (max(0, int(max_depth)),)).fetchall()
+        hyps = [self._hypothesis_row(r) for r in rows]
+        if not hyps:
+            return []
+        children, discoveries = self._subtree_maps()
+        # keep only discovery branches (same rule as discovery_frontier)
+        branches = []
+        for h in hyps:
+            seen: set[int] = set()
+            stack = list(h.get("parents") or [])
+            is_branch = False
+            while stack:
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in discoveries:
+                    is_branch = True
+                    break
+                stack.extend(children.get(pid, []))
+            if is_branch:
+                branches.append(h)
+        if not branches:
+            return []
+        # PUCT states are the BRANCHES themselves: n(s)/Q(s) read from the
+        # settles inside each branch's OWN subtree (not the whole discovery
+        # root's), per the paper — "the best outcome starting FROM a state".
+        settles_by_branch = self._subtree_settles(
+            {int(h["id"]) for h in branches}, children)
+
+        stats_by_root: dict[int, dict] = {}
+        for rid, rws in settles_by_branch.items():
+            stats_by_root[rid] = reward_stats(rws, scale=reward_scale)
+        T = sum(len(s["rewards"]) for s in stats_by_root.values())
+
+        def q_of(h: dict) -> float:
+            s = stats_by_root.get(int(h["id"]))
+            if s and s["rewards"]:
+                return s["best"]           # MAX, per the paper
+            return min(1.0, max(0.0, float(h.get("novelty") or 0.0) / 100.0))
+
+        def n_of(h: dict) -> int:
+            s = stats_by_root.get(int(h["id"]))
+            return len(s["rewards"]) if s else 0
+
+        qs = [q_of(h) for h in branches]
+        qmax, qmin = max(qs), min(qs)
+        scale = (qmax - qmin) if qmax > qmin else 0.0
+        ranks = sorted(range(len(branches)),
+                       key=lambda i: -qs[i])
+        prior_sum = sum(len(ranks) - r for r in range(len(ranks))) or 1
+        priors: dict[int, float] = {}
+        for r, idx in enumerate(ranks):
+            priors[idx] = (len(ranks) - r) / prior_sum
+        scored = []
+        for i, h in enumerate(branches):
+            n_i = n_of(h)
+            q_i = qs[i]
+            bonus = (c * scale * priors[i] * ((1.0 + T) ** 0.5) / (1 + n_i)
+                     if scale > 0 else 0.0)
+            scored.append({**h, "puct_score": round(q_i + bonus, 4),
+                           "puct_q": round(q_i, 4), "puct_n": n_i,
+                           "puct_bonus": round(bonus, 4)})
+        scored.sort(key=lambda h: -h["puct_score"])
+        # lineage blocking: never return two candidates sharing a parent
+        # (or the same discovery root) in one batch
+        out: list[dict] = []
+        taken_parents: set[int] = set()
+        taken_roots: set[int] = set()
+
+        def ancestor_roots(h: dict) -> set[int]:
+            seen: set[int] = set()
+            stack = list(h.get("parents") or [])
+            found: set[int] = set()
+            while stack:
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in discoveries:
+                    found.add(pid)
+                stack.extend(children.get(pid, []))
+            return found
+
+        for h in scored:
+            parents = {int(p) for p in (h.get("parents") or [])}
+            roots_here = ancestor_roots(h)
+            if parents & taken_parents or roots_here & taken_roots:
+                continue
+            out.append(h)
+            taken_parents |= parents
+            taken_roots |= roots_here
+            if len(out) >= limit:
+                break
+        return out
+
+    def best_reward(self) -> float:
+        """C4 — r_sota: the best continuous reward among ANCHORED supported
+        settles (unanchored rows are validity fails, never rewards)."""
+        from agentics.verify.reward import reward_from_row
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, measured, op, target, self_authored_ratio "
+                "FROM experiment_ledger WHERE status='supported' AND "
+                "self_authored_ratio IS NOT NULL AND "
+                "self_authored_ratio < 1.0 AND anchors != ''").fetchall()
+        keys = ("status", "measured", "op", "target", "self_authored_ratio")
+        rewards = [reward_from_row(dict(zip(keys, r))) for r in rows]
+        return max(rewards, default=0.0)
+
+    def discovery_subtree_rewards(self, root_id: int,
+                                  scale: str = "target") -> list[dict]:
+        """C3 input: every settled ledger row inside the discovery root's
+        subtree, each with its continuous reward attached (0 for
+        refuted/unanchored — the settle anchor law is the validity check)."""
+        from agentics.verify.reward import reward_from_row
+        children, _disc = self._subtree_maps()
+        rows = self._subtree_settles({int(root_id)}, children).get(
+            int(root_id), [])
+        span_rows = [r for r in rows if r.get("measured") is not None]
+        vals = [float(r["measured"]) for r in span_rows]
+        span = (max(vals) - min(vals)) if len(vals) >= 2 else None
+        out = []
+        for r in rows:
+            r = dict(r)
+            r["reward"] = reward_from_row(r, scale=scale, history_span=span)
+            out.append(r)
+        return out
+
+    # --------------------------------------------- MAP-Elites QD archive
+    def qd_record(self, mechanism: str, angle: str, hyp_id: int | None,
+                  claim: str, quality: float) -> str:
+        """Archive ONE candidate into its behaviour cell (mechanism x angle).
+        The cell keeps the BEST-quality representative (MAP-Elites elite);
+        a weaker newcomer updates nothing but still proves the cell is
+        occupied. Island assignment is round-robin over insertion order.
+        Returns the cell key."""
+        mech = (mechanism or "unknown").strip().lower()[:60] or "unknown"
+        ang = (angle or "core").strip().lower()[:60] or "core"
+        key = f"{mech}|{ang}"
+        with self._lock, self._conn:
+            n = self._conn.execute(
+                "SELECT COUNT(*) FROM qd_cells").fetchone()[0]
+            island = int(n) % 8
+            row = self._conn.execute(
+                "SELECT best_quality FROM qd_cells WHERE cell_key=?",
+                (key,)).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO qd_cells (cell_key, mechanism, angle, "
+                    "best_hyp_id, best_claim, best_quality, island, ts) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (key, mech, ang, hyp_id, (claim or "")[:300],
+                     max(0.0, float(quality)), island, time.time()))
+            elif float(quality) > float(row[0]):
+                self._conn.execute(
+                    "UPDATE qd_cells SET best_hyp_id=?, best_claim=?, "
+                    "best_quality=?, ts=? WHERE cell_key=?",
+                    (hyp_id, (claim or "")[:300], float(quality),
+                     time.time(), key))
+            self._conn.execute(
+                "DELETE FROM qd_cells WHERE cell_key NOT IN "
+                "(SELECT cell_key FROM qd_cells ORDER BY best_quality DESC "
+                "LIMIT 400)")
+        return key
+
+    def qd_cells_list(self, limit: int = 40) -> list[dict]:
+        """Archived elites, best first (ideation hint + dashboard)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT cell_key, mechanism, angle, best_hyp_id, best_claim, "
+                "best_quality, island FROM qd_cells "
+                "ORDER BY best_quality DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for r in rows:
+            out.append({"cell": r[0], "mechanism": r[1], "angle": r[2],
+                        "hyp_id": r[3], "claim": r[4], "quality": r[5],
+                        "island": r[6]})
+        return out
+
+    def qd_underexplored(self, taxonomy: list[str], limit: int = 5) -> list[str]:
+        """Mechanisms from `taxonomy` (agentics/diversity.classify) that the
+        archive has NO elite for — the saturation pivot's target list."""
+        with self._lock:
+            have = {r[0] for r in self._conn.execute(
+                "SELECT DISTINCT mechanism FROM qd_cells").fetchall()}
+        missing = [m for m in taxonomy if m.lower() not in have]
+        return missing[:max(0, int(limit))]
+
+    # --------------------------------------------- GraphRAG-lite
+    def kg_entity(self, name: str, kind: str = "") -> int | None:
+        """Upsert one entity (case-insensitive name); mentions increment."""
+        clean = (name or "").strip().lower()[:80]
+        if not clean:
+            return None
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name=?", (clean,)).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE kg_entities SET mentions=mentions+1, "
+                    "kind=CASE WHEN kind='' THEN ? ELSE kind END WHERE id=?",
+                    ((kind or "")[:40], row[0]))
+                return int(row[0])
+            cur = self._conn.execute(
+                "INSERT INTO kg_entities (name, kind, mentions, ts) "
+                "VALUES (?,?,1,?)", (clean, (kind or "")[:40], time.time()))
+            self._conn.execute(
+                "DELETE FROM kg_entities WHERE id NOT IN "
+                "(SELECT id FROM kg_entities ORDER BY mentions DESC LIMIT 400)")
+            return int(cur.lastrowid or 0) or None
+
+    def kg_edge(self, src: str, dst: str, rel: str,
+                source_hyp: int | None = None) -> bool:
+        """One typed edge src -rel-> dst; entities auto-upserted."""
+        with self._lock:
+            a = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name=?",
+                ((src or "").strip().lower()[:80],)).fetchone()
+            b = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name=?",
+                ((dst or "").strip().lower()[:80],)).fetchone()
+        if not a or not b or int(a[0]) == int(b[0]):
+            return False
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO kg_edges (src, dst, rel, source_hyp, ts) "
+                "VALUES (?,?,?,?,?)",
+                (int(a[0]), int(b[0]), (rel or "related")[:40],
+                 source_hyp, time.time()))
+            self._conn.execute(
+                "DELETE FROM kg_edges WHERE id NOT IN "
+                "(SELECT id FROM kg_edges ORDER BY ts DESC LIMIT 2000)")
+        return True
+
+    def kg_context(self, terms: list[str], limit: int = 12) -> str:
+        """A PATH-based context block: entities matching any term plus their
+        outgoing/incoming edges, rendered as 'a -rel-> b (mentions)'. Empty
+        string when the graph has nothing relevant — callers just skip it."""
+        if not terms:
+            return ""
+        with self._lock:
+            ids: set[int] = set()
+            names: dict[int, str] = {}
+            for t in terms[:8]:
+                pat = f"%{str(t).strip().lower()[:60]}%"
+                for eid, name, kind, men in self._conn.execute(
+                        "SELECT id, name, kind, mentions FROM kg_entities "
+                        "WHERE name LIKE ? ORDER BY mentions DESC LIMIT 8",
+                        (pat,)).fetchall():
+                    ids.add(eid)
+                    names[eid] = name + (f" [{kind}]" if kind else "")
+            if not ids:
+                return ""
+            id_list = list(ids)[:40]
+            marks = ",".join("?" * len(id_list))
+            edges = self._conn.execute(
+                f"SELECT src, dst, rel FROM kg_edges WHERE src IN ({marks}) "
+                f"OR dst IN ({marks}) ORDER BY ts DESC LIMIT ?",
+                (*id_list, *id_list, limit)).fetchall()
+            # neighbor entities must be rendered too, or every edge to an
+            # unseeded node would be silently dropped
+            neighbor_ids = ({int(s) for s, _d, _r in edges}
+                            | {int(d) for _s, d, _r in edges}) - ids
+            for nid in neighbor_ids:
+                row = self._conn.execute(
+                    "SELECT id, name, kind FROM kg_entities WHERE id=?",
+                    (nid,)).fetchone()
+                if row:
+                    ids.add(row[0])
+                    names[row[0]] = row[1] + (f" [{row[2]}]" if row[2] else "")
+            lines: list[str] = []
+        for src, dst, rel in edges:
+            if src in names and dst in names:
+                lines.append(f"- {names[src]} --{rel}--> {names[dst]}")
+        if not lines:
+            return ""
+        return "\n".join(sorted(set(lines))[:limit])
+
     def recent_hypotheses(self, limit: int = 12) -> list[dict]:
         """Newest hypotheses across ALL statuses with their QD signature.
 
@@ -1770,8 +2171,31 @@ class SharedMemory:
         of the verdict's deciding inputs the agent authored (1.0 = fully
         self-graded); `anchors` is the JSON list of external anchor kinds
         that made the verdict trustworthy. Both are None/'' for rows that
-        predate the law or carry no machine verdict."""
+        predate the law or carry no machine verdict.
+
+        C4 (TTT_DISCOVER.md): an anchored-supported settle whose continuous
+        reward beats the previous best journals `new_state_of_the_art` —
+        the paper's formal discovery event (R(s) > r_sota), independent of
+        the subjective novelty grade."""
+        from agentics.verify.reward import reward_from_row
+
+        reward = 0.0
+        if (status == "supported" and self_authored_ratio is not None
+                and float(self_authored_ratio) < 1.0):
+            reward = reward_from_row({
+                "status": status, "measured": measured, "op": op,
+                "target": target, "self_authored_ratio": self_authored_ratio,
+            })
         with self._lock, self._conn:
+            prev_best = self._conn.execute(
+                "SELECT MAX(id) FROM experiment_ledger").fetchone()
+            prev_rows = []
+            if prev_best and prev_best[0]:
+                prev_rows = self._conn.execute(
+                    "SELECT status, measured, op, target, self_authored_ratio "
+                    "FROM experiment_ledger WHERE status='supported' AND "
+                    "self_authored_ratio IS NOT NULL AND "
+                    "self_authored_ratio < 1.0 AND anchors != ''").fetchall()
             cur = self._conn.execute(
                 "INSERT INTO experiment_ledger (ts, agent, hyp_id, status, "
                 "metric, measured, op, target, verdict_note, protocol_path, "
@@ -1785,6 +2209,21 @@ class SharedMemory:
             self._conn.execute(
                 "DELETE FROM experiment_ledger WHERE id NOT IN "
                 "(SELECT id FROM experiment_ledger ORDER BY id DESC LIMIT 500)")
+        if reward > 0.0 and (anchors or "").strip():
+            prev_rewards = [
+                reward_from_row(dict(zip(("status", "measured", "op",
+                                          "target", "self_authored_ratio"),
+                                         r)))
+                for r in prev_rows]
+            if reward > max(prev_rewards, default=0.0):
+                try:
+                    self.journal(agent, "new_state_of_the_art", {
+                        "hyp": hyp_id, "metric": (metric or "")[:120],
+                        "reward": round(reward, 4),
+                        "measured": measured, "op": op, "target": target,
+                    })
+                except Exception:  # noqa: BLE001 — telemetry never gates
+                    pass
         return int(cur.lastrowid or 0)
 
     def ledger_recent(self, limit: int = 50) -> list[dict]:

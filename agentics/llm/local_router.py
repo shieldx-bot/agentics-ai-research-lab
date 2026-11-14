@@ -1,0 +1,129 @@
+"""Local small-model router (#3 of the advanced-tech integration): a FREE,
+offline LLM edge (Ollama, llama.cpp OpenAI-compatible, LM Studio) for the
+lab's cheap purposes — dedup/classify/extraction — so the cookie pool is
+spent ONLY on science.
+
+Why this exists (live 2026-11-14 07:08): 121/120 pool calls in one hour,
+mostly plumbing, and the science paths got budget-refused. A local model
+converts the whole class of "pool exhausted" incidents into a no-op: cheap
+purposes route here first (or fall back here when the pool refuses), the
+cookies stay reserved for research/verify/ideation.
+
+Design constraints (honest edge, same as every pool client):
+* never raises — a missing/unresponsive local runtime returns ok=False;
+* only the purposes in `local_llm_purposes` may use it (science purposes
+  NEVER silently degrade to the small model — a weaker verdict is worse
+  than a refused ask);
+* the P20 ledger does NOT count local asks: they consume no shared cookie
+  quota, and inflating the ledger would starve the pool cap artificially.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from types import SimpleNamespace
+
+import aiohttp
+
+log = logging.getLogger("llm.local_router")
+
+_local: SimpleNamespace | None = None      # process-wide singleton state
+
+
+def _timeout(settings=None) -> float:
+    return float(getattr(settings, "local_llm_timeout", 60.0) or 60.0)
+
+
+async def _post(url: str, payload: dict,
+                settings=None) -> dict | None:
+    """One POST to the local runtime; None on any failure (never raises)."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=_timeout(settings))
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    log.warning("local_router %s -> HTTP %s",
+                                url, resp.status)
+                    return None
+                return await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
+        log.warning("local_router %s failed: %s", url, exc)
+        return None
+
+
+async def available(settings=None) -> bool:
+    """True when the local runtime answers /api/tags (Ollama)."""
+    base = str(getattr(settings, "local_llm_url", "") or "").rstrip("/")
+    if not base:
+        return False
+    data = await _post(f"{base}/api/tags", {}, settings=settings)
+    return bool(data)
+
+
+async def ask(prompt: str, settings=None, purpose: str = "local",
+              system: str = "") -> SimpleNamespace | None:
+    """One Ollama /api/chat completion. Returns an LLMResponse-shaped
+    namespace (answer/citations/ok) or None when the runtime is absent/
+    failing. Deliberately NOT budget-recorded: local calls burn no cookie
+    quota (see module docstring)."""
+    base = str(getattr(settings, "local_llm_url", "") or "").rstrip("/")
+    model = str(getattr(settings, "local_llm_model", "") or "").strip()
+    if not base or not model or not prompt.strip():
+        return None
+    started = time.monotonic()
+    messages = []
+    if system.strip():
+        messages.append({"role": "system", "content": system[:2000]})
+    messages.append({"role": "user", "content": prompt[:16000]})
+    data = await _post(f"{base}/api/chat", {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }, settings=settings)
+    if not isinstance(data, dict):
+        return None
+    content = ""
+    message = data.get("message")
+    if isinstance(message, dict):
+        content = str(message.get("content") or "")
+    if not content and isinstance(data.get("response"), str):
+        content = data["response"]          # llama.cpp-style payloads
+    if not content.strip():
+        return None
+    return SimpleNamespace(
+        answer=content,
+        citations=[],
+        ok=True,
+        elapsed_s=time.monotonic() - started,
+        raw=data,
+    )
+
+
+# Purposes that may NEVER route to the small model — even if someone
+# lists them in LOCAL_LLM_PURPOSES. A weaker verdict/research answer is
+# worse than a refused ask (the reserve lane should wait for the pool).
+_SCIENCE_PURPOSES = frozenset({
+    "research", "verify", "ideation", "plan", "implement", "review",
+    "tournament", "tournament_judge2", "role_synthesis",
+})
+
+
+def purposes_for(settings) -> tuple[str, ...]:
+    """The purposes allowed to route to the local model (config list,
+    minus anything science-critical)."""
+    raw = str(getattr(settings, "local_llm_purposes",
+                      "kg_extract") or "")
+    return tuple(p.strip().lower() for p in raw.split(",") if p.strip()
+                 and p.strip().lower() not in _SCIENCE_PURPOSES)
+
+
+def allowed_for(settings, purpose: str) -> bool:
+    """Science purposes never degrade to the small model, even by accident."""
+    p = (purpose or "").lower()
+    if p in _SCIENCE_PURPOSES:
+        return False
+    return (bool(getattr(settings, "local_llm_enabled", False))
+            and p in purposes_for(settings))
