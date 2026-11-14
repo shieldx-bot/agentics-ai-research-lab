@@ -324,6 +324,25 @@ CREATE TABLE IF NOT EXISTS role_prompts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_role_prompts_active
     ON role_prompts(role, category) WHERE status='active';
+-- DSPy-lite prompt evolution (wave-2 #2): the CHALLENGER pool per
+-- (role, category). The active row in role_prompts stays the champion;
+-- variants are mutation arms served on exploration cycles, selected on
+-- REAL cycle outcomes (exit-code settle results, never LLM opinion), and
+-- promoted through store_role_prompt (the existing rework machinery)
+-- when they beat the champion's win-rate by a margin.
+CREATE TABLE IF NOT EXISTS prompt_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    category TEXT NOT NULL,
+    mission TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'arm',     -- arm | retired | promoted
+    origin TEXT NOT NULL DEFAULT 'mutate',  -- mutate | manual
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_variants ON prompt_variants(role, category, status);
 CREATE TABLE IF NOT EXISTS llm_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -647,6 +666,98 @@ class SharedMemory:
             ).fetchone()
         return {"prompts": row[0], "uses": row[1], "successes": row[2],
                 "failures": row[3]}
+
+    # -------------------------------------- prompt variants (wave-2 #2)
+    _PROMPT_VARIANT_KEYS = ("id", "role", "category", "mission", "status",
+                            "origin", "ts", "uses", "wins", "losses")
+
+    def prompt_variants(self, role: str, category: str,
+                        limit: int = 8) -> list[dict]:
+        """The armed challenger pool for (role, category), oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, role, category, mission, status, origin, ts, "
+                "uses, wins, losses FROM prompt_variants "
+                "WHERE role=? AND category=? AND status='arm' "
+                "ORDER BY id ASC LIMIT ?", (role, category, limit)
+            ).fetchall()
+        return [dict(zip(self._PROMPT_VARIANT_KEYS, r)) for r in rows]
+
+    def store_prompt_variant(self, role: str, category: str, mission: str,
+                             origin: str = "mutate",
+                             pool_size: int = 3) -> int:
+        """Add one challenger arm; prune to the newest `pool_size` arms.
+        Returns the variant id (0 when the mission is unusable)."""
+        mission = (mission or "").strip()
+        if not mission:
+            return 0
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO prompt_variants (role, category, mission, "
+                "status, origin, ts) VALUES (?, ?, ?, 'arm', ?, ?)",
+                (role, category, mission[:4000], origin, time.time()))
+            vid = int(cur.lastrowid or 0)
+            # keep only the newest pool_size armed arms (retire the rest)
+            self._conn.execute(
+                "UPDATE prompt_variants SET status='retired' "
+                "WHERE role=? AND category=? AND status='arm' AND id NOT IN "
+                "(SELECT id FROM prompt_variants WHERE role=? AND category=? "
+                "AND status='arm' ORDER BY id DESC LIMIT ?)",
+                (role, category, role, category, max(1, int(pool_size))))
+        return vid
+
+    def record_prompt_variant_outcome(self, variant_id: int,
+                                      success: bool) -> None:
+        """Feed one cycle outcome into an armed variant (uses/wins/losses)."""
+        if not variant_id:
+            return
+        col = "wins" if success else "losses"
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE prompt_variants SET uses=uses+1, {col}={col}+1 "
+                "WHERE id=? AND status='arm'", (int(variant_id),))
+
+    def promote_prompt_variant(self, variant_id: int,
+                               min_uses: int, edge: float) -> bool:
+        """Promote an armed variant to champion when it BEATS the active
+        mission's win-rate by `edge` with at least `min_uses` samples.
+
+        Promotion goes through store_role_prompt, so the existing rework /
+        TTL machinery owns the new champion unchanged. Returns True on
+        promotion; not-enough-data returns False silently."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT role, category, mission, uses, wins FROM "
+                "prompt_variants WHERE id=? AND status='arm'",
+                (int(variant_id),)).fetchone()
+        if row is None or int(row[3]) < int(min_uses):
+            return False
+        role, category, mission = row[0], row[1], row[2]
+        var_rate = float(row[4]) / float(row[3])
+        champ = self.get_role_prompt(role, category)
+        champ_rate = 0.0
+        if champ is not None and int(champ.get("uses") or 0) > 0:
+            champ_rate = float(champ["successes"]) / float(champ["uses"])
+        if var_rate < champ_rate + float(edge):
+            return False
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE prompt_variants SET status='promoted' WHERE id=?",
+                (int(variant_id),))
+        self.store_role_prompt(role, category, mission,
+                               reason="prompt_evolved")
+        return True
+
+    def prompt_variant_stats(self) -> dict[str, int]:
+        """Owner-dashboard aggregate over the challenger pool."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(uses),0), "
+                "COALESCE(SUM(wins),0), "
+                "SUM(CASE WHEN status='promoted' THEN 1 ELSE 0 END) "
+                "FROM prompt_variants").fetchone()
+        return {"variants": row[0] or 0, "uses": row[1] or 0,
+                "wins": row[2] or 0, "promoted": row[3] or 0}
 
     def role_experience(self, role: str, category: str, limit: int = 8) -> str:
         """Recent traces of this (role, category) as digest lines for the

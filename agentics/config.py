@@ -224,7 +224,8 @@ class Settings:
     # plan instead of an idle agent (2026-11-14 08:35 plan-starvation).
     local_llm_purposes: str = field(
         default_factory=lambda: _env("LOCAL_LLM_PURPOSES",
-                                     "kg_extract,plan,role_synthesis"))
+                                     "kg_extract,plan,role_synthesis,"
+                                     "prompt_evolve,reflect"))
     # GraphRAG-lite: mine findings into the knowledge graph when the local
     # router is configured; ingest is a no-op without it.
     kg_enabled: bool = field(default_factory=lambda: _env_bool("KG_ENABLED", True))
@@ -391,6 +392,23 @@ class Settings:
         default_factory=lambda: _env_int("ROLE_PROMPT_MAX_CHARS", 1600))
     role_prompt_rework_failures: int = field(
         default_factory=lambda: _env_int("ROLE_PROMPT_REWORK_FAILURES", 2))
+    # Wave-2 #2 — DSPy-lite prompt evolution: the role mission is not just
+    # re-synthesized after failures, it EVOLVES. Challenger variants (arms)
+    # are served on exploration cycles, scored on real exit-code outcomes,
+    # and promoted when they beat the champion's win-rate by a margin.
+    # Mutation runs on the LOCAL router (purpose prompt_evolve) — no cookie
+    # cost. Requires adaptive_prompts.
+    prompt_evolution_enabled: bool = field(
+        default_factory=lambda: _env_bool("PROMPT_EVOLUTION", True))
+    prompt_variant_pool: int = field(
+        default_factory=lambda: _env_int("PROMPT_VARIANT_POOL", 3))
+    prompt_explore_p: float = field(
+        default_factory=lambda: _env_float("PROMPT_EXPLORE_P", 0.25))
+    prompt_variant_promote_min: int = field(
+        default_factory=lambda: _env_int("PROMPT_VARIANT_PROMOTE_MIN", 10))
+    prompt_variant_promote_edge: float = field(
+        default_factory=lambda: _env_float("PROMPT_VARIANT_PROMOTE_EDGE",
+                                           0.15))
     # --- Coordination pack A2X (docs/COORDINATION.md) ------------------------
     # Contract-Net-lite: rank bonus a claim adds to a task the supervisor's
     # scan awarded to THIS agent (0 disables the allocation signal entirely;
