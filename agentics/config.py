@@ -225,7 +225,7 @@ class Settings:
     local_llm_purposes: str = field(
         default_factory=lambda: _env("LOCAL_LLM_PURPOSES",
                                      "kg_extract,plan,role_synthesis,"
-                                     "prompt_evolve,reflect"))
+                                     "prompt_evolve,reflect,skill_distill"))
     # GraphRAG-lite: mine findings into the knowledge graph when the local
     # router is configured; ingest is a no-op without it.
     kg_enabled: bool = field(default_factory=lambda: _env_bool("KG_ENABLED", True))
@@ -418,6 +418,15 @@ class Settings:
         default_factory=lambda: _env_int("REFLECT_EVERY_CYCLES", 6))
     reflect_min_notes: int = field(
         default_factory=lambda: _env_int("REFLECT_MIN_NOTES", 5))
+    # Wave-2 #1 — Voyager-style skill library: supported settles are
+    # distilled into reusable skills (description via the LOCAL router,
+    # purpose skill_distill; code stored verbatim). Retrieval injects the
+    # token-overlap top-3 into protocol-writing/implement prompts.
+    skill_library_enabled: bool = field(
+        default_factory=lambda: _env_bool("SKILL_LIBRARY", True))
+    skill_distill_every_cycles: int = field(
+        default_factory=lambda: _env_int("SKILL_DISTILL_EVERY_CYCLES", 4))
+    skill_max: int = field(default_factory=lambda: _env_int("SKILL_MAX", 120))
     # --- Coordination pack A2X (docs/COORDINATION.md) ------------------------
     # Contract-Net-lite: rank bonus a claim adds to a task the supervisor's
     # scan awarded to THIS agent (0 disables the allocation signal entirely;

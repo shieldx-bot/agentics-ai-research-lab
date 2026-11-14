@@ -448,6 +448,23 @@ CREATE TABLE IF NOT EXISTS kg_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_kg_edges_src ON kg_edges(src);
 CREATE INDEX IF NOT EXISTS idx_kg_edges_dst ON kg_edges(dst);
+-- Voyager-style skill library (wave-2 #1): protocols the lab SETTLED as
+-- supported get distilled into reusable, indexed skills. Distillation and
+-- retrieval run on the LOCAL router / plain token overlap — zero cookie
+-- cost; the compounding memory turns one-off protocol wins into the
+-- coder's starting point next time a similar claim appears.
+CREATE TABLE IF NOT EXISTS skill_library (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    code TEXT NOT NULL DEFAULT '',          -- full protocol source (settled)
+    metric TEXT NOT NULL DEFAULT '',
+    source_hyp INTEGER,                     -- the settle this came from
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_skill_library ON skill_library(status, ts);
 """
 
 
@@ -2181,6 +2198,79 @@ class SharedMemory:
         if not lines:
             return ""
         return "\n".join(sorted(set(lines))[:limit])
+
+    # ------------------------------------- skill library (wave-2 #1)
+    def add_skill(self, name: str, description: str, code: str = "",
+                  metric: str = "", source_hyp: int | None = None,
+                  max_skills: int = 120) -> int:
+        """Store one distilled skill. One skill per source settle (the
+        UNIQUE-ish gate lives here): re-settling the same hypothesis
+        refreshes the row instead of duplicating it. Bounded table —
+        oldest, least-used skills fall off past `max_skills`."""
+        name = (name or "").strip()
+        if not name:
+            return 0
+        with self._lock, self._conn:
+            prior = None
+            if source_hyp is not None:
+                prior = self._conn.execute(
+                    "SELECT id FROM skill_library WHERE source_hyp=? "
+                    "AND status='active'", (int(source_hyp),)).fetchone()
+            if prior:
+                self._conn.execute(
+                    "UPDATE skill_library SET name=?, description=?, code=?, "
+                    "metric=?, ts=? WHERE id=?",
+                    (name[:120], (description or "")[:600], code[:20000],
+                     (metric or "")[:60], time.time(), prior[0]))
+                return int(prior[0])
+            cur = self._conn.execute(
+                "INSERT INTO skill_library (name, description, code, "
+                "metric, source_hyp, status, ts) VALUES (?,?,?,?,?,'active',?)",
+                (name[:120], (description or "")[:600], code[:20000],
+                 (metric or "")[:60], source_hyp, time.time()))
+            vid = int(cur.lastrowid or 0)
+            self._conn.execute(
+                "UPDATE skill_library SET status='superseded' WHERE id NOT IN "
+                "(SELECT id FROM skill_library ORDER BY uses DESC, id DESC "
+                "LIMIT ?)", (max(1, int(max_skills)),))
+            return vid
+
+    def library_skills(self, limit: int = 40) -> list[dict]:
+        """Active skills, most-used first (retrieval + dashboard feed)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, name, description, code, metric, source_hyp, "
+                "ts, uses FROM skill_library WHERE status='active' "
+                "ORDER BY uses DESC, id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r[0], "name": r[1], "description": r[2], "code": r[3],
+                 "metric": r[4], "source_hyp": r[5], "ts": r[6],
+                 "uses": r[7]} for r in rows]
+
+    def skill_for_hyp(self, hyp_id: int | None) -> dict | None:
+        """The skill distilled from this hypothesis' settle, if any."""
+        if hyp_id is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM skill_library WHERE source_hyp=? "
+                "AND status='active'", (int(hyp_id),)).fetchone()
+        return None if row is None else next(
+            (s for s in self.library_skills(limit=500)
+             if s["id"] == row[0]), None)
+
+    def bump_skill_uses(self, skill_ids: list[int]) -> None:
+        with self._lock, self._conn:
+            for sid in skill_ids:
+                self._conn.execute(
+                    "UPDATE skill_library SET uses=uses+1 WHERE id=?",
+                    (int(sid),))
+
+    def skill_library_stats(self) -> dict[str, int]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(uses),0) FROM skill_library "
+                "WHERE status='active'").fetchone()
+        return {"skills": row[0] or 0, "uses": row[1] or 0}
 
     def recent_hypotheses(self, limit: int = 12) -> list[dict]:
         """Newest hypotheses across ALL statuses with their QD signature.

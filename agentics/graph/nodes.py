@@ -52,6 +52,7 @@ from agentics.research import diversity as research_diversity
 from agentics.research import free_tools
 from agentics.research import ideation as idea
 from agentics.research import papers as papers_mod
+from agentics.evolution.skills import skills_block          # wave-2 #1
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
 from agentics import diversity as qd
 from agentics.verify_ops import (
@@ -486,6 +487,13 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         from agentics.graph.reflection import maybe_reflect
         maybe_reflect(ctx)
     except Exception:  # noqa: BLE001 — reflection must never break the scan
+        pass
+    # Wave-2 #1: skill library distillation — supported settles become
+    # reusable skills (description via the LOCAL router, code verbatim).
+    try:
+        from agentics.evolution.skills import maybe_distill
+        maybe_distill(ctx)
+    except Exception:  # noqa: BLE001 — distill must never break the scan
         pass
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
@@ -1742,6 +1750,8 @@ async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> 
         f"Machine criterion (the protocol MUST print AGENTICS_RESULT with "
         f"exactly this metric): {criterion_desc}\n"
         f"{retry_note}\n"
+        # Wave-2 #1: settled protocols compound — start from verified skills
+        f"{skills_block(ctx.memory, hyp['claim'])}\n\n"
         f"{PROTOCOL_CONTRACT}\n"
         'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
         '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
@@ -2874,6 +2884,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
             f"{brief}"
+            # Wave-2 #1: compounding skills — verified approaches for this
+            # kind of task, distilled from the lab's own settled protocols.
+            f"{skills_block(ctx.memory, state.get('issue_title', ''))}\n\n"
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
