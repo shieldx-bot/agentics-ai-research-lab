@@ -7,7 +7,7 @@
 
 [![python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org)
 [![langgraph](https://img.shields.io/badge/core-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![tests](https://img.shields.io/badge/tests-1094%20passing-brightgreen)](#8-đánh-giá-bầy-đàn--pre-production)
+[![tests](https://img.shields.io/badge/tests-1118%20passing-brightgreen)](#8-đánh-giá-bầy-đàn--pre-production)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
