@@ -35,6 +35,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from agentics.agents.roles import (
     GUARDRAILS,
@@ -307,6 +308,33 @@ class PlanCore:
     steps: list[str] = field(default_factory=list)
 
 
+def clean_plan_path(raw, root=None) -> str | None:
+    """Sanitize a model-proposed plan file path (live 2026-11-14 14:47: a
+    local-model plan carried an ABSOLUTE path; node_implement's read_file
+    hit the P10 guard's `workspace paths must be relative` ValueError and
+    the whole cycle died — the same LLM-artifact-kills-a-cycle class as
+    the empty-papers IndexError that morning). Strips cosmetic garbage
+    (quotes, backticks, Windows separators, `./`), relativizes an
+    absolute path that points INSIDE `root` (the model echoing its
+    workspace prefix is legitimate), and returns None for anything
+    unusable so the caller can skip that file instead of crashing."""
+    p = str(raw or "").strip().strip("`\"'").strip()
+    if not p:
+        return None
+    p = p.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    candidate = Path(p)
+    if candidate.is_absolute():
+        if root is None:
+            return candidate.as_posix()      # no root known: caller decides
+        try:
+            candidate = candidate.resolve().relative_to(Path(root).resolve())
+        except (ValueError, OSError):
+            return None
+    return candidate.as_posix() or None
+
+
 def normalize_plan(parsed: dict, caps: dict | None = None) -> PlanCore:
     """Tolerant adapter from the model's own plan to the machine contract.
 
@@ -333,8 +361,11 @@ def normalize_plan(parsed: dict, caps: dict | None = None) -> PlanCore:
                    if isinstance(n, str)][:caps["reuses"]]
     files = parsed.get("files") or []
     core.expected_files = [
-        f.get("path", "")[:PATH_MAX] for f in files
-        if isinstance(f, dict) and f.get("path")
+        p[:PATH_MAX] for p in (
+            clean_plan_path(f.get("path"))
+            for f in files
+            if isinstance(f, dict) and f.get("path")
+        ) if p
     ][:caps["files"]]
     core.extras = {
         k: v for k, v in parsed.items()
@@ -395,8 +426,8 @@ def plan_state_json(core: PlanCore, cap: int = PLAN_STATE_CAP) -> str:
     }
     if isinstance(files, list):
         slim["files"] = [
-            {"path": str(f.get("path", ""))[:PATH_MAX],
-             "change": str(f.get("change", "new"))[:40]}
+            {"path": (clean_plan_path(f.get("path")) or "")[:PATH_MAX],
+             "change": str(f.get("change", "new")).strip().lower()[:40]}
             for f in files[:PLAN_CAPS["files"]] if isinstance(f, dict)
         ]
     text = json.dumps(slim, ensure_ascii=False, separators=(",", ":"))

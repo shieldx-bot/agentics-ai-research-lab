@@ -577,3 +577,52 @@ def test_plan_provider_failure_does_not_retry(mem, monkeypatch):
               "papers": [{"answer": ""}]}))
     assert len(asks) == 1                        # no retry on provider failure
     assert state["error"].startswith("llm plan call failed")
+
+
+# ------------------------- plan path sanitization (live 2026-11-14 14:47)
+def test_clean_plan_path_strips_cosmetic_garbage():
+    assert planning.clean_plan_path("  experiments/a.py  ") == "experiments/a.py"
+    assert planning.clean_plan_path("`experiments/a.py`") == "experiments/a.py"
+    assert planning.clean_plan_path('"experiments/a.py"') == "experiments/a.py"
+    assert planning.clean_plan_path("experiments\\a.py") == "experiments/a.py"
+    assert planning.clean_plan_path("./experiments/a.py") == "experiments/a.py"
+    assert planning.clean_plan_path("") is None
+    assert planning.clean_plan_path(None) is None
+
+
+def test_clean_plan_path_relativizes_absolute_inside_workspace(tmp_path):
+    inner = tmp_path / "experiments" / "a.py"
+    assert planning.clean_plan_path(str(inner), root=tmp_path) == "experiments/a.py"
+
+
+def test_clean_plan_path_outside_workspace_is_none(tmp_path):
+    # absolute outside the workspace: unusable for implement (None),
+    # but with no root known the caller decides (kept, posix-normalized)
+    assert planning.clean_plan_path("/etc/passwd", root=tmp_path) is None
+    assert planning.clean_plan_path("/etc/passwd") == "/etc/passwd"
+
+
+def test_clean_plan_path_traversal_string_cannot_escape_via_relative_to(tmp_path):
+    # a path with .. segments resolves BEFORE relative_to, so the escape
+    # attempt can never come back as a workspace-relative path
+    evil = str(tmp_path / ".." / "outside" / "x.py")
+    assert planning.clean_plan_path(evil, root=tmp_path) is None
+
+
+def test_normalize_plan_expected_files_are_sanitized():
+    core = planning.normalize_plan(
+        {"files": [{"path": "./experiments\\a.py", "change": "EDIT"},
+                   {"path": "`docs/b.md`"}]})
+    assert core.expected_files == ["experiments/a.py", "docs/b.md"]
+
+
+def test_plan_state_json_slim_normalizes_paths_and_change():
+    core = planning.normalize_plan(
+        {"files": [{"path": "/weird/abs/path.py", "change": "Edit"},
+                   {"path": "./x.py", "change": "NEW"}],
+         "notes": "filler" * 100})       # force the slim rebuild (overflow)
+    text = planning.plan_state_json(core, cap=400)
+    files = json.loads(text)["files"]
+    assert files[0]["path"] == "/weird/abs/path.py"   # no root: kept as-is
+    assert files[0]["change"] == "edit"
+    assert files[1]["path"] == "x.py" and files[1]["change"] == "new"

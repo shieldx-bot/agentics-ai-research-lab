@@ -651,3 +651,63 @@ def test_reviewer_sees_the_recorded_evidence(mem, monkeypatch):
     review = mem.get_review(mr_id)
     assert "P16 evidence: 2 run(s)" in review["verdict_comment"]
     assert "confirmed" in review["verdict_comment"]
+
+
+# ------------------- plan path safety (live 2026-11-14 14:47, a06 crash)
+def test_implement_survives_absolute_path_in_plan(mem, tmp_path, monkeypatch):
+    """Live 14:47: a06/writer's whole cycle died on ValueError
+    'workspace paths must be relative' — a LOCAL-model plan (pool budget
+    exhausted) carried an ABSOLUTE path straight into read_file. The P10
+    guard must stay strict, but the cycle must relativize what is inside
+    the workspace and skip what is not: a bad path costs ONE file, never
+    the cycle."""
+    seen_paths: list = []
+
+    class GuardedWorkspace(FakeWorkspace):
+        """Mimics the real RepoWorkspace read/write path guards."""
+        def read_file(self, p):
+            if Path(p).is_absolute():
+                raise ValueError("workspace paths must be relative")
+            return super().read_file(p)
+
+        def write_file(self, p, c, allow=False):
+            if Path(p).is_absolute():
+                raise ValueError("workspace paths must be relative")
+            seen_paths.append(p)
+            super().write_file(p, c, allow)
+
+    _llm_json(monkeypatch, payload="x = 1\n")
+    ws = GuardedWorkspace(tmp_path, [])
+    plan = {"files": [
+        {"path": str(tmp_path / "experiments" / "a.py"), "change": "edit"},
+        {"path": "/etc/escaped.py", "change": "edit"},        # outside → skip
+        {"path": "", "change": "edit"},                       # empty → skip
+    ], "commit_message": "m"}
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws),
+        {**_impl_state(), "plan": json.dumps(plan)}))
+    # the cycle completed and pushed — one crash-free pass over all files
+    assert ws.pushed and state["action"] == "open_pr"
+    # the inside-workspace absolute path was relativized and written
+    assert seen_paths == ["experiments/a.py"]
+    # the escaped path was journalled, not crashed on
+    events = [e["event"] for e in mem.recent_journal(limit=50)]
+    assert "plan_path_skipped" in events
+
+
+def test_implement_survives_read_file_guard_refusal(mem, tmp_path, monkeypatch):
+    """Even a ValueError from read_file (hallucinated/guarded path) must
+    degrade to a new-file write, mirroring the None-for-hallucination
+    contract — never kill the cycle."""
+    class RefusingWorkspace(FakeWorkspace):
+        def read_file(self, p):
+            raise ValueError("path escapes the agent workspace")
+
+    _llm_json(monkeypatch, payload="x = 1\n")
+    ws = RefusingWorkspace(tmp_path, [])
+    state = asyncio.run(nodes.node_implement(
+        _impl_ctx(mem, ws),
+        {**_impl_state(), "plan": json.dumps(
+            {"files": [{"path": "experiments/a.py", "change": "edit"}],
+             "commit_message": "m"})}))
+    assert ws.pushed and state["action"] == "open_pr"

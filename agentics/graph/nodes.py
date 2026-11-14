@@ -39,6 +39,7 @@ from agentics.peer_review import (
 from agentics.planning import (
     PLAN_INSTRUCTION,
     bump_prompt_feedback,
+    clean_plan_path,
     extras_state_json,
     normalize_plan,
     plan_state_json,
@@ -2914,14 +2915,33 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
         if state.get("error"):           # LLM died mid-plan: push nothing
             state["done"] = True
             return state
-        path, change = spec.get("path", ""), spec.get("change", "new")
+        change = str(spec.get("change", "new")).strip().lower()
+        raw_path = spec.get("path", "")
+        # P13 path safety (live 2026-11-14 14:47: a06's cycle died on
+        # ValueError "workspace paths must be relative" — a local-model
+        # plan carried an ABSOLUTE path straight into read_file's P10
+        # guard). Relativize absolute-inside-workspace paths, skip
+        # unusable ones: a bad path must cost ONE file, never the cycle.
+        path = clean_plan_path(raw_path, root=ctx.workspace.path)
+        if not path:
+            if str(raw_path or "").strip():
+                try:
+                    ctx.memory.journal(ctx.agent_id, "plan_path_skipped",
+                                       {"task": state.get("issue_number"),
+                                        "path": str(raw_path)[:120]})
+                except Exception:  # noqa: BLE001 — telemetry must never gate
+                    pass
+            continue
         # `or ""`: read_file returns None for a hallucinated path (the plan
         # says "edit" but the file does not exist in the workspace) — treat
         # it as a new file instead of crashing the whole cycle.
-        current = (
-            await asyncio.to_thread(ctx.workspace.read_file, path)
-            if change == "edit" else ""
-        ) or ""
+        current = ""
+        if change == "edit":
+            try:
+                current = (await asyncio.to_thread(
+                    ctx.workspace.read_file, path)) or ""
+            except ValueError:
+                current = ""     # guard refusal: write it as a new file
         prompt = (
             f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
