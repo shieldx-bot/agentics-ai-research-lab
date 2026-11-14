@@ -400,6 +400,7 @@ scan → claim → research → plan → implement → verify (P16/P16-R)
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Phát triển nhiều người cùng lúc, ít xung đột |
 | [ADVANCED_TECH_ROADMAP.md](docs/ADVANCED_TECH_ROADMAP.md) | TOP 5 công nghệ tiên tiến dự kiến đưa vào (GEPA, router, MCP, GraphRAG, verifier học được) |
 | [ADVANCED_TECH_ROADMAP_WAVE3.md](docs/ADVANCED_TECH_ROADMAP_WAVE3.md) | TOP 5 wave 3 (semantic cache, hybrid rerank, MCP, RLVR gate, fulltext + citation grounding) — wave-1/2 đã tích hợp, xem [ADVANCED_STACK.md](docs/ADVANCED_STACK.md) |
+| [TECH_RADAR_WAVE3.md](docs/TECH_RADAR_WAVE3.md) | Wave 3 bổ trợ — hardening & trust: sandbox cấp OS, prompt-injection defense, thống kê nghiệm, OTel tracing, chaos harness (4/5 chưa có ở bất kỳ proposal nào) |
 
 ## English quickstart
 
