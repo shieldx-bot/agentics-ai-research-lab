@@ -1,5 +1,11 @@
 # Lộ trình công nghệ tiên tiến — TOP 5 cần đưa vào
 
+> **Trạng thái 2026-11-14: #1 (GEPA) và #4 (GraphRAG verdict layer) ĐÃ TRIỂN KHAI**
+> — `agentics/evolution/gepa.py` + CLI `gepa-evolve`; `kg_edges.trusted` +
+> `kg_neighborhood`/`kg_contradictions` + CLI `kg-query`/`kg-contradictions`;
+> propose-time KG context trong `_gate_and_register`. Chi tiết: EVOLUTION.md §6,
+> MEMORY.md (GraphRAG verdict layer).
+
 > Nguyên tắc của owner: **không đụng vào core** (graph/orchestrator/P16 đã bền
 > qua 801 test) — mọi thứ dưới đây là **lớp add-on** gắn vào các điểm móc sẵn
 > có (ledger `llm_usage`, `role_prompts`, `findings`/`evidence`/`hypotheses`,

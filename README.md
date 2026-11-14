@@ -16,6 +16,17 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
 
 ## Có gì mới (2026-11)
 
+- **GEPA — tối ưu prompt phản chiếu** (`agentics/evolution/gepa.py`): trên nền
+  pool challenger wave-2, sinh ứng viên mission từ pareto-front (win-rate ×
+  độ dài) + crossover + bài học thất bại thật; LOCAL router khi có, generator
+  xác định khi không. Lab vẫn là judge (P11, exit-code). CLI:
+  `agentics gepa-evolve <role> <category>`.
+- **GraphRAG verdict layer**: cạnh đồ thị mất tín nhiệm ngay khi hypothesis
+  nguồn bị P16 kết luận refuted (`kg_edges.trusted`); neighbourhood đa hop
+  (`h1:`/`h2:`, lọc trust) chèn vào JUDGE prompt lúc propose; phát hiện
+  mâu thuẫn NGỮ NGHĨA giữa các claim đã chốt ngược phán quyết. CLI:
+  `agentics kg-query`, `agentics kg-contradictions`.
+
 - **Luật neo verdict — `self_authored_ratio`** (2026-11-14, vòng "verdict
   provenance"): trục kiểm duyệt KHÔNG phải "thuật toán vs AI" — mà là *ai cầm
   bút viết thang điểm, và thang điểm có neo vào thứ nằm ngoài tầm với của
