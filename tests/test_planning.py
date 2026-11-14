@@ -340,6 +340,61 @@ def test_node_plan_backward_compatible_minimal_json(mem, monkeypatch):
     assert "plan_extras" not in state
 
 
+# -------------------------------------------------- empty-papers regression
+# Live 2026-11-14 10:31: research was budget-blocked, the LangGraph channel
+# `papers` existed with its default [] and `state.get('papers', [{}])[0]`
+# raised IndexError — the whole a03 cycle died. The `.get` default never
+# fires when the key EXISTS, so the plan node must tolerate an empty list.
+def test_node_plan_empty_papers_channel_does_not_crash(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    seen = {}
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        seen["p"] = prompt
+        return json.dumps({"approach": "a", "files": [], "steps": ["s1"],
+                           "commit_message": "m"}), []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    ctx = _plan_ctx(mem)
+    # key EXISTS with the channel default [] — the exact crash shape
+    state = asyncio.run(nodes.node_plan(ctx, {
+        "issue_number": 7, "issue_title": "Budget-blocked research",
+        "issue_body": "", "papers": [], "category": "code",
+    }))
+    assert state["commit_message"] == "m"
+    # degraded summary is signalled in the prompt, never an IndexError
+    assert "Research summary:" in seen["p"]
+
+    # key MISSING entirely — the pre-fix default path, must also survive
+    state = asyncio.run(nodes.node_plan(ctx, {
+        "issue_number": 8, "issue_title": "No research yet",
+        "issue_body": "", "category": "code",
+    }))
+    assert state["commit_message"] == "m"
+
+
+def test_node_plan_prompt_carries_first_paper_answer(mem, monkeypatch):
+    from agentics.graph import nodes
+
+    seen = {}
+
+    async def fake_llm(ctx, prompt, mode="concise", purpose="general", state=None):
+        seen["p"] = prompt
+        return json.dumps({"approach": "a", "files": [], "steps": ["s1"],
+                           "commit_message": "m"}), []
+
+    monkeypatch.setattr(nodes, "_llm_ask", fake_llm)
+    asyncio.run(nodes.node_plan(_plan_ctx(mem), {
+        "issue_number": 9, "issue_title": "T", "issue_body": "",
+        "papers": [{"answer": "NVF offload cuts latency 40%"}, {"answer": "x"}],
+        "category": "code",
+    }))
+    # ONLY the first paper feeds the plan prompt (2500-char window)
+    assert "NVF offload cuts latency 40%" in seen["p"]
+    assert "x\n\n" not in seen["p"].split("Research summary:")[1].split("\n\n")[0]
+
+
 def test_llm_ask_resolves_adaptive_system_prompt(mem, monkeypatch):
     from agentics.graph import nodes
 

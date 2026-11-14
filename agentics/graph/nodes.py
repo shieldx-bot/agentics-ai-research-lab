@@ -2702,10 +2702,15 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         "the review feedback below; do not rewrite unrelated files.\n"
         if state.get("rework_mr") else ""
     )
+    # `papers` is a LangGraph channel whose default is [] — when research was
+    # budget-blocked the key EXISTS with an empty list, so `get('papers',
+    # [{}])` returns [] and [0] raises IndexError (live 2026-11-14 10:31:
+    # a03's whole cycle died on it). `or [{}]` covers both missing AND empty.
+    research_summary = str((state.get("papers") or [{}])[0].get("answer", ""))[:2500]
     prompt = (
         f"Issue #{state.get('issue_number')}: {state.get('issue_title')}\n"
         f"{state.get('issue_body')}\n\nResearch summary:\n"
-        f"{state.get('papers', [{}])[0].get('answer', '')[:2500]}\n\n"
+        f"{research_summary}\n\n"
         f"Traces from other agents (learn from them, do not repeat their failures):\n"
         f"{traces_txt}\n\n"
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
