@@ -362,6 +362,7 @@ scan → claim → research → plan → implement → verify (P16/P16-R)
 | [MEMORY.md](docs/MEMORY.md) | LifeMem: trace, cluster, skill chưng cất |
 | [LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) | Perplexity + Hyperbrowser cloud browser |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Phát triển nhiều người cùng lúc, ít xung đột |
+| [ADVANCED_TECH_ROADMAP.md](docs/ADVANCED_TECH_ROADMAP.md) | TOP 5 công nghệ tiên tiến dự kiến đưa vào (GEPA, router, MCP, GraphRAG, verifier học được) |
 
 ## English quickstart
 
