@@ -305,3 +305,93 @@ SELECT COUNT(*) FROM journal WHERE event='frontier_priority';
   are not special.
 * `EIG_WEIGHT` too high (>1.0) can pull the frontier toward flashy unknown
   metrics over deep-dive continuity — keep it <= 0.5.
+
+---
+
+## 6. Wave 3 — generator / cascade / tooling stack (2026-11-14)
+
+The third wave closes the remaining roadmap items (#1 GEPA, #2 cascade,
+#3 MCP, #5 learned gate; #4 GraphRAG-lite landed in wave 1). Same design
+rules as waves 1-2: additive hooks only, every consumer degrades to the
+previous behaviour when its flag is off, selection signals stay
+machine-truth.
+
+| # | Technology | Default | Env knobs |
+|---|------------|---------|-----------|
+| 1 | GEPA-style reflective prompt regeneration | on (with prompt evolution) | `GEPA_REFLECTION` |
+| 2 | Static cascade to an independent frontier provider | off | `LLM_CASCADE_PROVIDER`, `LLM_CASCADE_PURPOSES` |
+| 3 | MCP stdio bridge → `mcp_tools` table | off (empty server map) | `MCP_SERVERS`, `MCP_TIMEOUT_S` |
+| 5 | Learned risk gate (shadow) | shadow | `RISK_GATE_MODE`, `RISK_GATE_SOFT_THRESHOLD` |
+
+**What each does, one paragraph each**
+
+* **#1 GEPA reflection** (`agentics/evolution/gepa_driver.py`) — DSPy-lite
+  mutates the champion on a fixed template; GEPA adds the two-step
+  REFLECTION when the champion's recent experience actually contains
+  failures: the local model reads the real trace digests, critiques the
+  mission against them, then rewrites it against that critique. The arm
+  enters the ordinary `prompt_variants` pool (origin='gepa'), is scored
+  on exit-code truth, and is promoted by the existing machinery — the
+  lab stays the judge. Journal event: `gepa_reflection`.
+* **#2 Static cascade** (`agentics/llm/router.py`) — when a pool-side ask
+  FAILS (refusal = dry pool / open circuit, or a provider error), an
+  allowed purpose gets ONE retry against the configured frontier
+  provider (ChatGPT) before the cycle degrades to `reflect`. Verdict and
+  jury purposes (`verify`, `review`, `repair`, `defend`, `tournament`,
+  `tournament_judge2`, `ideation`) can NEVER cascade — provenance and
+  jury independence are not for sale. Every attempt journals
+  `router_cascade`; the client shares the second-judge cloud session
+  when the dual jury is configured.
+* **#3 MCP bridge** (`agentics/tools/mcp_client.py`) — a minimal stdio
+  JSON-RPC 2.0 client (initialize → tools/list → tools/call,
+  selector-based read timeout, no SDK dependency). Config is
+  OWNER-APPROVED ONLY (`MCP_SERVERS` JSON or `tools.mcp_servers:` in
+  lab.yaml): an empty map is a strict no-op, and discovered capabilities
+  land in their own `mcp_tools` table — deliberately NOT
+  `tool_registry`, whose meaning stays "code merged via a PR". The sync
+  runs once in `run_forever` before the swarm starts; a broken server
+  journals `mcp_sync_error` and the lab continues unchanged.
+* **#5 Learned risk gate** (`agentics/verify/gate.py`, shadow-only v1) —
+  the ledger IS a labelled dataset; a pure-python logistic model over 6
+  prior-history features (attempts, fail rate, fail streak, attempt
+  size, ...) estimates P(the cycle settles clean) BEFORE the panel opens
+  and journals `risk_gate_prediction`. Shadow mode never blocks; "soft"
+  only journals `risk_gate_softblock` (advisory). No leakage (features
+  strictly from prior traces), <40 settled rows ⇒ silent, in-sample AUC
+  is reported as in-sample. The roadmap's real soft-block stays OFF
+  until the shadow AUC proves itself on ≥2 weeks of live data.
+
+**Wave-3 KPI queries** (same `data/shared_memory.db`)
+
+```sql
+-- GEPA: are reflective arms being born and winning?
+SELECT origin, COUNT(*), SUM(uses), SUM(wins) FROM prompt_variants GROUP BY origin;
+SELECT COUNT(*) FROM journal WHERE event='gepa_reflection';
+
+-- cascade: how many dead asks did the frontier provider rescue?
+SELECT outcome, COUNT(*) FROM journal WHERE event='router_cascade' GROUP BY outcome;
+
+-- MCP: what did the owner-approved servers expose?
+SELECT server, COUNT(*) FROM mcp_tools GROUP BY server;
+SELECT COUNT(*) FROM journal WHERE event='mcp_sync_error';
+
+-- risk gate: is the learned score informative?
+SELECT agent, p, prior_fail_rate, fail_streak, auc_insample
+FROM journal WHERE event='risk_gate_prediction' ORDER BY id DESC LIMIT 20;
+```
+
+**Failure modes**
+
+* No Ollama → GEPA regeneration silently declines (plain mutation keeps
+  serving; healthy champions never reflect).
+* `LLM_CASCADE_PROVIDER=chatgpt` without `chatgpt_cookie_path` → the
+  cascade logs a warning and returns None; the cycle degrades exactly as
+  before the wave. On a one-token Hyperbrowser pool the cascade shares
+  the judge's session and the two asks serialize.
+* A wedged MCP server cannot hang the lab: the selector-based read
+  timeout (`MCP_TIMEOUT_S`) fails the sync with `mcp_sync_error`; the
+  next `run_forever` start retries.
+* The risk gate trains on whatever the ledger holds — on a young lab
+  (<40 settled rows) it stays silent; after a role/flow change the 15min
+  retrain catches the new regime. The in-sample AUC is NOT a held-out
+  metric; treat it as a sanity ceiling, not a promise.

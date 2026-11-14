@@ -340,6 +340,17 @@ class Orchestrator:
         contexts = self.build_contexts()
         log.info("starting %d agent threads (roles: %s)",
                  len(contexts), [c.role.value for c in contexts])
+        # Wave-3 #3 — MCP bridge: discover owner-approved server tools once
+        # before the swarm starts (config-gated; an empty map is a strict
+        # no-op; never raises — a bad server degrades to a journaled
+        # mcp_sync_error and the lab continues exactly as before).
+        try:
+            from agentics.tools import mcp_client as _mcp
+            stats = await _mcp.sync_bridge(self.settings, self.memory)
+            if stats:
+                log.info("MCP bridge synced: %s", stats)
+        except Exception as exc:  # noqa: BLE001 — the bridge is optional
+            log.warning("MCP bridge failed: %s", exc)
         tasks = [
             asyncio.create_task(self._agent_loop(c, i))
             for i, c in enumerate(contexts)
