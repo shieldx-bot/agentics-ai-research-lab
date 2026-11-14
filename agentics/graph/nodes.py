@@ -525,6 +525,10 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # Awards are a market signal, not a lock: the claimant still races and
     # decides, the award just lifts the task in its ranking (node_claim).
     try:
+        prev_awards = ctx.memory.task_awards_rows()
+    except Exception:  # noqa: BLE001 — a read must never break the scan
+        prev_awards = []
+    try:
         awards = recommend_awards(
             ctx.memory,
             ttl=int(getattr(ctx.settings, "coord_award_ttl", 3)))
@@ -532,6 +536,13 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         awards = []
     if awards:
         ctx.memory.journal(ctx.agent_id, "contract_net_awards", {"awards": awards})
+    # A CHANGED allocation is a material dispatch change (the manager just
+    # steered work to specific agents — they must hear it), but a steady-state
+    # re-award of the same pairs is not: awards are recomputed every scan, so
+    # gating on the pair signature keeps the message feed quiet between real
+    # steering moves while the digest still reaches the agents it concerns.
+    awards_changed = ({(a["task_id"], a["agent"]) for a in awards}
+                      != {(a["task_id"], a["agent"]) for a in prev_awards})
     summary = (
         f"Backlog scan: {len(tasks)} open unclaimed task(s)."
         + (f" Stale claims freed: {freed}." if freed else "")
@@ -570,7 +581,7 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # recent-messages window that every agent's prompt reads. A P19 panel
     # sweep IS material (an MR died / a task re-opened — agents must know).
     material = bool(freed or stale_locks or repaired or topped_up
-                    or swept_panels
+                    or swept_panels or awards_changed
                     or "Opened self-evolution task" in state["summary"])
     try:
         ctx.memory.journal(ctx.agent_id, "scan_summary", {
