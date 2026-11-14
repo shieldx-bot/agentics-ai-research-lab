@@ -34,6 +34,7 @@ def _fast_clean(monkeypatch):
     ft.clear_cache()
     monkeypatch.setattr(ft, "_ARXIV_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(ft, "_GH_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ft, "_MIN_INTERVALS", {})   # no 1 s host pacing
     yield
     ft.clear_cache()
 
@@ -729,7 +730,10 @@ def test_request_retries_once_on_429(monkeypatch):
     monkeypatch.setattr(ft.aiohttp, "ClientSession", FakeSess)
     monkeypatch.setattr(ft.asyncio, "sleep", fake_sleep)
     out = asyncio.run(ft._request("https://api.example.org/x"))
-    assert out == "body" and len(sleeps) == 1 and sleeps[0] == 0.01
+    assert out == "body" and len(sleeps) == 1
+    # 429 retries are jittered (1.0-1.5x the Retry-After) so parallel
+    # agents never re-fire in lock-step
+    assert 0.01 <= sleeps[0] <= 0.0151
 
 
 def test_request_no_retry_on_404(monkeypatch):

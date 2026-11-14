@@ -75,7 +75,7 @@ def _ctx(mem: SharedMemory, tmp_path: Path, agent_id: str = "a02",
         agent_id=agent_id, role=Role.RESEARCHER, memory=mem,
         llm=llm if llm is not None else FakeLLM(),
         workspace=FakeWS(tmp_path / f"ws-{agent_id}"),
-        cycle=1, settings=SimpleNamespace(research_topic="NFV"),
+        cycle=1, settings=SimpleNamespace(research_topic="NFV", settle_require_anchor=False),
         heartbeat=lambda *a, **k: None, report=lambda **kw: None,
         meta={"personal": SimpleNamespace(add_lesson=lambda *a, **k: None)},
     )

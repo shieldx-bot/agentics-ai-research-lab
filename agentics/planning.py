@@ -185,10 +185,23 @@ async def resolve_system_prompt(ctx, state: dict | None = None) -> str:
                         role, category, exc)
     if not mission:
         mission = static_mission(role)
+    # Wave-2 #2 (DSPy-lite prompt evolution): the mission may be an armed
+    # CHALLENGER variant on an exploration cycle — selection signal comes
+    # from the cycle's exit-code outcome in bump_prompt_feedback, mutation
+    # runs on the local router (zero cookie cost).
+    variant_id = 0
+    if enabled:
+        try:
+            from agentics.evolution import prompts as _prompt_evo
+            mission, variant_id = await _prompt_evo.maybe_variant(
+                ctx, role, category, mission)
+        except Exception as exc:  # noqa: BLE001 — degrade to champion
+            log.debug("prompt variant pick failed: %s", exc)
     prompt = compose_system_prompt(
         getattr(ctx, "agent_id", "agent"), role, topic, mission)
     if isinstance(meta, dict):
         meta["_system_prompt"] = prompt
+        meta["_prompt_variant_id"] = variant_id
     return prompt
 
 
@@ -205,6 +218,17 @@ def bump_prompt_feedback(ctx, state: dict) -> str:
         return ""                      # neutral: races are not prompt failures
     role = _role_val(getattr(ctx, "role", None))
     category = str(state.get("category") or role)
+    # Wave-2 #2: if a CHALLENGER variant served this cycle, its outcome goes
+    # to the variant score card (Thompson arms + promotion) INSTEAD of the
+    # champion's counters — the champion was not serving.
+    meta = getattr(ctx, "meta", None)
+    if isinstance(meta, dict) and meta.get("_prompt_variant_id"):
+        try:
+            from agentics.evolution import prompts as _prompt_evo
+            _prompt_evo.note_variant_feedback(ctx, state)
+        except Exception as exc:  # noqa: BLE001 — feedback must not kill reflect
+            log.debug("variant feedback failed: %s", exc)
+        return ""
     rework_after = int(
         _settings_flag(settings, "role_prompt_rework_failures", 2) or 2)
     try:

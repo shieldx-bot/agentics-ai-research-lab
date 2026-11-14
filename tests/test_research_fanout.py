@@ -51,7 +51,7 @@ class Budget:
         self.left = left
         self.asks = []
 
-    def can_ask(self, agent):
+    def can_ask(self, agent, purpose=""):
         return (self.left > 0, "ok" if self.left > 0 else "exhausted")
 
     def record(self, agent, purpose, ok, elapsed):

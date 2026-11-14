@@ -161,7 +161,12 @@ def _node_digest(node: str, out: dict) -> str:
     task = out.get("issue_number")
     head = f"#{task} " if task else ""
     if node == "claim":
-        return f"{head}claimed '{out.get('issue_title', '')}'"[:200]
+        # The claim node also ends with "no unclaimed tasks; resting" — a
+        # digest that still says "claimed ''" is a lie the owner reads
+        # (live 2026-11-14 dashboard). Fall back to the cycle summary.
+        if out.get("issue_title"):
+            return f"{head}claimed '{out['issue_title']}'"[:200]
+        return f"{head}{out.get('summary') or 'no task claimed — resting'}"[:200]
     if node == "research":
         return f"{head}researched '{out.get('issue_title', '')[:80]}'"[:200]
     if node == "plan":

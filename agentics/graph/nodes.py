@@ -50,8 +50,11 @@ from agentics.policies.intent import scope_violations
 from agentics.research import citations as cite_fmt
 from agentics.research import diversity as research_diversity
 from agentics.research import free_tools
+from agentics.research import ideation as idea
 from agentics.research import papers as papers_mod
+from agentics.evolution.skills import skills_block          # wave-2 #1
 from agentics.verify_metrics import PROTOCOL_CONTRACT, Criterion, run_protocol
+from agentics import diversity as qd
 from agentics.verify_ops import (
     Evidence, cmds_from_evidence, run_experiment, run_experiments, summarize,
     verdict_for,
@@ -155,7 +158,45 @@ def _memory_context(ctx: AgentContext) -> dict:
         # supported claims are reusable common ground, refuted ones are dead
         # ends (rendered by verified_knowledge_text, below).
         "verified": verified_knowledge_text(ctx) or "(nothing verified yet)",
+        # Kosmos world model: the swarm's structured current state (newest
+        # findings, verified/refuted facts, open gaps) for coherent long runs.
+        "world": _world_model_text(ctx) or "(world model empty)",
     }
+
+
+def _world_model_text(ctx: AgentContext) -> str:
+    """Kosmos world model, consumption side — the swarm's structured state
+    (newest findings, verified/refuted facts, open gaps) as bounded prompt
+    text. Empty when the model has no notes yet (cold start unchanged)."""
+    try:
+        n = int(getattr(ctx.settings, "world_context_notes", 12) or 12)
+        return ctx.memory.world_render(limit=n)
+    except Exception:  # noqa: BLE001 — world model must never break a cycle
+        return ""
+
+
+def _pem_gate(ctx: AgentContext, claim: str, exclude_id: int | None = None) -> bool:
+    """DAPS Persistent-Edit-Memory gate: reject a NEW hypothesis that is a
+    near-clone of one already in the stream (word-Jaccard over non-stopword
+    tokens, signature axes included). Returns True when acceptable."""
+    threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+    try:
+        priors = ctx.memory.recent_hypotheses(limit=12)
+    except Exception:  # noqa: BLE001 — a broken gate must not block research
+        return True
+    dup = qd.near_duplicate(claim, priors, threshold,
+                            exclude_ids={exclude_id} if exclude_id else None)
+    if dup is None:
+        return True
+    score, prior = dup
+    try:
+        ctx.memory.journal(ctx.agent_id, "hypothesis_near_duplicate", {
+            "claim": claim[:160], "duplicate_of": prior.get("id"),
+            "status": prior.get("status"), "jaccard": round(score, 3),
+            "why": "PEM gate: near-clone rejected, not a new discovery"})
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def verified_knowledge_text(ctx: AgentContext, limit: int = 6) -> str:
@@ -210,9 +251,48 @@ async def _llm_ask(
     budget = getattr(ctx, "budget", None)
     started = time.monotonic()
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose)
+        if not allowed and purpose and why.startswith("P20 pool budget"):
+            # P20b — a science-critical ask (verify/ideation reserve) that
+            # is merely AHEAD of the sliding window should wait seconds and
+            # retry ONCE instead of dying for the rest of the hour: the
+            # window frees continuously, so a short bounded wait usually
+            # gets the escape hatch through. Wait only when the retry hint
+            # is small (window nearly drained anyway); otherwise give up
+            # fast and let the cycle degrade as before.
+            wait_cap = float(getattr(ctx.settings, "budget_block_wait_cap_s",
+                                     0.0) or 0.0)
+            if wait_cap > 0:
+                wait = budget.retry_in_s(ctx.agent_id, purpose)
+                if 0 < wait <= wait_cap:
+                    log.info("[%s] %s waits %.0fs for the budget window "
+                             "to slide", ctx.agent_id, purpose, wait)
+                    await asyncio.sleep(wait)
+                    allowed, why = budget.can_ask(ctx.agent_id, purpose)
         if not allowed:
-            log.warning("[%s] %s blocked by budget: %s", ctx.agent_id, purpose, why)
+            # P20c (#3 local router): a CHEAP purpose that the pool refuses
+            # can still run on the free local model — the cookies stay
+            # reserved for science. Science purposes never degrade here
+            # (local_router.allowed_for refuses them by construction).
+            try:
+                from agentics.llm import local_router
+                if local_router.allowed_for(ctx.settings, purpose):
+                    local_resp = await local_router.ask(
+                        prompt, settings=ctx.settings, purpose=purpose)
+                    if local_resp is not None and local_resp.ok:
+                        log.info("[%s] %s served by the local model "
+                                 "(pool budget exhausted)",
+                                 ctx.agent_id, purpose)
+                        try:
+                            ctx.memory.journal(ctx.agent_id, "local_fallback",
+                                               {"purpose": purpose})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return local_resp.answer, []
+            except Exception:  # noqa: BLE001 — fallback must never break the gate
+                pass
+            log.warning("[%s] %s blocked by budget: %s",
+                        ctx.agent_id, purpose, why)
             if state is not None and not state.get("error"):
                 state["error"] = f"P20 budget: {why}"
             try:
@@ -365,11 +445,56 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         if sweep_size > 0 and every_n > 0 and ctx.cycle % every_n == 0 and workspace is not None:
             from agentics.verify.replay import replay_settled
             replay_report = replay_settled(
-                ctx.memory, workspace, limit=sweep_size, agent=ctx.agent_id)
+                ctx.memory, workspace, limit=sweep_size, agent=ctx.agent_id,
+                cooldown_s=getattr(ctx.settings, "replay_cooldown_s", 0),
+                max_replays=getattr(ctx.settings, "replay_max_per_hyp", 0))
     except Exception:  # noqa: BLE001 — replication must never break the scan
         replay_report = []
     replayed_n = sum(1 for r in replay_report if r.get("replayed"))
     replay_events = [r.get("event", "") for r in replay_report if r.get("replayed")]
+    # DAPS diversity audit: mechanism entropy over the recent hypothesis
+    # stream. DAPS showed SURFACE diversity staying flat while MECHANISM
+    # entropy collapses (and in-loop gains stop transferring) — so we monitor
+    # mechanism categories, not wording variety, and alert the owner early.
+    try:
+        recent_hyps = ctx.memory.recent_hypotheses(limit=20)
+        audit = qd.audit([h["claim"] for h in recent_hyps])
+        ctx.memory.journal(ctx.agent_id, "diversity_audit", audit)
+        if (audit["window"] >= 8
+                and audit["entropy_nats"] < float(
+                    getattr(ctx.settings, "diversity_min_entropy", 1.0))):
+            ctx.memory.post_message(
+                ctx.agent_id, "alert",
+                f"DIVERSITY ALERT (DAPS): mechanism entropy {audit['entropy_nats']} "
+                f"nats over last {audit['window']} hypotheses — the research "
+                f"stream is collapsing onto few categories "
+                f"({audit['categories']}). Mode collapse suspected: next "
+                "proposals should target an under-represented category.")
+    except Exception:  # noqa: BLE001 — the audit must never break the scan
+        pass
+    # Wave-2 #4: verify calibration audit — the settle verdicts' empirical
+    # confidence floor (replay/replication agreement, Wilson-95); the owner
+    # gets ONE alert when the floor drops, not a flood.
+    try:
+        from agentics.verify.calibration import calibration_audit
+        calibration_audit(ctx)
+    except Exception:  # noqa: BLE001 — the audit must never break the scan
+        pass
+    # Wave-2 #5: periodic reflection tree — the supervisor synthesizes
+    # higher-level insights from the world model on the LOCAL router
+    # (zero cookie cost); insights carry provenance and feed ideation.
+    try:
+        from agentics.graph.reflection import maybe_reflect
+        maybe_reflect(ctx)
+    except Exception:  # noqa: BLE001 — reflection must never break the scan
+        pass
+    # Wave-2 #1: skill library distillation — supported settles become
+    # reusable skills (description via the LOCAL router, code verbatim).
+    try:
+        from agentics.evolution.skills import maybe_distill
+        maybe_distill(ctx)
+    except Exception:  # noqa: BLE001 — distill must never break the scan
+        pass
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(
@@ -386,7 +511,9 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
     # Awards are a market signal, not a lock: the claimant still races and
     # decides, the award just lifts the task in its ranking (node_claim).
     try:
-        awards = recommend_awards(ctx.memory)
+        awards = recommend_awards(
+            ctx.memory,
+            ttl=int(getattr(ctx.settings, "coord_award_ttl", 3)))
     except Exception:  # noqa: BLE001 — allocation must never break the scan
         awards = []
     if awards:
@@ -640,7 +767,7 @@ async def _ask_angle(ctx: AgentContext, view, angle: tuple[str, str],
     None instead of breaking the finding."""
     label, hint = angle
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose="research")
         if not allowed:
             log.info("[%s] fan-out angle '%s' skipped by budget: %s",
                      ctx.agent_id, label, why)
@@ -773,6 +900,14 @@ async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
         ctx.memory.add_finding,
         ctx.agent_id, title, content, list(citations), state.get("issue_number"),
     )
+    # Kosmos world model: the new finding becomes structured shared state so
+    # every other agent's next prompt sees it without reading the full text.
+    try:
+        await asyncio.to_thread(
+            ctx.memory.world_add, ctx.agent_id, "finding",
+            f"{topic}: {answer[:200]}", source=f"finding#{fid}")
+    except Exception:  # noqa: BLE001 — world model must never break research
+        pass
     # v3 sync-trim: remember WHICH vector doc indexes this row, so the day the
     # findings trim evicts it the vector tier deletes the same doc (the ghost
     # rows the recall path used to skip at read time never accumulate).
@@ -780,6 +915,19 @@ async def _finish_research(ctx: AgentContext, state: ResearchState, topic: str,
         ctx.vector.add, content,
         {"agent": ctx.agent_id, "finding_id": fid, "issue": state.get("issue_number")},
     )
+    # GraphRAG-lite (#4): mine the finding into the knowledge graph via the
+    # LOCAL router (zero cookie spend). A missing/absent runtime is a no-op
+    # — an honest degradation, never an invented triple.
+    if bool(getattr(ctx.settings, "kg_enabled", True)):
+        try:
+            from agentics.research.kg_extract import ingest_text
+            await asyncio.wait_for(
+                ingest_text(ctx.memory, content, ctx.settings,
+                            source_hyp=None),
+                timeout=float(getattr(ctx.settings, "local_llm_timeout",
+                                      20.0)) + 5.0)
+        except Exception:  # noqa: BLE001 — KG sugar must never break research
+            pass
     if doc_id:
         linker = getattr(ctx.memory, "set_finding_vector_doc", None)
         if linker is not None:
@@ -888,6 +1036,883 @@ async def _dedup_known(ctx: AgentContext, topic: str) -> list[dict]:
     return known
 
 
+# ------------------------------------ QD ideation closed loop (2026-11-14)
+# IDEAgent qualification gate + Kosmos insight harvest / gap proposal. All
+# LLM calls run with purpose="ideation" (routed to the general pool), are
+# budget-gated through _llm_ask, and degrade to "no ideation" on failure —
+# the deep-dive experiment itself never depends on the ideation round.
+
+EXTRACT_CLAIMS_PROMPT = (
+    "Research finding to verify:\n{finding}\n\n"
+    "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
+    "self-contained python simulation can check (simulate the method on "
+    "synthetic data, measure the metric). For each claim write its "
+    "protocol.\n\n"
+    f"{PROTOCOL_CONTRACT}\n"
+    'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+    '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+    '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+    '"assumptions": "...", "effect": "..."}}]}\n\n'
+    "The signature quintuple is the idea's compact identity for the "
+    "swarm's Quality-Diversity archive — keep each field under 25 words."
+)
+
+
+async def _ideation_allowed(ctx: AgentContext) -> bool:
+    settings = getattr(ctx, "settings", None)
+    if not getattr(settings, "ideation_enabled", False):
+        return False
+    return ctx.llm is not None
+
+
+async def _reject_candidate(ctx: AgentContext, claim: str, reason: str,
+                            why: str) -> None:
+    """Archive a rejected candidate as a COMPACT pattern (IDEAgent R store)
+    and journal it. Full claims would bloat every future seed prompt."""
+    mech = ""
+    try:
+        mech = qd.classify(claim)
+    except Exception:  # noqa: BLE001 — taxonomy is advisory only
+        pass
+    await asyncio.to_thread(
+        ctx.memory.add_rejected_pattern, ctx.agent_id, claim, mech, reason)
+    # MAP-Elites: a rejected idea still OCCUPIES its behaviour cell — the
+    # archive keeps one representative of every approach ever tried, so the
+    # saturation pivot steers toward cells that do not exist yet.
+    try:
+        await asyncio.to_thread(
+            ctx.memory.qd_record, mech, "rejected", None, claim, 0.0)
+    except Exception:  # noqa: BLE001 — archive must never break the gate
+        pass
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "idea_rejected",
+        {"claim": claim[:160], "reason": reason, "mechanism": mech,
+         "why": why[:160]})
+
+
+async def _gate_and_register(ctx: AgentContext, child: dict,
+                             parents: list[int],
+                             recent: list[dict],
+                             depth: int = 0, branch: str = "",
+                             repair_margin: float | None = None) -> int | None:
+    """IDEAgent pipeline for ONE candidate: PEM near-dup gate -> judge ->
+    qualification (accept / one repair / reject) -> registry insert.
+
+    Returns the new hypothesis id, or None when the candidate is rejected
+    or the judge is unavailable. `parents` keeps the Kosmos lineage (the
+    settled experiment row this idea grew from). `depth`/`branch` carry the
+    discovery-branch position (branch level below the discovery root + the
+    attack angle) so the deep-dive backlog can prioritize the subtree.
+    `repair_margin` overrides settings.idea_repair_margin — the saturation
+    pivot passes the WIDER band (idea_repair_margin_saturation) so a
+    near-miss idea gets its one repair round when the lab has nothing else
+    to do; the post-repair re-judge still must fully pass the gate."""
+    child = idea.normalize_child(child)
+    if child is None:                    # contract violation — nothing to judge
+        return None
+    claim = child["claim"]
+    crit = child["criterion"]
+    # Cheap mechanical gate first: a near-clone of ANY recent hypothesis
+    # (any status) is archived as a rejected pattern without an LLM call.
+    threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+    dup = qd.near_duplicate(claim, recent, threshold)
+    if dup is not None:
+        await _reject_candidate(
+            ctx, claim,
+            f"near-duplicate of h#{dup[1].get('id')} "
+            f"(jaccard={dup[0]:.2f})", "PEM: re-proposed an existing idea")
+        return None
+    # IDEAgent judge: one call, scores on the four axes.
+    answer, _ = await _llm_ask(
+        ctx,
+        idea.JUDGE_PROMPT.format(claim=claim[:1200],
+                                 criterion=json.dumps(crit, ensure_ascii=False)),
+        purpose="ideation")
+    j = idea.parse_scores(answer)
+    if j is None:
+        return None                      # judge unavailable — no registration
+    tau = float(getattr(ctx.settings, "idea_min_score", 60))
+    margin = (float(getattr(ctx.settings, "idea_repair_margin", 20))
+              if repair_margin is None else float(repair_margin))
+    route = idea.qualification(j, tau=tau, repair_margin=margin)
+    if route == "reject":
+        await _reject_candidate(
+            ctx, claim, f"gate rejected (Q={j.quality():.0f}, "
+            f"weak={j.worst_margin(tau):+.0f})",
+            j.notes[:120] or "IDEAgent gate")
+        return None
+    if route == "repair":
+        # ONE repair round: fix the weak axes WITHOUT changing the
+        # mechanism (IDEAgent Stage II), then re-judge the child.
+        weak = (f"non_obviousness={j.non_obviousness:.0f}, "
+                f"clarity={j.clarity:.0f}, soundness={j.soundness:.1f}")
+        r_answer, _ = await _llm_ask(
+            ctx,
+            idea.REPAIR_PROMPT.format(claim=claim[:1000],
+                                      criterion=json.dumps(crit,
+                                                           ensure_ascii=False),
+                                      feedback=j.notes[:300] or "see weak scores",
+                                      weak=weak),
+            purpose="ideation")
+        fixed = idea.parse_repair(r_answer)
+        if fixed is None:
+            await _reject_candidate(
+                ctx, claim, "repair round produced nothing usable",
+                "IDEAgent repair")
+            return None
+        j2 = None
+        r2, _ = await _llm_ask(
+            ctx,
+            idea.JUDGE_PROMPT.format(claim=fixed["claim"][:1200],
+                                     criterion=json.dumps(fixed["criterion"],
+                                                          ensure_ascii=False)),
+            purpose="ideation")
+        j2 = idea.parse_scores(r2)
+        if j2 is None or idea.qualification(
+                j2, tau=tau, repair_margin=0.0) != "accept":
+            await _reject_candidate(
+                ctx, claim, "repaired child still below the gate",
+                "IDEAgent repair")
+            return None
+        child, claim, crit = fixed, fixed["claim"], fixed["criterion"]
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "idea_repaired",
+            {"final_claim": claim[:160], "Q_before": round(j.quality(), 1),
+             "Q_after": round(j2.quality(), 1)})
+    hyp_id = await asyncio.to_thread(
+        ctx.memory.add_hypothesis, ctx.agent_id, claim, crit,
+        parents=parents, depth=max(0, int(depth)), branch=branch)
+    sig = child.get("signature")
+    if isinstance(sig, dict) and sig:
+        await asyncio.to_thread(
+            ctx.memory.set_hypothesis_signature, hyp_id, sig)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "idea_registered",
+        {"hyp": hyp_id, "claim": claim[:160], "parents": parents,
+         "Q": round(j.quality(), 1), "route": route,
+         "depth": max(0, int(depth)), "branch": branch})
+    return hyp_id
+
+
+async def _harvest_insights(ctx: AgentContext, parent_id: int,
+                            claim: str, verdict: str, measured: str) -> int:
+    """Kosmos closed loop: a settled experiment proposes its FOLLOW-UPS —
+    and, when the ideator grades the result surprising (novelty >=
+    discovery_novelty_min), the result becomes a DISCOVERY: the registry
+    row is flagged, the world model records it, and the follow-ups become
+    ANGLED BRANCHES (mechanism / generalize / boundary / amplify) at
+    depth+1 that the deep-dive backlog prioritizes (discovery_frontier).
+
+    One ideation call -> up to idea_max_children children -> each gated
+    through _gate_and_register (PEM + judge + repair). Returns how many
+    children were registered; never raises."""
+    if not await _ideation_allowed(ctx):
+        return 0
+    try:
+        parent_row = ctx.memory.get_hypothesis(parent_id) or {}
+        parent_depth = int(parent_row.get("depth") or 0)
+        max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        novelty_min = int(getattr(ctx.settings, "discovery_novelty_min", 70))
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        rejected = ctx.memory.rejected_render()
+        recent = ctx.memory.recent_hypotheses(12)
+        n_children = max(1, int(getattr(ctx.settings, "idea_max_children", 2)))
+        answer, _ = await _llm_ask(
+            ctx,
+            idea.INSIGHT_PROMPT.format(
+                n_children=n_children, claim=claim[:1200],
+                verdict=verdict, measured=measured[:300] or "none recorded",
+                world=world[:1800] or "(empty)", rejected=rejected[:800] or "(none)",
+                angles="/".join(idea.DISCOVERY_ANGLES)),
+            purpose="ideation")
+        novelty, is_disc, reason, children = idea.parse_discovery(
+            answer, max_children=n_children)
+        # ---- discovery recognition (autoresearch quantitative judgment):
+        # the agent KNOWS it found something new, marks it, and the swarm
+        # pivots its backlog into that finding's subtree.
+        branch_mode = bool(
+            novelty is not None and is_disc and novelty >= novelty_min)
+        if branch_mode:
+            # double-judge + citation gate: the FIRST judge (this ideator)
+            # already said discovery; the gate demands an INDEPENDENT second
+            # opinion from another account AND an external citation URL —
+            # without them the discovery would rest entirely on inputs the
+            # authoring agent authored (self-graded surprise).
+            gate_ok, gate_why = await _discovery_gate(
+                ctx, claim, verdict, measured, novelty_min)
+            if gate_ok:
+                await asyncio.to_thread(
+                    ctx.memory.mark_discovery, parent_id, novelty)
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "discovery_detected",
+                    {"hyp": parent_id, "novelty": round(float(novelty), 1),
+                     "reason": reason[:200], "verdict": verdict,
+                     "branches_planned": len(children),
+                     "gate": "double_judge+citation"})
+                await asyncio.to_thread(
+                    ctx.memory.world_add, ctx.agent_id, "finding",
+                    f"DISCOVERY(novelty={round(float(novelty))}): {claim[:150]} "
+                    f"-> {verdict}; digging in: {reason[:120]}",
+                    source=f"h#{parent_id}")
+            else:
+                branch_mode = False
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "discovery_gate_denied",
+                    {"hyp": parent_id,
+                     "novelty": round(float(novelty), 1),
+                     "why": gate_why[:220]})
+        if not children:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "insight_harvest_empty",
+                {"parent_hyp": parent_id, "verdict": verdict,
+                 "novelty": None if novelty is None else round(float(novelty), 1),
+                 "is_discovery": branch_mode})
+            return 0
+        if parent_depth >= max_depth:
+            # branch cap: this subtree is deep enough — stop spawning children
+            # so a single discovery cannot monopolize the registry forever.
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "branch_depth_cap",
+                {"parent_hyp": parent_id, "depth": parent_depth,
+                 "max_depth": max_depth})
+            return 0
+        registered = 0
+        for child in children:
+            # refresh the archive before EACH child: a child registered
+            # moments ago must already block its own clones (IDEAgent: the
+            # active archive grows as candidates are admitted).
+            recent_now = ctx.memory.recent_hypotheses(12)
+            hyp_id = await _gate_and_register(
+                ctx, child, [parent_id], recent_now,
+                depth=parent_depth + 1,
+                branch=str(child.get("angle") or "") if branch_mode else "")
+            if hyp_id is not None:
+                registered += 1
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "insight_harvest",
+            {"parent_hyp": parent_id, "verdict": verdict,
+             "proposed": len(children), "registered": registered,
+             "novelty": None if novelty is None else round(float(novelty), 1),
+             "is_discovery": branch_mode})
+        return registered
+    except Exception as exc:  # noqa: BLE001 — harvest must never break a settle
+        log.warning("[%s] insight harvest failed: %s", ctx.agent_id, exc)
+        return 0
+
+
+async def _branch_feedback(ctx: AgentContext, hyp_id: int, status: str) -> None:
+    """C3 entropic credit assignment (TTT_DISCOVER.md) — a BRANCH settle
+    credits its discovery root (nearest ancestor with discovery=1) by HOW
+    GOOD the settle was, not just that it happened:
+
+        q_i = softmax_beta(r_i)   (beta adaptive: KL(q||uniform) = log 2)
+        boost_i = bonus_max * k * q_i / sum(q_j)
+
+    The best branch's reward takes nearly the whole `bonus_max`
+    (settings.entropic_bonus_max, default 8.0); equally-rewarded groups are
+    constant-reward groups — NO information, boost 0 (the old +5-for-every-
+    supported line was exactly the rich-get-richer pump the harsh review
+    convicted). refuted/unanchored rows carry reward 0 and weight ~0.
+    The discovery root's own settle is judged by the ideator's novelty
+    grading instead (no self-reinforcement). Never raises."""
+    if status not in ("supported", "refuted"):
+        return
+    try:
+        root = await asyncio.to_thread(
+            ctx.memory.nearest_discovery_ancestor, hyp_id)
+        if root is None or int(root.get("id") or 0) == int(hyp_id):
+            return
+        if status == "supported":
+            from agentics.verify.reward import (
+                adaptive_softmax_weights as entropic_weights)
+            bonus_max = float(getattr(ctx.settings, "entropic_bonus_max",
+                                      8.0))
+            scale_mode = str(getattr(ctx.settings, "reward_scale", "target"))
+            rows = await asyncio.to_thread(
+                ctx.memory.discovery_subtree_rewards, int(root["id"]),
+                scale_mode)
+            boost = 0.0
+            if rows:
+                rewards = [float(r.get("reward") or 0.0) for r in rows]
+                weights = entropic_weights(rewards)
+                # constant-reward group (>= 2 identical results) carries NO
+                # information -> zero boost. A SINGLE settle is still
+                # evidence: its weight is 1.0, boost = bonus_max.
+                constant = (len(rewards) > 1
+                            and len(set(round(r, 9) for r in rewards)) == 1)
+                my_rows = [r for r in rows
+                           if int(r.get("hyp_id") or -1) == int(hyp_id)]
+                if my_rows and not constant:
+                    my_reward = max(float(r.get("reward") or 0.0)
+                                    for r in my_rows)
+                    idx = rewards.index(my_reward)
+                    boost = bonus_max * len(rewards) * weights[idx]
+            nov = await asyncio.to_thread(
+                ctx.memory.discovery_reinforce, int(root["id"]), boost)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "discovery_confirmed",
+                {"branch_hyp": hyp_id, "discovery": int(root["id"]),
+                 "novelty": round(float(nov), 1),
+                 "boost": round(boost, 3),
+                 "group_size": len(rows),
+                 "why": "branch settled supported — entropic credit applied"})
+        else:
+            row = await asyncio.to_thread(ctx.memory.get_hypothesis, hyp_id)
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "branch_dead_end",
+                {"branch_hyp": hyp_id,
+                 "discovery": int(root["id"]),
+                 "angle": (row or {}).get("branch", ""),
+                 "why": "branch settled refuted — this attack angle failed"})
+    except Exception as exc:  # noqa: BLE001 — feedback must never break a settle
+        log.warning("[%s] branch feedback failed: %s", ctx.agent_id, exc)
+
+
+# ------------------------------------------------- settle anchor law
+def _settle_law(ctx: AgentContext, hyp_id: int, claim: str, status: str,
+                ev, code: str, citations: int = 0):
+    """Apply the settle anchor law to one machine verdict (node paths).
+
+    The epistemic rule: `supported` requires self_authored_ratio < 1 — at
+    least one verdict input the agent did NOT author. Anchor sources at the
+    node level: external citation URLs from the ask that produced the
+    protocol, a pinned-hash dataset the protocol declares (verified against
+    the actual workspace file), an already-confirmed P24 replication, and
+    owner approval. An anchorless supported is downgraded to the new
+    `unanchored` status + journaled `settle_unanchored`; the caller records
+    the provenance (ratio + anchors) in the ledger row either way.
+    Returns (status_after, provenance). Never raises."""
+    from agentics.verify.anchors import (
+        apply_settle_law, detect_pinned_data, provenance_for_settle)
+    require = bool(getattr(ctx.settings, "settle_require_anchor", True))
+    try:
+        flags = ctx.memory.settle_anchor_state(hyp_id)
+    except Exception:  # noqa: BLE001 — provenance must never break a settle
+        flags = {"replicated": False, "owner_approved": False}
+    try:
+        pinned = detect_pinned_data(ctx.workspace, code)
+    except Exception:  # noqa: BLE001
+        pinned = False
+    prov = provenance_for_settle(
+        citations=citations, replicated=bool(flags.get("replicated")),
+        owner_approved=bool(flags.get("owner_approved")), pinned_data=pinned)
+    status, _downgraded = apply_settle_law(status, prov, require)
+    if _downgraded:
+        try:
+            ctx.memory.journal(ctx.agent_id, "settle_unanchored", {
+                "hyp": hyp_id, "claim": claim[:160],
+                "self_authored_ratio": prov.ratio,
+                "why": "verdict passed the criterion but every deciding "
+                       "input was agent-authored — supported withheld "
+                       "until independent replication / owner approval"})
+        except Exception:  # noqa: BLE001 — the law must never break a settle
+            pass
+    return status, prov
+
+
+def _world_kind(status: str) -> str:
+    """World-model kind for a settled status. `unanchored` is NOT verified
+    knowledge — it is a measured finding waiting for an external anchor, so
+    it enters the world model as a provisional `finding`, never as
+    `verified` (common ground only grows from anchored verdicts)."""
+    return ("verified" if status == "supported"
+            else "refuted" if status == "refuted"
+            else "finding" if status == "unanchored" else "gap")
+
+
+async def _discovery_gate(ctx: AgentContext, claim: str, verdict: str,
+                          measured: str,
+                          novelty_min: int) -> tuple[bool, str]:
+    """The discovery double-judge + external-citation gate.
+
+    mark_discovery fires only when TWO independent inputs agree the result
+    is surprising: (a) the ideator's own grading (checked by the caller)
+    and (b) a SECOND opinion from an INDEPENDENT account — a sibling view
+    of the session host pinned to the NEXT account, so the judge cannot be
+    the author's own cookie identity re-answering itself. The peer's
+    answer must also carry at least one external citation URL (Perplexity
+    academic mode returns citations natively): the URL is a verdict input
+    the authoring agent did not author.
+
+    Returns (ok, why). A failed gate never breaks the harvest — the result
+    simply keeps the plain follow-up behavior instead of branching."""
+    if not bool(getattr(ctx.settings, "discovery_second_judge", True)):
+        return True, "second judge disabled by config (DISCOVERY_SECOND_JUDGE=0)"
+    host = ctx.llm
+    try:
+        pool = len(host) if host is not None else 0
+    except Exception:  # noqa: BLE001 — non-pool hosts (fakes) have no peers
+        pool = 0
+    if host is None or pool < 2:
+        return False, (f"no independent judge account available "
+                       f"(pool={pool}; discovery needs a second identity)")
+    try:
+        peer_idx = ((int(getattr(host, "prefer_index", 0) or 0) + 1) % pool)
+        peer = host.view(peer_idx)
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        resp = await peer.ask(
+            idea.NOVELTY_JUDGE_PROMPT.format(
+                claim=claim[:1200], verdict=verdict,
+                measured=(measured or "none recorded")[:300],
+                world=world[:1500] or "(empty)", novelty_min=novelty_min),
+            mode="academic", purpose="research")
+        nov2, disc2, why2 = idea.parse_novelty_judgement(
+            getattr(resp, "answer", ""))
+        cites = list(getattr(resp, "citations", None) or [])
+        if nov2 is None:
+            return False, "second judge reply unparsable (no novelty contract)"
+        if not disc2 or nov2 < novelty_min:
+            return False, (f"second judge graded novelty "
+                           f"{round(float(nov2), 1)} (agreement requires "
+                           f">= {novelty_min}): {why2[:120]}")
+        if not cites:
+            return False, ("second judge returned no external citation URL "
+                           "— no input outside the author's reach")
+        return True, (f"peer judge novelty {round(float(nov2), 1)} + "
+                      f"{len(cites)} external citation(s)")
+    except Exception as exc:  # noqa: BLE001 — a failed gate never breaks the harvest
+        return False, f"second judge unavailable: {exc}"[:200]
+
+
+async def _propose_gap_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
+    """Kosmos world model as TASK PROPOSER: topic saturated + registry
+    empty -> the agent reads the world model and registers ONE gap-closing
+    hypothesis instead of idling (autoresearch NEVER-STOP clause).
+
+    Returns True when a hypothesis was registered (the deep-dive can pick
+    it up in the same or next cycle)."""
+    if not await _ideation_allowed(ctx):
+        return False
+    try:
+        world = ctx.memory.world_render(
+            limit=int(getattr(ctx.settings, "world_context_notes", 12)))
+        # MAP-Elites steering (#2): mechanisms with NO archived elite are
+        # the pivot's target list — a saturated topic escapes by moving to
+        # an unoccupied behaviour cell, not by re-proposing covered ones.
+        try:
+            from agentics.diversity import _MECHANISM_KEYWORDS
+            from agentics.research.kg_extract import mechanism_hint
+            hint = mechanism_hint(
+                ctx.memory, list(_MECHANISM_KEYWORDS.keys()))
+            if hint:
+                world = (world + "\n\n" + hint)[:2100]
+        except Exception:  # noqa: BLE001 — hint is advisory
+            pass
+        rejected = ctx.memory.rejected_render()
+        recent = ctx.memory.recent_hypotheses(12)
+        recent_claims = [r["claim"] for r in recent]
+        answer, _ = await _llm_ask(
+            ctx,
+            idea.GAP_PROMPT.format(
+                world=world[:1800] or "(empty)",
+                recent="\n".join(f"- {c[:140]}" for c in recent_claims[:10])
+                or "(none)",
+                rejected=rejected[:800] or "(none)"),
+            purpose="ideation")
+        children = idea.parse_children(answer, max_children=1)
+        if not children:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "gap_proposal_empty",
+                {"why": "no parsable gap hypothesis"})
+            return False
+        hyp_id = await _gate_and_register(
+            ctx, children[0], [], recent,
+            repair_margin=float(getattr(
+                ctx.settings, "idea_repair_margin_saturation", 30)))
+        if hyp_id is None:
+            return False
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "gap_hypothesis_registered",
+            {"hyp": hyp_id, "claim": children[0]["claim"][:160],
+             "source": "world_model_gap"})
+        state["summary"] = (f"saturation pivot: registered gap hypothesis "
+                            f"h#{hyp_id} from the world model")
+        return True
+    except Exception as exc:  # noqa: BLE001 — proposal must never crash research
+        log.warning("[%s] gap proposal failed: %s", ctx.agent_id, exc)
+        return False
+
+
+async def _seed_hypotheses_from_findings(ctx: AgentContext,
+                                         state: ResearchState) -> bool:
+    """Saturation escape hatch #2 (P16bis raw material): the world model
+    proposed nothing (or the gate refused the idea), but the swarm holds
+    FINDINGS. Each finding hides 1-2 QUANTITATIVE claims a small python
+    protocol can check — extract them and PRE-REGISTER (criterion locked
+    before any run; no experiment executes here), so the deep-dive backlog
+    picks them up next cycle through the ordinary settle machinery.
+
+    Live 2026-11-14 owner dashboard: with the topic saturated, 5 findings
+    stored and 0 hypotheses registered, the lab oscillated skip->reject
+    forever while the whole settle/replication/discovery pipeline starved.
+    This path is that pipeline's raw-material pump. Returns True when at
+    least one hypothesis was registered. Never raises."""
+    if not await _ideation_allowed(ctx):
+        return False
+    try:
+        findings = await asyncio.to_thread(ctx.memory.list_findings, 2)
+        if not findings:
+            return False
+        registered = 0
+        for finding in findings:
+            answer, _ = await _llm_ask(
+                ctx,
+                EXTRACT_CLAIMS_PROMPT.replace(
+                    "{finding}",
+                    (f"{finding.get('title', '')}\n"
+                     f"{finding.get('content', '')}")[:3000]),
+                mode="concise", purpose="verify")
+            parsed = parse_json_block(answer)
+            specs = [h for h in (parsed.get("hypotheses") or [])
+                     if isinstance(h, dict)][:2]
+            for spec in specs:
+                claim = str(spec.get("claim", "")).strip()[:300]
+                protocol_code = str(spec.get("protocol", ""))
+                if not claim or not protocol_code.strip():
+                    continue
+                try:
+                    criterion = Criterion.from_dict(spec)
+                except ValueError:
+                    continue
+                # Same near-clone gate as node_verify: a reworded claim of
+                # something already in the stream must not pass as new.
+                if not _pem_gate(ctx, claim):
+                    continue
+                hyp_id = await asyncio.to_thread(
+                    ctx.memory.add_hypothesis, ctx.agent_id, claim,
+                    criterion.as_dict(), task_id=state.get("issue_number"),
+                    finding_id=finding.get("id"), status="proposed",
+                    protocol_code=protocol_code[:20000])
+                sig = spec.get("signature")
+                if isinstance(sig, dict) and sig:
+                    await asyncio.to_thread(
+                        ctx.memory.set_hypothesis_signature, hyp_id, sig)
+                registered += 1
+        if registered == 0:
+            return False
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "findings_seeded_hypotheses",
+            {"registered": registered,
+             "why": "saturation pivot: pre-registered quantitative claims "
+                    "from stored findings (P16bis raw material)"})
+        state["summary"] = (
+            f"saturation pivot: pre-registered {registered} hypothesis/ies "
+            "from stored findings (P16bis)")
+        return True
+    except Exception as exc:  # noqa: BLE001 — seeding must never crash research
+        log.warning("[%s] findings seeding failed: %s", ctx.agent_id, exc)
+        return False
+
+
+def _close_saturated_task(ctx: AgentContext, state: ResearchState) -> None:
+    """Stop re-awarding a task whose research target is fully covered.
+
+    The claim/release cycle below is what produced the live 400+-cycle idle
+    loop: contract-net re-awards the task, the researcher skips it as
+    covered, releases it, and the next cycle repeats. Closing the task (the
+    local board in local-only mode; a no-op on unknown ids in GitHub mode)
+    removes it from the open pool permanently."""
+    task_id = state.get("issue_number")
+    if not task_id:
+        return
+    try:
+        ctx.memory.set_task_status(task_id, "closed")
+        ctx.memory.journal(ctx.agent_id, "task_closed_saturated",
+                           {"task": task_id,
+                            "why": "topic covered, all angles researched"})
+    except Exception as exc:  # noqa: BLE001 — closure must never break research
+        log.warning("could not close saturated task %s: %s", task_id, exc)
+
+
+async def _test_proposed_hypothesis(ctx: AgentContext, state: ResearchState) -> bool:
+    """Deep-dive path: turn ONE registry `proposed` hypothesis into a real
+    experiment and adjudicate it with the same machine gate as node_verify.
+
+    Returns True when a hypothesis was picked up and run (or irreversibly
+    marked), False when the registry has nothing testable this cycle.
+    The hypothesis's OWN row is updated (status testing -> settled) so the
+    registry stays the single source of truth — no duplicate claim rows."""
+    if ctx.llm is None:
+        return False
+    try:
+        max_attempts = int(getattr(ctx.settings, "idea_max_attempts", 2))
+        backlog = await asyncio.to_thread(
+            ctx.memory.testable_hypotheses, 6, max_attempts)
+    except Exception:  # noqa: BLE001
+        backlog = []
+    if not backlog:
+        return False
+    # Deep-dive backlog v2 (autoresearch): `inconclusive` near-misses whose
+    # protocol measured nothing usable come FIRST (retry with the failure
+    # note in the prompt, bounded by idea_max_attempts), then fresh
+    # `proposed` claims.
+    retries = [h for h in backlog if h.get("attempts", 0) > 0]
+    fresh = [h for h in backlog if h.get("attempts", 0) == 0]
+    # DAPS CCR: pick the FRESH candidate whose MECHANISM category is rarest
+    # in the recent hypothesis stream (ties -> oldest), not blindly the
+    # oldest — acceptance pressure otherwise amplifies the proposer's prior.
+    try:
+        recent = await asyncio.to_thread(ctx.memory.recent_hypotheses, 10)
+        backlog_ids = {h["id"] for h in backlog}
+        recent_claims = [r["claim"] for r in recent
+                         if r.get("id") not in backlog_ids]
+        fresh = qd.coverage_order(fresh, recent_claims)
+    except Exception:  # noqa: BLE001 — CCR must never block the deep dive
+        recent = []
+        pass
+    # Discovery frontier (novelty round): when a settled result was marked a
+    # DISCOVERY, its branch children jump the CCR queue. C2 (TTT_DISCOVER.md):
+    # the frontier is scored by the paper's PUCTSampler — Q = MAX descendant
+    # reward, exploitation bonus decays with subtree settles (the structural
+    # cure for rich-get-richer) — and only falls back to BFS order when the
+    # PUCT buffer is degenerate (no settles / single candidate).
+    try:
+        max_depth = int(getattr(ctx.settings, "branch_max_depth", 4))
+        puct_c = float(getattr(ctx.settings, "puct_c", 1.0))
+        eig_w = float(getattr(ctx.settings, "eig_weight", 0.5) or 0.0)
+        frontier = await asyncio.to_thread(
+            ctx.memory.discovery_frontier_puct, 3, max_depth, puct_c,
+            str(getattr(ctx.settings, "reward_scale", "target")), eig_w)
+        if not frontier:
+            frontier = await asyncio.to_thread(
+                ctx.memory.discovery_frontier, 3, max_depth)
+        if frontier:
+            fids = {h["id"] for h in frontier}
+            fmeta = {h["id"]: h for h in frontier}
+            boosted = [h for h in fresh if h["id"] in fids]
+            if boosted:
+                fresh = boosted + [h for h in fresh if h["id"] not in fids]
+                top = fmeta[boosted[0]["id"]]
+                await asyncio.to_thread(
+                    ctx.memory.journal, ctx.agent_id, "frontier_priority",
+                    {"hyp": boosted[0]["id"],
+                     "claim": boosted[0]["claim"][:160],
+                     "branch": top.get("branch", ""),
+                     "depth": top.get("depth", 0),
+                     "puct_score": top.get("puct_score"),
+                     "puct_q": top.get("puct_q"),
+                     "puct_n": top.get("puct_n"),
+                     "frontier_size": len(boosted)})
+    except Exception:  # noqa: BLE001 — frontier must never block the deep dive
+        pass
+    backlog = retries + fresh
+    hyp = backlog[0]
+    is_retry = hyp.get("attempts", 0) > 0
+    retry_note = ""
+    if is_retry:
+        retry_note = (
+            f"\n\nIMPORTANT: previous attempt #{hyp.get('attempts')} of this "
+            f"protocol failed to measure anything usable: "
+            f"{str(hyp.get('verdict_note') or 'unknown failure')[:400]}. "
+            "Write a CORRECTED protocol — if the failure was trivial (a bug, "
+            "a missing import) fix it; if the measurement approach itself "
+            "was broken, change it. Keep it simple.\n")
+    # DAPS PEM inherit: a registry proposal that is a near-clone of an
+    # already-SETTLED claim inherits that verdict instead of burning a
+    # protocol run on a re-wording (same convention as node_verify's reuse).
+    try:
+        threshold = float(getattr(ctx.settings, "diversity_jaccard_max", 0.8))
+        settled_priors = [r for r in recent
+                          if r.get("status") in ("supported", "refuted")]
+        dup = qd.near_duplicate(hyp["claim"], settled_priors, threshold,
+                                exclude_ids={hyp["id"]})
+    except Exception:  # noqa: BLE001
+        dup = None
+    if dup is not None:
+        score, prior = dup
+        await asyncio.to_thread(
+            ctx.memory.update_hypothesis, hyp["id"], prior["status"],
+            note=(f"inherited verdict of settled h#{prior['id']} "
+                  f"(near-duplicate, jaccard={score:.2f})"))
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_reused",
+            {"hyp": hyp["id"], "claim": hyp["claim"][:160],
+             "settled_by": prior["id"], "status": prior["status"],
+             "jaccard": round(score, 3),
+             "why": "PEM: registry proposal is a near-clone of a settled claim"})
+        state["summary"] = (f"deep-dive: registry h#{hyp['id']} is a near-clone "
+                            f"of settled h#{prior['id']} -> verdict inherited")
+        state["done"] = True
+        return True
+    try:
+        crit = json.loads(hyp.get("criterion") or "{}")
+    except Exception:  # noqa: BLE001
+        crit = {}
+    criterion_desc = (
+        f"metric={crit.get('metric')} op={crit.get('op')} target={crit.get('target')}"
+        + (f" tolerance={crit.get('tolerance')}" if crit.get("tolerance") else "")
+    )
+    prompt = (
+        "A research hypothesis was pre-registered by the swarm but never "
+        "tested. Write its self-contained python protocol.\n\n"
+        f"Hypothesis claim:\n{hyp['claim'][:1500]}\n\n"
+        f"Machine criterion (the protocol MUST print AGENTICS_RESULT with "
+        f"exactly this metric): {criterion_desc}\n"
+        f"{retry_note}\n"
+        # Wave-2 #1: settled protocols compound — start from verified skills
+        f"{skills_block(ctx.memory, hyp['claim'])}\n\n"
+        f"{PROTOCOL_CONTRACT}\n"
+        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
+        '"op": ">=", "target": 0.9, "protocol": "<full python code>", '
+        '"signature": {"problem": "...", "mechanism": "...", "novelty": "...", '
+        '"assumptions": "...", "effect": "..."}}]} '
+        "with EXACTLY ONE entry."
+    )
+    answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    parsed = parse_json_block(answer)
+    specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)]
+    if not specs:
+        if is_retry:
+            # autoresearch: after a failed fix attempt, retire the claim —
+            # the idea (not the protocol) is fundamentally broken.
+            await asyncio.to_thread(
+                ctx.memory.update_hypothesis, hyp["id"], "refuted",
+                note="retired after failed retry: protocol unfixable")
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_retired",
+                {"hyp": hyp["id"], "why": "retry produced no usable protocol"})
+            state["summary"] = (f"deep-dive: retired h#{hyp['id']} after a "
+                                f"failed retry (protocol unfixable)")
+            state["done"] = True
+            return True
+        await asyncio.to_thread(
+            ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
+            {"hyp": hyp["id"], "why": "LLM returned no parsable protocol"})
+        return False
+    spec = specs[0]
+    code = str(spec.get("protocol", ""))
+    if not code.strip():
+        return False
+    try:
+        criterion = Criterion.from_dict(spec)
+    except ValueError as exc:
+        # Frozen registry criterion wins when the LLM disagrees with it.
+        try:
+            criterion = Criterion.from_dict(crit)
+        except ValueError:
+            await asyncio.to_thread(
+                ctx.memory.journal, ctx.agent_id, "hypothesis_protocol_failed",
+                {"hyp": hyp["id"], "why": f"criterion unusable: {exc}"})
+            return False
+    hyp_id = hyp["id"]
+    claim = hyp["claim"]
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis, hyp_id, "testing")
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis_protocol_code, hyp_id, code[:20000])
+    sig = spec.get("signature")
+    if isinstance(sig, dict) and sig:
+        await asyncio.to_thread(
+            ctx.memory.set_hypothesis_signature, hyp_id, sig)
+    await asyncio.to_thread(ctx.workspace.sync_main)   # workspace must exist
+    path = f"experiments/verify_h{hyp_id}.py"
+    try:
+        await asyncio.to_thread(ctx.workspace.write_file, path, code)
+    except ValueError as exc:            # P10 layer 1: protected / traversal
+        await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                "inconclusive", note=str(exc)[:300])
+        await asyncio.to_thread(
+            ctx.memory.record_experiment, ctx.agent_id, hyp_id,
+            "inconclusive", metric=criterion.metric, op=criterion.op,
+            target=criterion.target, verdict_note=str(exc)[:200],
+            protocol_path=path, source="deep_dive", description=claim[:200])
+        state["summary"] = f"deep-dive h#{hyp_id} blocked by guard: {exc}"
+        state["done"] = True
+        return True
+    try:
+        ev = await asyncio.to_thread(run_protocol, ctx.workspace, path, criterion)
+    except Exception as exc:  # noqa: BLE001 — one bad protocol must not kill the cycle
+        await asyncio.to_thread(ctx.memory.update_hypothesis, hyp_id,
+                                "inconclusive", note=f"runner error: {exc}"[:300])
+        await asyncio.to_thread(
+            ctx.memory.record_experiment, ctx.agent_id, hyp_id,
+            "inconclusive", metric=criterion.metric, op=criterion.op,
+            target=criterion.target, verdict_note=f"runner error: {exc}"[:200],
+            protocol_path=path, source="deep_dive", description=claim[:200])
+        state["summary"] = f"deep-dive h#{hyp_id} runner error: {exc}"
+        state["done"] = True
+        return True
+
+    def _rerun(fixed_code: str):
+        try:
+            ctx.workspace.write_file(path, fixed_code)
+        except ValueError as exc:
+            return Evidence(
+                cmd=path, exit_code=126, verdict="inconclusive",
+                method="protocol", output=f"repair write refused: {exc}",
+                meta={"note": f"repair write refused: {exc}",
+                      "metrics": {}, "runs": []})
+        return run_protocol(ctx.workspace, path, criterion)
+
+    ev, _fixed = await _repair_protocol_rounds(
+        ctx, state, claim=claim, criterion=criterion, code=code,
+        ev=ev, rerun=_rerun, what=f"registry:h{hyp_id}", hyp_id=hyp_id)
+    ev_id = await asyncio.to_thread(
+        ctx.memory.record_evidence, ctx.agent_id, hyp.get("task_id"),
+        ev.cmd, ev.exit_code, ev.verdict,
+        hypothesis=claim, method=ev.method, output=ev.output,
+        duration_s=ev.duration_s, artifact=path)
+    await asyncio.to_thread(
+        ctx.memory.attach_protocol_outcome, ev_id,
+        ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
+    status = VERIFY_STATUS[ev.verdict]
+    note = str(ev.meta.get("note", ""))
+    # Settle anchor law: `supported` needs at least one verdict input the
+    # agent did not author. The protocol-generation ask's citation URLs are
+    # that external input when Perplexity returns them.
+    status, prov = _settle_law(ctx, hyp_id, claim, status, ev, code,
+                               citations=len(ask_citations))
+    if status == "unanchored" and ev.verdict == "confirmed":
+        note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                f"no external anchor]")[:600]
+    await asyncio.to_thread(
+        ctx.memory.update_hypothesis, hyp_id, status,
+        evidence_id=ev_id, note=note, protocol_path=path)
+    await asyncio.to_thread(
+        ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
+        {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
+         "note": note[:200], "evidence": ev_id,
+         "criterion": criterion.as_dict(), "source": "registry_deep_dive",
+         "self_authored_ratio": prov.ratio},
+    )
+    measured = ev.meta.get("metrics", {})
+    # autoresearch ledger: this settle is now part of the keep/discard
+    # history (supported=keep, everything else=discard) — the loop's memory
+    # of what was TRIED, failures included. The row carries the verdict's
+    # PROVENANCE (ratio + anchors) next to the verdict.
+    await asyncio.to_thread(
+        ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
+        metric=criterion.metric,
+        measured=measured.get(criterion.metric), op=criterion.op,
+        target=criterion.target, verdict_note=note[:200],
+        protocol_path=path, source="deep_dive", description=claim[:200],
+        self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
+    # Kosmos world model: the settled registry claim becomes shared state.
+    await asyncio.to_thread(
+        ctx.memory.world_add, ctx.agent_id, _world_kind(status),
+        f"{claim[:180]} -> {status}"
+        + (f" ({note[:120]})" if note else ""),
+        source=f"h#{hyp_id}")
+    if status in ("supported", "refuted", "unanchored"):
+        # bandit-lite feedback FIRST: a branch settle credits/debits its
+        # discovery root before the ideation round re-reads the registry.
+        # (An `unanchored` verdict never reinforces a discovery — its
+        # supported-grade is withheld precisely because it is untrusted.)
+        if status != "unanchored":
+            await _branch_feedback(ctx, hyp_id, status)
+        # Kosmos closed loop: the settled result proposes its follow-ups.
+        measured_txt = (f"{criterion.metric}={measured.get(criterion.metric)}"
+                        if measured else note[:200])
+        await _harvest_insights(ctx, hyp_id, claim, status, measured_txt)
+    state["summary"] = (
+        f"deep-dive: tested registry h#{hyp_id} -> {status} "
+        f"(measured {measured or note[:80]})")
+    state["done"] = True
+    return True
+
+
 async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchState:
     """Researcher: search papers, dedup vs vector memory, store findings.
 
@@ -936,7 +1961,33 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
                     rotated = True
                     break
         if not rotated:
+            # Saturation is NOT the end of the cycle — it is the moment to go
+            # DEEPER: the registry holds `proposed` hypotheses (pre-registered
+            # or tournament-bred) that nothing ever turned into a runnable
+            # experiment. Live 2026-11-14: with 5 findings covering the topic
+            # the researchers skipped for 400+ cycles while 4 proposed
+            # hypotheses sat untested and the evidence ledger grew only
+            # duplicate replays. Work the backlog instead of idling.
+            if await _test_proposed_hypothesis(ctx, state):
+                return state
+            # Registry exhausted too — Kosmos: the world model is a TASK
+            # PROPOSER, not just context. One gap-closing hypothesis gets
+            # registered from the open gaps/questions (gated: PEM + IDEAgent
+            # judge) and the deep-dive works it in the same or next cycle.
+            # Only when even the pivot fails does the lab honestly rest.
+            if await _propose_gap_hypothesis(ctx, state):
+                if await _test_proposed_hypothesis(ctx, state):
+                    return state
+                state["done"] = True
+                return state
+            # Escape hatch #2: even the gap pivot failed — mine the FINDINGS
+            # the lab already holds for quantitative, protocol-checkable
+            # claims (P16bis needs raw material; each stored finding is an
+            # unmined hypothesis source). Registered only, run next cycle.
+            if await _seed_hypotheses_from_findings(ctx, state):
+                return state
             state["summary"] = f"topic already covered by {len(known)} findings; skipping"
+            _close_saturated_task(ctx, state)
             state["done"] = True
             return state
     # Breadth steering: the swarm's already-cited domains feed back into the
@@ -951,11 +2002,17 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
                                {"known_domains": len(domains)})
     except Exception:  # noqa: BLE001 — steering must never gate research
         breadth = ""
+    # Kosmos world model: the current shared state steers WHAT to research
+    # next — open gaps and untested leads, not just the static topic string.
+    world = _world_model_text(ctx)
+    world_line = (f"\n\nWorld model (swarm state — build on VERIFIED, avoid "
+                  f"REFUTED, close a GAP):\n{world}") if world else ""
     query = (
         f"{topic} — context: {ctx.settings.research_topic}. "
         "Focus on methods, benchmarks, reproducible results."
         + (f"\n\nProblem statement from the issue:\n{body[:400]}" if body else "")
         + (f"\n\n{knowledge}" if knowledge else "")
+        + world_line
         + breadth
     )
 
@@ -968,7 +2025,7 @@ async def node_research(ctx: AgentContext, state: ResearchState) -> ResearchStat
     # without burning a single budgeted call.
     budget = getattr(ctx, "budget", None)
     if budget is not None:
-        allowed, why = budget.can_ask(ctx.agent_id)
+        allowed, why = budget.can_ask(ctx.agent_id, purpose="research")
         if not allowed:
             log.warning("[%s] research blocked by budget: %s", ctx.agent_id, why)
             try:
@@ -1135,17 +2192,11 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             "expected_files": [],
         },
     )
-    prompt = (
-        f"Research finding to verify:\n{finding_text[:3000]}\n\n"
-        "Extract up to 2 QUANTITATIVE claims from this finding that a small, "
-        "self-contained python simulation can check (simulate the method on "
-        "synthetic data, measure the metric). For each claim write its "
-        "protocol.\n\n"
-        f"{PROTOCOL_CONTRACT}\n"
-        'Reply ONLY JSON: {"hypotheses": [{"claim": "...", "metric": "<name>", '
-        '"op": ">=", "target": 0.9, "protocol": "<full python code>"}]}'
-    )
-    answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
+    # .replace, not .format: the contract text embeds literal JSON braces
+    # (AGENTICS_RESULT: {"<metric>": <number>}) that .format would parse
+    # as placeholders.
+    prompt = EXTRACT_CLAIMS_PROMPT.replace("{finding}", finding_text[:3000])
+    answer, ask_citations = await _llm_ask(ctx, prompt, mode="concise", purpose="verify")
     parsed = parse_json_block(answer)
     specs = [h for h in (parsed.get("hypotheses") or []) if isinstance(h, dict)][:3]
     if not specs:
@@ -1155,6 +2206,7 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
 
     await asyncio.to_thread(ctx.workspace.sync_main)    # workspace must exist
     results: list[dict] = []
+    harvest_target: tuple | None = None   # (hyp_id, claim, status, measured_txt)
     for spec in specs:
         claim = str(spec.get("claim", "")).strip()[:300]
         criterion, malformed = None, ""
@@ -1186,10 +2238,23 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
                             "reused": True, "hypothesis_id": prior["id"],
                             "evidence_id": prior["evidence_id"]})
             continue
+        # DAPS PEM: reject a NEW hypothesis that is a near-clone of one
+        # already in the stream — surface novelty (new wording) must not be
+        # counted as a new discovery (IDEAgent diversity floor, live decay).
+        if not _pem_gate(ctx, claim):
+            results.append({"claim": claim, "status": "inconclusive",
+                            "note": "rejected by PEM diversity gate "
+                                    "(near-duplicate of a recent hypothesis)",
+                            "near_duplicate": True})
+            continue
         hyp_id = await asyncio.to_thread(
             ctx.memory.add_hypothesis, ctx.agent_id, claim, criterion.as_dict(),
             task_id=state.get("issue_number"), finding_id=state.get("finding_id"),
             status="testing", protocol_code=protocol_code[:20000])
+        sig = spec.get("signature")
+        if isinstance(sig, dict) and sig:
+            await asyncio.to_thread(
+                ctx.memory.set_hypothesis_signature, hyp_id, sig)
         path = f"experiments/verify_h{hyp_id}.py"
         try:
             await asyncio.to_thread(ctx.workspace.write_file, path, protocol_code)
@@ -1235,6 +2300,17 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ev.meta.get("metrics", {}), ev.meta.get("runs", []), hyp_id)
         status = VERIFY_STATUS[ev.verdict]
         note = str(ev.meta.get("note", ""))
+        # Settle anchor law: `supported` needs at least one verdict input
+        # the agent did not author. External inputs here: citation URLs
+        # from the verify ask + the research citations the finding was
+        # grounded in (state), a pinned-hash dataset, P24 replication,
+        # owner approval.
+        status, prov = _settle_law(
+            ctx, hyp_id, claim, status, ev, protocol_code,
+            citations=len(ask_citations) + len(state.get("citations") or []))
+        if status == "unanchored" and ev.verdict == "confirmed":
+            note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                    f"no external anchor]")[:600]
         await asyncio.to_thread(
             ctx.memory.update_hypothesis, hyp_id, status,
             evidence_id=ev_id, note=note, protocol_path=path)
@@ -1242,11 +2318,50 @@ async def node_verify(ctx: AgentContext, state: ResearchState) -> ResearchState:
             ctx.memory.journal, ctx.agent_id, "hypothesis_verified",
             {"hyp": hyp_id, "verdict": status, "claim": claim[:160],
              "note": note[:200], "evidence": ev_id,
-             "criterion": criterion.as_dict()},
+             "criterion": criterion.as_dict(),
+             "self_authored_ratio": prov.ratio},
         )
+        # Kosmos world model: the settled fact becomes shared state with
+        # provenance — every next cycle's prompts read it back. An
+        # `unanchored` verdict enters as a provisional `finding`, never as
+        # `verified` (common ground only grows from anchored verdicts).
+        await asyncio.to_thread(
+            ctx.memory.world_add, ctx.agent_id, _world_kind(status),
+            f"{claim[:180]} -> {status}"
+            + (f" ({note[:120]})" if note else ""),
+            source=f"h#{hyp_id}")
         results.append({"claim": claim, "status": status, "note": note,
                         "hypothesis_id": hyp_id, "evidence_id": ev_id,
+                        "self_authored_ratio": prov.ratio,
                         "replication": False})
+        # autoresearch ledger + discovery feedback + Kosmos harvest: the
+        # MAIN verify path used to settle claims silently — no ledger row,
+        # no novelty judgment, no branching. Every settle now feeds the
+        # loop the same way the deep-dive path does (one harvest per cycle:
+        # prefer the first supported settle, then an unanchored one, else
+        # the first refuted). The ledger row carries the verdict's
+        # PROVENANCE (ratio + anchors) next to the verdict.
+        if status in ("supported", "refuted", "unanchored"):
+            measured = ev.meta.get("metrics", {})
+            await asyncio.to_thread(
+                ctx.memory.record_experiment, ctx.agent_id, hyp_id, status,
+                metric=criterion.metric,
+                measured=measured.get(criterion.metric), op=criterion.op,
+                target=criterion.target, verdict_note=note[:200],
+                protocol_path=path, source="verify", description=claim[:200],
+                self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
+            if status != "unanchored":
+                await _branch_feedback(ctx, hyp_id, status)
+            measured_txt = (f"{criterion.metric}="
+                            f"{measured.get(criterion.metric)}"
+                            if measured else note[:200])
+            rank = {"supported": 2, "unanchored": 1}.get(status, 0)
+            if harvest_target is None or rank > {
+                    "supported": 2, "unanchored": 1}.get(
+                        harvest_target[2], 0):
+                harvest_target = (hyp_id, claim, status, measured_txt)
+    if harvest_target is not None:
+        await _harvest_insights(ctx, *harvest_target)
     # P24: the independent-replication block rides along on this cycle too
     if repl:
         results = repl + results
@@ -1521,6 +2636,15 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                       f"your plan must be consistent with these and your verify_cmds "
                       f"must check the NEW claims):\n{knowledge_txt}\n"
                       if knowledge_txt else "")
+    # Kosmos world model: the plan advances the swarm's CURRENT state — open
+    # gaps and verified facts steer the approach, refuted ones block it.
+    world_txt = _world_model_text(ctx)
+    world_rule = (
+        f"\nWorld model (the swarm's current structured state — plan must "
+        f"build on VERIFIED facts, close a GAP, never re-assert REFUTED):\n"
+        f"{world_txt}\n"
+        if world_txt else ""
+    )
     # A2X swarm lessons: OTHER agents' failures aggregated into signatures —
     # (xN) means the approach was tried N times by DIFFERENT agents and never
     # worked (Voyager lesson loop / Reflexion, at swarm scale).
@@ -1551,7 +2675,7 @@ async def node_plan(ctx: AgentContext, state: ResearchState) -> ResearchState:
         f"Distilled skills from past workflows that led to merges (LifeMem tier — "
         f"follow what worked, avoid what is listed):\n{skills_txt}\n\n"
         f"Reusable tools already registered in this repo (reuse before writing new code):\n"
-        f"{tools_txt}\n{personal_rule}{recall_rule}{swarm_rule}{evolution_rule}{rework_rule}{knowledge_rule}\n"
+        f"{tools_txt}\n{personal_rule}{recall_rule}{swarm_rule}{evolution_rule}{rework_rule}{knowledge_rule}{world_rule}\n"
         f"{PLAN_INSTRUCTION}"
     )
     answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="plan", state=state)
@@ -1761,6 +2885,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
             f"Task #{state.get('issue_number')}: {state.get('issue_title')}\nPlan step for this file:\n"
             f"{json.dumps(spec, ensure_ascii=False)}\n\n"
             f"{brief}"
+            # Wave-2 #1: compounding skills — verified approaches for this
+            # kind of task, distilled from the lab's own settled protocols.
+            f"{skills_block(ctx.memory, state.get('issue_title', ''))}\n\n"
             f"Current content:\n{current[:6000]}\n\n"
             "Return the FULL new file content only, no explanations."
         )
@@ -1958,7 +3085,9 @@ async def node_implement(ctx: AgentContext, state: ResearchState) -> ResearchSta
                 what=f"implement:{hyp.hypothesis_id}", hyp_id=hyp_id)
             await asyncio.to_thread(
                 settle_hypothesis, ctx.memory, ctx.agent_id, hyp_id, hyp, ev,
-                method="hypothesis_contract")
+                method="hypothesis_contract",
+                require_anchor=bool(getattr(ctx.settings,
+                                            "settle_require_anchor", True)))
             # the protocol file rides the branch — the MR record must list it,
             # or the reviewer sees a diff file the record does not explain
             # (the protocol IS the evidence's source code)

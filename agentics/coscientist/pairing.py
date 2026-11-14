@@ -33,6 +33,38 @@ DEBATE_WHEN_MATCHES_LT = 3
 DEBATE_WHEN_ELO_DELTA_LT = 200.0
 
 
+def jaccard_similarity(hyp_a: dict, hyp_b: dict) -> float:
+    """Lexical proximity between two hypotheses (0..1), dependency-free.
+
+    The reference weights debates by VECTOR idea-distance; the lab's
+    hypotheses are short claims, where token-set Jaccard on the claim +
+    the QD signature mechanism is the honest, testable equivalent — and
+    its job here is only to avoid wasting a match on two near-identical
+    claims (sim > 0.9), never to rank quality."""
+    try:
+        stop = {"the", "a", "an", "of", "in", "on", "for", "and", "or",
+                "to", "with", "is", "are", "than", "by", "from", "at",
+                "least", "will", "can", "that", "this", "when", "while"}
+        ta = {w for w in re.findall(r"[a-z][a-z\-]+",
+                                    str(hyp_a.get("claim") or "").lower())
+              if w not in stop}
+        tb = {w for w in re.findall(r"[a-z][a-z\-]+",
+                                    str(hyp_b.get("claim") or "").lower())
+              if w not in stop}
+        # same declared mechanism = an approach-level duplicate signal
+        sig_a = (hyp_a.get("signature") or {})
+        sig_b = (hyp_b.get("signature") or {})
+        same_mech = (str((sig_a or {}).get("mechanism") or "").lower()
+                     == str((sig_b or {}).get("mechanism") or "").lower()
+                     and bool((sig_a or {}).get("mechanism")))
+        if not ta or not tb:
+            return 0.0
+        j = len(ta & tb) / max(1, len(ta | tb))
+        return min(1.0, j + (0.3 if same_mech else 0.0))
+    except Exception:  # noqa: BLE001 — similarity must never gate a match
+        return 0.0
+
+
 def select_mode(a_matches: int, b_matches: int, elo_a: float,
                 elo_b: float) -> PairMode:
     """Debate for new/close matchups, plain pairwise for separated veterans."""
@@ -73,10 +105,22 @@ def select_pair(
     new_hyps = [h for h in pool if matches(h) < DEBATE_WHEN_MATCHES_LT]
     warm = [h for h in pool if matches(h) >= DEBATE_WHEN_MATCHES_LT]
 
-    # bucket 1: new entrant vs nearest-Elo seasoned opponent
+    # bucket 1: new entrant vs nearest-Elo seasoned opponent — but never
+    # against a NEAR-IDENTICAL claim (a debate between clones is noise)
     if roll < p_new and new_hyps and warm:
         a = rng_choice(rng, new_hyps)
-        b = min(warm, key=lambda h: abs(elo(h) - elo(a)))
+        candidates = sorted(warm, key=lambda h: abs(elo(h) - elo(a)))
+        b = candidates[0]
+        for cand in candidates:
+            sim = None
+            if similarity is not None:
+                try:
+                    sim = similarity(a, cand)
+                except Exception:      # noqa: BLE001 — vector tier must never gate
+                    sim = None
+            if sim is None or sim <= 0.9:
+                b = cand
+                break
         return a, b
 
     # bucket 2: close-Elo pair in the warm set, weighted by idea distance

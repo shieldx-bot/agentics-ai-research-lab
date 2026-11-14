@@ -83,6 +83,55 @@ CREATE TABLE IF NOT EXISTS journal (
     event TEXT NOT NULL,
     detail TEXT DEFAULT ''
 );
+-- Kosmos world model (arXiv 2511.02824): a STRUCTURED shared state that
+-- nodes append to and every prompt reads back, so 100s of cycles stay
+-- coherent on one objective. kind: finding | verified | refuted | gap |
+-- question. source: 'finding#N' / 'h#N' / 'evidence#N' provenance tag.
+CREATE TABLE IF NOT EXISTS world_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    level INTEGER NOT NULL DEFAULT 0,       -- wave-2 #5: 0=raw note,
+                                            -- 1..3 = reflection depth
+    parents TEXT NOT NULL DEFAULT '[]'      -- JSON ids of source notes
+);
+-- autoresearch (karpathy/autoresearch) experiment ledger: EVERY settle --
+-- deep-dive, coder protocol, replication attempt -- lands here with
+-- keep/discard semantics (supported=keep, everything else=discard). The
+-- ledger is the loop's memory of what was TRIED, including failures: the
+-- near-miss retry pool and the diversity audit read it, the dashboard
+-- renders it. Bounded to the newest 500 rows.
+CREATE TABLE IF NOT EXISTS experiment_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    hyp_id INTEGER,
+    status TEXT NOT NULL,
+    metric TEXT DEFAULT '',
+    measured REAL,
+    op TEXT DEFAULT '',
+    target REAL,
+    verdict_note TEXT DEFAULT '',
+    protocol_path TEXT DEFAULT '',
+    source TEXT DEFAULT '',
+    description TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_hyp ON experiment_ledger(hyp_id);
+-- IDEAgent rejected-pattern archive (R): COMPACT summaries of rejected
+-- ideas -- mechanism + one-line reason, never the full idea -- fed back
+-- into ideation seed prompts so the loop pivots away from failing
+-- mechanisms instead of re-proposing them. Bounded to 100 rows.
+CREATE TABLE IF NOT EXISTS rejected_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    agent TEXT NOT NULL,
+    claim TEXT NOT NULL,
+    mechanism TEXT DEFAULT '',
+    reason TEXT DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -278,6 +327,25 @@ CREATE TABLE IF NOT EXISTS role_prompts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_role_prompts_active
     ON role_prompts(role, category) WHERE status='active';
+-- DSPy-lite prompt evolution (wave-2 #2): the CHALLENGER pool per
+-- (role, category). The active row in role_prompts stays the champion;
+-- variants are mutation arms served on exploration cycles, selected on
+-- REAL cycle outcomes (exit-code settle results, never LLM opinion), and
+-- promoted through store_role_prompt (the existing rework machinery)
+-- when they beat the champion's win-rate by a margin.
+CREATE TABLE IF NOT EXISTS prompt_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,
+    category TEXT NOT NULL,
+    mission TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'arm',     -- arm | retired | promoted
+    origin TEXT NOT NULL DEFAULT 'mutate',  -- mutate | manual
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_variants ON prompt_variants(role, category, status);
 CREATE TABLE IF NOT EXISTS llm_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -305,10 +373,15 @@ CREATE INDEX IF NOT EXISTS idx_swarm_eval_ts ON swarm_eval_snapshots(ts);
 CREATE TABLE IF NOT EXISTS task_awards (
     -- Contract-Net-lite (A2X): the supervisor's allocation signal. Rewritten
     -- WHOLESALE on every scan, so a row older than one scan cannot exist.
+    -- `hits` counts CONSECUTIVE scans the same (task, agent) pair survived
+    -- unclaimed — the award TTL input (recommend_awards drops a pair once
+    -- it exceeds coord_award_ttl: the manager stops re-awarding a task
+    -- nobody claims, instead of nagging forever).
     task_id INTEGER PRIMARY KEY,
     agent TEXT NOT NULL,
     score REAL NOT NULL,                    -- the Performance-Novelty score it won with
-    ts REAL NOT NULL
+    ts REAL NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 1
 );
 -- Co-Scientist tournament (agentics/coscientist): every simulated scientific
 -- debate between two hypotheses, with the exact Elo state transition. The
@@ -340,6 +413,58 @@ CREATE TABLE IF NOT EXISTS tournament_feedback (
     window_matches INTEGER NOT NULL,        -- how many debates it synthesised
     text TEXT NOT NULL
 );
+-- MAP-Elites QD archive (agentics/qd_elites.py): one ELITE per behaviour
+-- cell (mechanism x angle). Rejected/near-duplicate ideas are not thrown
+-- away — they compete INSIDE their cell, so the swarm keeps one good
+-- representative of every approach it ever tried instead of collapsing
+-- onto a single mode. Bounded to 400 cells.
+CREATE TABLE IF NOT EXISTS qd_cells (
+    cell_key TEXT PRIMARY KEY,              -- "mechanism|angle" (lowercased)
+    mechanism TEXT NOT NULL DEFAULT '',
+    angle TEXT NOT NULL DEFAULT '',
+    best_hyp_id INTEGER,
+    best_claim TEXT NOT NULL DEFAULT '',
+    best_quality REAL NOT NULL DEFAULT 0.0, -- gate Q / novelty, max kept
+    island INTEGER NOT NULL DEFAULT 0,      -- round-robin island assignment
+    ts REAL NOT NULL
+);
+-- GraphRAG-lite (agentics/research/kg_extract.py): entities + typed edges
+-- extracted from findings/settles. Context for research/ideation prompts is
+-- a PATH over this graph, not a flat finding list; bounded tables.
+CREATE TABLE IF NOT EXISTS kg_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,              -- lowercased entity name
+    kind TEXT NOT NULL DEFAULT '',          -- method | dataset | metric | concept
+    mentions INTEGER NOT NULL DEFAULT 1,
+    ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kg_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src INTEGER NOT NULL,
+    dst INTEGER NOT NULL,
+    rel TEXT NOT NULL DEFAULT '',           -- improves | uses | measures | ...
+    source_hyp INTEGER,                     -- hypothesis/finding provenance
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kg_edges_src ON kg_edges(src);
+CREATE INDEX IF NOT EXISTS idx_kg_edges_dst ON kg_edges(dst);
+-- Voyager-style skill library (wave-2 #1): protocols the lab SETTLED as
+-- supported get distilled into reusable, indexed skills. Distillation and
+-- retrieval run on the LOCAL router / plain token overlap — zero cookie
+-- cost; the compounding memory turns one-off protocol wins into the
+-- coder's starting point next time a similar claim appears.
+CREATE TABLE IF NOT EXISTS skill_library (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    code TEXT NOT NULL DEFAULT '',          -- full protocol source (settled)
+    metric TEXT NOT NULL DEFAULT '',
+    source_hyp INTEGER,                     -- the settle this came from
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded
+    ts REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_skill_library ON skill_library(status, ts);
 """
 
 
@@ -425,6 +550,42 @@ class SharedMemory:
                 "ALTER TABLE hypotheses ADD COLUMN elo REAL NOT NULL DEFAULT 1200",
                 "ALTER TABLE hypotheses ADD COLUMN matches_played INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE hypotheses ADD COLUMN parents TEXT NOT NULL DEFAULT '[]'",
+                # IDEAgent quintuple signature: {problem, mechanism, novelty,
+                # assumptions, effect} — compact identity for the QD
+                # diversity gates (near-duplicate PEM, coverage CCR).
+                "ALTER TABLE hypotheses ADD COLUMN signature TEXT NOT NULL DEFAULT '{}'",
+                # Discovery branching (2026-11-14 "branch on discovery" round):
+                # discovery=1 marks a settled result the ideator judged
+                # surprising vs the world model (novelty 0-100); depth keeps
+                # the branch level (children = parent.depth + 1, capped by
+                # branch_max_depth so a discovery tree cannot run away);
+                # branch stores the attack angle (mechanism / generalize /
+                # boundary / amplify) the child digs into.
+                "ALTER TABLE hypotheses ADD COLUMN discovery INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN novelty REAL NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE hypotheses ADD COLUMN branch TEXT NOT NULL DEFAULT ''",
+                # Settle anchor law (verdict provenance round): owner_approved
+                # is the local-only escape hatch — an input of the verdict
+                # the agent did NOT author; unanchored supported verdicts
+                # wait here (or for P24 replication) before becoming common
+                # ground.
+                "ALTER TABLE hypotheses ADD COLUMN owner_approved INTEGER NOT NULL DEFAULT 0",
+                # Wave-2 #5 reflection tree: world notes gain a DEPTH
+                # (0=raw note from a cycle, 1..3=synthesized insight) and
+                # the JSON ids of the notes each insight was synthesized
+                # FROM — provenance the dashboard renders and stale-insight
+                # downgrades walk.
+                "ALTER TABLE world_notes ADD COLUMN level INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE world_notes ADD COLUMN parents TEXT NOT NULL DEFAULT '[]'",
+                # experiment_ledger provenance columns: every settle records
+                # its self_authored_ratio (1.0 = fully self-graded) and the
+                # JSON list of external anchors that made the verdict trust-
+                # worthy (citation / peer_judge / replication / ...).
+                "ALTER TABLE experiment_ledger ADD COLUMN self_authored_ratio REAL",
+                "ALTER TABLE experiment_ledger ADD COLUMN anchors TEXT NOT NULL DEFAULT ''",
+                # Award TTL (2026-11-14): consecutive unclaimed re-award count
+                "ALTER TABLE task_awards ADD COLUMN hits INTEGER NOT NULL DEFAULT 1",
             ):                 # migrations for DBs created before LifeMem / dashboard
                 try:
                     self._conn.execute(column)
@@ -532,6 +693,98 @@ class SharedMemory:
             ).fetchone()
         return {"prompts": row[0], "uses": row[1], "successes": row[2],
                 "failures": row[3]}
+
+    # -------------------------------------- prompt variants (wave-2 #2)
+    _PROMPT_VARIANT_KEYS = ("id", "role", "category", "mission", "status",
+                            "origin", "ts", "uses", "wins", "losses")
+
+    def prompt_variants(self, role: str, category: str,
+                        limit: int = 8) -> list[dict]:
+        """The armed challenger pool for (role, category), oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, role, category, mission, status, origin, ts, "
+                "uses, wins, losses FROM prompt_variants "
+                "WHERE role=? AND category=? AND status='arm' "
+                "ORDER BY id ASC LIMIT ?", (role, category, limit)
+            ).fetchall()
+        return [dict(zip(self._PROMPT_VARIANT_KEYS, r)) for r in rows]
+
+    def store_prompt_variant(self, role: str, category: str, mission: str,
+                             origin: str = "mutate",
+                             pool_size: int = 3) -> int:
+        """Add one challenger arm; prune to the newest `pool_size` arms.
+        Returns the variant id (0 when the mission is unusable)."""
+        mission = (mission or "").strip()
+        if not mission:
+            return 0
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO prompt_variants (role, category, mission, "
+                "status, origin, ts) VALUES (?, ?, ?, 'arm', ?, ?)",
+                (role, category, mission[:4000], origin, time.time()))
+            vid = int(cur.lastrowid or 0)
+            # keep only the newest pool_size armed arms (retire the rest)
+            self._conn.execute(
+                "UPDATE prompt_variants SET status='retired' "
+                "WHERE role=? AND category=? AND status='arm' AND id NOT IN "
+                "(SELECT id FROM prompt_variants WHERE role=? AND category=? "
+                "AND status='arm' ORDER BY id DESC LIMIT ?)",
+                (role, category, role, category, max(1, int(pool_size))))
+        return vid
+
+    def record_prompt_variant_outcome(self, variant_id: int,
+                                      success: bool) -> None:
+        """Feed one cycle outcome into an armed variant (uses/wins/losses)."""
+        if not variant_id:
+            return
+        col = "wins" if success else "losses"
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE prompt_variants SET uses=uses+1, {col}={col}+1 "
+                "WHERE id=? AND status='arm'", (int(variant_id),))
+
+    def promote_prompt_variant(self, variant_id: int,
+                               min_uses: int, edge: float) -> bool:
+        """Promote an armed variant to champion when it BEATS the active
+        mission's win-rate by `edge` with at least `min_uses` samples.
+
+        Promotion goes through store_role_prompt, so the existing rework /
+        TTL machinery owns the new champion unchanged. Returns True on
+        promotion; not-enough-data returns False silently."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT role, category, mission, uses, wins FROM "
+                "prompt_variants WHERE id=? AND status='arm'",
+                (int(variant_id),)).fetchone()
+        if row is None or int(row[3]) < int(min_uses):
+            return False
+        role, category, mission = row[0], row[1], row[2]
+        var_rate = float(row[4]) / float(row[3])
+        champ = self.get_role_prompt(role, category)
+        champ_rate = 0.0
+        if champ is not None and int(champ.get("uses") or 0) > 0:
+            champ_rate = float(champ["successes"]) / float(champ["uses"])
+        if var_rate < champ_rate + float(edge):
+            return False
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE prompt_variants SET status='promoted' WHERE id=?",
+                (int(variant_id),))
+        self.store_role_prompt(role, category, mission,
+                               reason="prompt_evolved")
+        return True
+
+    def prompt_variant_stats(self) -> dict[str, int]:
+        """Owner-dashboard aggregate over the challenger pool."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(uses),0), "
+                "COALESCE(SUM(wins),0), "
+                "SUM(CASE WHEN status='promoted' THEN 1 ELSE 0 END) "
+                "FROM prompt_variants").fetchone()
+        return {"variants": row[0] or 0, "uses": row[1] or 0,
+                "wins": row[2] or 0, "promoted": row[3] or 0}
 
     def role_experience(self, role: str, category: str, limit: int = 8) -> str:
         """Recent traces of this (role, category) as digest lines for the
@@ -850,6 +1103,20 @@ class SharedMemory:
             ).fetchone()
         return int(row[0] if row else 0)
 
+    def llm_kth_oldest_call_ts(self, window_s: float = 3600.0,
+                               k: int = 1) -> float | None:
+        """Timestamp of the k-th OLDEST call inside the sliding window —
+        the anchor for P20's retry hint: when this call exits the window
+        (ts + window_s), `used` drops by one. None when fewer than k calls."""
+        k = max(int(k), 1)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ts FROM llm_usage WHERE ts > ? ORDER BY ts ASC "
+                "LIMIT 1 OFFSET ?",
+                (time.time() - window_s, k - 1),
+            ).fetchone()
+        return float(row[0]) if row else None
+
     def llm_fail_streak(self, agent: str) -> int:
         """Consecutive failed calls by one agent (newest backwards) — the
         circuit breaker counts provider failures, not 'answered but slow'."""
@@ -951,6 +1218,7 @@ class SharedMemory:
         task_id: int | None = None, finding_id: int | None = None,
         protocol_path: str = "", status: str = "proposed",
         protocol_code: str = "", parents: list[int] | None = None,
+        depth: int = 0, branch: str = "",
     ) -> int:
         """Register a hypothesis BEFORE the protocol runs (pre-registration).
 
@@ -962,20 +1230,117 @@ class SharedMemory:
         `protocol_code` keeps the protocol source INSIDE memory, so a settled
         claim stays replayable even after P21 prunes the workspace.
         `parents` records the Co-Scientist evolution lineage (ids of the
-        hypotheses this one was bred from) — provenance, not verdict."""
+        hypotheses this one was bred from) — provenance, not verdict.
+        `depth`/`branch` keep the discovery-branch position: branch level
+        below the discovery root and the attack angle (mechanism /
+        generalize / boundary / amplify) this child digs into."""
         from agentics.verify.hypothesis import claim_hash as _chash
 
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO hypotheses (ts, agent, task_id, finding_id, claim, "
                 "criterion, protocol_path, status, claim_hash, protocol_code, "
-                "parents) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "parents, depth, branch) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), agent, task_id, finding_id, claim[:500],
                  json.dumps(criterion, ensure_ascii=False), protocol_path[:300],
                  status, _chash(claim), protocol_code[:20_000],
-                 json.dumps([int(p) for p in (parents or [])])),
+                 json.dumps([int(p) for p in (parents or [])]),
+                 max(0, int(depth)), (branch or "")[:40]),
             )
             return int(cur.lastrowid or 0)
+
+    def mark_discovery(self, hyp_id: int, novelty: float) -> bool:
+        """Flag a settled hypothesis as a DISCOVERY (novelty 0-100).
+
+        The ideator judged the measured result surprising against the world
+        model; the deep-dive backlog then prioritizes this subtree
+        (discovery_frontier) instead of rotating generic next ideas."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET discovery=1, novelty=? WHERE id=?",
+                (max(0.0, min(100.0, float(novelty))), hyp_id))
+        return cur.rowcount > 0
+
+    def owner_approve(self, hyp_id: int, note: str = "") -> bool:
+        """Owner escape hatch (local-only mode): the human explicitly
+        accepts a claim — a verdict input the agent did NOT author, so it
+        anchors the settle (self_authored_ratio drops below 1).
+
+        Journal event `owner_approved` carries the decision for the audit
+        trail. Idempotent: approving twice changes nothing (True only on
+        the FIRST approval)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET owner_approved=1 "
+                "WHERE id=? AND owner_approved=0",
+                (int(hyp_id),))
+            changed = cur.rowcount > 0
+            if changed:
+                self._conn.execute(
+                    "INSERT INTO journal (ts, agent, event, detail) "
+                    "VALUES (?,?,?,?)",
+                    (time.time(), "owner", "owner_approved", json.dumps({
+                        "hyp": int(hyp_id), "note": (note or "")[:300],
+                    }, ensure_ascii=False)))
+        return changed
+
+    def settle_anchor_state(self, hyp_id: int) -> dict:
+        """The anchor flags a settle can read from the hypothesis row itself:
+        independent replication confirmed (P24) and owner approval. Everything
+        else (citations, peer judge, pinned data) comes from the settle site's
+        own context and is passed in separately."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT replication, owner_approved FROM hypotheses "
+                "WHERE id=?", (int(hyp_id),)).fetchone()
+        if row is None:
+            return {"replicated": False, "owner_approved": False}
+        return {"replicated": (row[0] or "") == "confirmed",
+                "owner_approved": bool(row[1])}
+
+    def nearest_discovery_ancestor(self, hyp_id: int) -> dict | None:
+        """The NEAREST discovery root in this hypothesis's lineage (the row
+        itself when it IS a discovery). Bandit feedback input: a branch
+        settle must credit/debit the discovery it grew from.
+
+        Cycle-safe (visited set); returns the full discovery row or None
+        when no ancestor is flagged."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, parents, discovery FROM hypotheses").fetchall()
+            pm: dict[int, list[int]] = {}
+            for pid, praw, _disc in rows:
+                try:
+                    pm[pid] = json.loads(praw or "[]")
+                except json.JSONDecodeError:
+                    pm[pid] = []
+        frontier_ids = [int(hyp_id)]
+        seen: set[int] = set()
+        while frontier_ids:
+            pid = frontier_ids.pop(0)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            row = self.get_hypothesis(pid)
+            if row is not None and row.get("discovery"):
+                return row
+            frontier_ids.extend(pm.get(pid, []))
+        return None
+
+    def discovery_reinforce(self, disc_id: int, bonus: float = 5.0) -> float:
+        """Boost a discovery's novelty when a branch settles SUPPORTED
+        (bandit reward: evidence that the finding is real and worth digging
+        into). Capped at 100. Returns the new novelty."""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT novelty FROM hypotheses WHERE id=?", (disc_id,)
+            ).fetchone()
+            nov = min(100.0, float(row[0] or 0.0) + max(0.0, float(bonus))) \
+                if row else 0.0
+            self._conn.execute(
+                "UPDATE hypotheses SET novelty=?, discovery=1 WHERE id=?",
+                (nov, disc_id))
+        return nov
 
     def settled_hypothesis_for_claim(self, claim: str) -> dict | None:
         """The swarm's SETTLED verdict for this claim, if anyone already ran it.
@@ -1137,13 +1502,20 @@ class SharedMemory:
                 row["parents"] = json.loads(r[17] or "[]")
             except json.JSONDecodeError:
                 row["parents"] = []
+        # Discovery branching columns (novelty detection round)
+        if len(r) > 21:
+            row["discovery"] = bool(r[18])
+            row["novelty"] = r[19]
+            row["depth"] = r[20]
+            row["branch"] = r[21]
         return row
 
     # canonical column list for get/list — _hypothesis_row reads positionally
     HYP_COLS = ("id, ts, agent, task_id, finding_id, claim, criterion, "
                 "protocol_path, status, verdict_note, evidence_id, attempts, "
                 "protocol_code, replication, replication_attempts, "
-                "elo, matches_played, parents")
+                "elo, matches_played, parents, discovery, novelty, depth, "
+                "branch")
 
     def hypotheses_needing_replication(self, agent: str, limit: int = 2) -> list[dict]:
         """P24 — settled claims whose stored protocol an INDEPENDENT agent
@@ -1159,8 +1531,11 @@ class SharedMemory:
         the same claim forever (the sweep re-checks newest-first for drift;
         this path replicates each claim ONCE per swarm).
 
-        A row qualifies when: the claim is SETTLED 'supported' (refuted and
-        inconclusive claims are dead ends / fresh runs, nothing to confirm),
+        A row qualifies when: the claim is SETTLED 'supported' — or the NEW
+        `unanchored` status (a machine verdict that PASSED its criterion but
+        rests entirely on agent-authored inputs; replication is exactly its
+        path to supported, so unanchored rows jump the queue) — refuted and
+        inconclusive claims are dead ends / fresh runs, nothing to confirm;
         the protocol source is stored (P23), the requesting agent is NOT the
         author, and the claim has not been replicated yet (or an earlier
         replication came back inconclusive — a sandbox hiccup — with fewer
@@ -1169,10 +1544,11 @@ class SharedMemory:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {self.HYP_COLS} FROM hypotheses "
-                "WHERE status='supported' AND protocol_code != '' AND agent != ? "
+                "WHERE status IN ('supported','unanchored') "
+                "AND protocol_code != '' AND agent != ? "
                 "AND (replication = '' OR (replication = 'inconclusive' "
                 "     AND replication_attempts < 2)) "
-                "ORDER BY id ASC LIMIT ?",
+                "ORDER BY (status = 'unanchored') DESC, id ASC LIMIT ?",
                 (agent, limit),
             ).fetchall()
         return [self._hypothesis_row(r) for r in rows]
@@ -1354,18 +1730,816 @@ class SharedMemory:
                 for r in rows]
 
     def settled_hypotheses(self, limit: int = 20,
-                           require_code: bool = False) -> list[dict]:
+                           require_code: bool = False,
+                           cooldown_s: float = 0,
+                           max_replays: int = 0) -> list[dict]:
         """Settled (supported|refuted) hypotheses, newest first — the replay
         sweep's input. `require_code` keeps only claims whose protocol source
-        is stored (replayable), so P21-pruned legacy claims are skipped."""
-        sql = (f"SELECT {self.HYP_COLS} FROM hypotheses "
-               "WHERE status IN ('supported','refuted')")
+        is stored (replayable), so P21-pruned legacy claims are skipped.
+
+        Flood control (live 2026-11-14: with only two replayable claims the
+        supervisors re-ran the SAME two protocols every sweep, flooding the
+        evidence ledger with hundreds of duplicate rows):
+        - cooldown_s: skip claims whose LAST replay evidence is younger than
+          this many seconds (0 = no cooldown);
+        - max_replays: skip claims already replayed this many times (0 = cap
+          off) — a claim confirmed K times adds no information on run K+1."""
+        sql = [f"SELECT {self.HYP_COLS} FROM hypotheses h",
+               "WHERE h.status IN ('supported','refuted')"]
         if require_code:
-            sql += " AND protocol_code != ''"
-        sql += " ORDER BY id DESC LIMIT ?"
+            sql.append(" AND h.protocol_code != ''")
+        if max_replays > 0:
+            sql.append(" AND (SELECT COUNT(*) FROM evidence e "
+                       "WHERE e.hypothesis_id = h.id AND e.method = 'replay') < ?")
+        if cooldown_s > 0:
+            sql.append(" AND (SELECT COALESCE(MAX(e.ts), 0) FROM evidence e "
+                       "WHERE e.hypothesis_id = h.id AND e.method = 'replay') < ?")
+        sql.append(" ORDER BY h.id DESC LIMIT ?")
+        args: list = []
+        if max_replays > 0:
+            args.append(max_replays)
+        if cooldown_s > 0:
+            args.append(time.time() - cooldown_s)
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute("\n".join(sql), args).fetchall()
+        return [self._hypothesis_row(r) for r in rows]
+
+    def proposed_hypotheses(self, limit: int = 3) -> list[dict]:
+        """P16bis registry backlog: `proposed` claims with NO protocol yet,
+        OLDEST first. These are the hypotheses the swarm pre-registered (or
+        the tournament evolution bred) but nothing ever turned into a
+        runnable experiment — the deep-dive backlog node_research works
+        through when the literature topic is already saturated."""
+        sql = (f"SELECT {self.HYP_COLS} FROM hypotheses "
+               "WHERE status = 'proposed' AND protocol_code = '' "
+               "ORDER BY id ASC LIMIT ?")
         with self._lock:
             rows = self._conn.execute(sql, (limit,)).fetchall()
         return [self._hypothesis_row(r) for r in rows]
+
+    def discovery_frontier(self, limit: int = 3,
+                           max_depth: int = 4) -> list[dict]:
+        """Discovery-driven branch frontier — the deep-dive backlog's PRIORITY
+        slice (2026-11-14 novelty round, the "recognize a breakthrough and
+        dig into it" mechanism).
+
+        Returns `proposed`, protocol-less hypotheses that descend from ANY
+        discovery (a parent chain reaching a row with discovery=1), bounded
+        to `max_depth` below the registry root (priority decays with branch
+        level so a discovery tree cannot monopolize the backlog forever).
+        Ordering: shallowest first (BFS over the discovery tree), ties by id
+        — the loop digs BREADTH-first into a new finding instead of chasing
+        one branch to exhaustion before the others.
+
+        Non-discovery proposals are deliberately excluded here; they compete
+        through the ordinary CCR coverage order."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                "WHERE status='proposed' AND protocol_code='' AND depth <= ? "
+                "ORDER BY id ASC", (max(0, int(max_depth)),)).fetchall()
+            parents_map = self._conn.execute(
+                "SELECT id, parents, discovery FROM hypotheses").fetchall()
+        pm: dict[int, list[int]] = {}
+        discoveries: set[int] = set()
+        for pid, praw, disc in parents_map:
+            try:
+                pm[pid] = json.loads(praw or "[]")
+            except json.JSONDecodeError:
+                pm[pid] = []
+            if disc:
+                discoveries.add(pid)
+        out = []
+        for r in rows:
+            h = self._hypothesis_row(r)
+            # walk the parent chain (bounded: cycle-safe via visited set)
+            seen: set[int] = set()
+            frontier_ids = list(h.get("parents") or [])
+            is_branch = False
+            while frontier_ids:
+                pid = frontier_ids.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in discoveries:
+                    is_branch = True
+                    break
+                frontier_ids.extend(pm.get(pid, []))
+            if is_branch:
+                out.append(h)
+            if len(out) >= limit:
+                break
+        out.sort(key=lambda h: (h.get("depth", 0), h["id"]))
+        return out[:limit]
+
+    # --------------------------------------------- C2: PUCT frontier (TTT)
+    def _subtree_maps(self) -> tuple[dict[int, list[int]], set[int]]:
+        """(children map, discovery roots) over the whole hypothesis table."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, parents, discovery FROM hypotheses").fetchall()
+        children: dict[int, list[int]] = {}
+        discoveries: set[int] = set()
+        for pid, praw, disc in rows:
+            try:
+                for par in json.loads(praw or "[]"):
+                    children.setdefault(int(par), []).append(pid)
+            except json.JSONDecodeError:
+                continue
+            if disc:
+                discoveries.add(pid)
+        return children, discoveries
+
+    def _subtree_settles(self, root_ids: set[int],
+                         children: dict[int, list[int]]) -> dict[int, list[dict]]:
+        """experiment_ledger settle rows GROUPED BY frontier root: every
+        settle whose hyp_id lies inside the subtree of any root. This is
+        the PUCT buffer — n(s), Q(s) read from it, no schema change."""
+        if not root_ids:
+            return {}
+        with self._lock:
+            all_rows = self._conn.execute(
+                "SELECT hyp_id, status, measured, op, target, "
+                "self_authored_ratio, metric, anchors "
+                "FROM experiment_ledger").fetchall()
+        # map ledger hyp_id -> its frontier root
+        roots_of: dict[int, int] = {}
+        for rid in root_ids:
+            for mid in {rid, *self._descendants(rid, children)}:
+                roots_of[mid] = rid
+        led: dict[int, list[dict]] = {}
+        for (hid, status, measured, op, target, ratio, metric, anchors) in all_rows:
+            if hid is None:
+                continue
+            led.setdefault(int(hid), []).append({
+                "hyp_id": int(hid), "status": status,
+                "measured": measured, "op": op or "", "target": target,
+                "self_authored_ratio": ratio, "metric": metric or "",
+                "anchors": anchors or "",
+            })
+        out: dict[int, list[dict]] = {}
+        for hid, rows in led.items():
+            root = roots_of.get(hid)
+            if root is not None:
+                out.setdefault(root, []).extend(rows)
+        return out
+
+    @staticmethod
+    def _descendants(rid: int, children: dict[int, list[int]]) -> set[int]:
+        out: set[int] = set()
+        stack = list(children.get(rid, []))
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            out.add(cur)
+            stack.extend(children.get(cur, []))
+        return out
+
+    def discovery_frontier_puct(self, limit: int = 3, max_depth: int = 4,
+                                c: float = 1.0,
+                                reward_scale: str = "target",
+                                eig_weight: float = 0.0) -> list[dict]:
+        """C2 (TTT_DISCOVER.md): the discovery frontier scored by the
+        paper's PUCTSampler instead of plain BFS order, refined by wave-2
+        #3's expected-information-gain-per-cost term (Bayesian experimental
+        design on the settle ledger): a metric the ledger has answered the
+        same way twenty times buys nothing, an unexplored one buys up to
+        ln2 nats. eig_weight=0 restores the pure PUCT order.
+
+            score(s) = Q(s) + c * scale * P(s) * sqrt(1+T) / (1 + n(s))
+
+        Q(s) = MAX reward among settled descendants (best outcome reachable
+        FROM a state, never the average); unexpanded states proxy Q by
+        novelty/100. P(s) = rank prior over the buffer's Q values. n(s) =
+        settles in s's subtree — the exploitation bonus DECAYS as a branch
+        is dug into, which is the structural cure for rich-get-richer.
+        Falls back to the BFS order for every degenerate buffer (no
+        settles, single candidate, zero Q range)."""
+        from agentics.verify.reward import reward_from_row, reward_stats
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self.HYP_COLS} FROM hypotheses "
+                "WHERE status='proposed' AND protocol_code='' AND depth <= ? "
+                "ORDER BY id ASC", (max(0, int(max_depth)),)).fetchall()
+        hyps = [self._hypothesis_row(r) for r in rows]
+        if not hyps:
+            return []
+        children, discoveries = self._subtree_maps()
+        # keep only discovery branches (same rule as discovery_frontier)
+        branches = []
+        for h in hyps:
+            seen: set[int] = set()
+            stack = list(h.get("parents") or [])
+            is_branch = False
+            while stack:
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in discoveries:
+                    is_branch = True
+                    break
+                stack.extend(children.get(pid, []))
+            if is_branch:
+                branches.append(h)
+        if not branches:
+            return []
+        # PUCT states are the BRANCHES themselves: n(s)/Q(s) read from the
+        # settles inside each branch's OWN subtree (not the whole discovery
+        # root's), per the paper — "the best outcome starting FROM a state".
+        settles_by_branch = self._subtree_settles(
+            {int(h["id"]) for h in branches}, children)
+
+        stats_by_root: dict[int, dict] = {}
+        for rid, rws in settles_by_branch.items():
+            stats_by_root[rid] = reward_stats(rws, scale=reward_scale)
+        T = sum(len(s["rewards"]) for s in stats_by_root.values())
+
+        def q_of(h: dict) -> float:
+            s = stats_by_root.get(int(h["id"]))
+            if s and s["rewards"]:
+                return s["best"]           # MAX, per the paper
+            return min(1.0, max(0.0, float(h.get("novelty") or 0.0) / 100.0))
+
+        def n_of(h: dict) -> int:
+            s = stats_by_root.get(int(h["id"]))
+            return len(s["rewards"]) if s else 0
+
+        qs = [q_of(h) for h in branches]
+        qmax, qmin = max(qs), min(qs)
+        scale = (qmax - qmin) if qmax > qmin else 0.0
+        ranks = sorted(range(len(branches)),
+                       key=lambda i: -qs[i])
+        prior_sum = sum(len(ranks) - r for r in range(len(ranks))) or 1
+        priors: dict[int, float] = {}
+        for r, idx in enumerate(ranks):
+            priors[idx] = (len(ranks) - r) / prior_sum
+        scored = []
+        for i, h in enumerate(branches):
+            n_i = n_of(h)
+            q_i = qs[i]
+            bonus = (c * scale * priors[i] * ((1.0 + T) ** 0.5) / (1 + n_i)
+                     if scale > 0 else 0.0)
+            entry = {**h, "puct_score": round(q_i + bonus, 4),
+                     "puct_q": round(q_i, 4), "puct_n": n_i,
+                     "puct_bonus": round(bonus, 4)}
+            # wave-2 #3: information-gain-per-cost refines the order inside
+            # the branch — pure PUCT stays when eig_weight is 0.
+            if eig_weight > 0.0:
+                try:
+                    from agentics.evolution.eig import eig_score
+                    entry.update(eig_score(self, h))
+                    entry["puct_score"] = round(
+                        q_i + bonus + eig_weight * entry["eig_score"], 4)
+                except Exception:  # noqa: BLE001 — EIG is sugar
+                    pass
+            scored.append(entry)
+        scored.sort(key=lambda h: -h["puct_score"])
+        # lineage blocking: never return two candidates sharing a parent
+        # (or the same discovery root) in one batch
+        out: list[dict] = []
+        taken_parents: set[int] = set()
+        taken_roots: set[int] = set()
+
+        def ancestor_roots(h: dict) -> set[int]:
+            seen: set[int] = set()
+            stack = list(h.get("parents") or [])
+            found: set[int] = set()
+            while stack:
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if pid in discoveries:
+                    found.add(pid)
+                stack.extend(children.get(pid, []))
+            return found
+
+        for h in scored:
+            parents = {int(p) for p in (h.get("parents") or [])}
+            roots_here = ancestor_roots(h)
+            if parents & taken_parents or roots_here & taken_roots:
+                continue
+            out.append(h)
+            taken_parents |= parents
+            taken_roots |= roots_here
+            if len(out) >= limit:
+                break
+        return out
+
+    def best_reward(self) -> float:
+        """C4 — r_sota: the best continuous reward among ANCHORED supported
+        settles (unanchored rows are validity fails, never rewards)."""
+        from agentics.verify.reward import reward_from_row
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, measured, op, target, self_authored_ratio "
+                "FROM experiment_ledger WHERE status='supported' AND "
+                "self_authored_ratio IS NOT NULL AND "
+                "self_authored_ratio < 1.0 AND anchors != ''").fetchall()
+        keys = ("status", "measured", "op", "target", "self_authored_ratio")
+        rewards = [reward_from_row(dict(zip(keys, r))) for r in rows]
+        return max(rewards, default=0.0)
+
+    def discovery_subtree_rewards(self, root_id: int,
+                                  scale: str = "target") -> list[dict]:
+        """C3 input: every settled ledger row inside the discovery root's
+        subtree, each with its continuous reward attached (0 for
+        refuted/unanchored — the settle anchor law is the validity check)."""
+        from agentics.verify.reward import reward_from_row
+        children, _disc = self._subtree_maps()
+        rows = self._subtree_settles({int(root_id)}, children).get(
+            int(root_id), [])
+        span_rows = [r for r in rows if r.get("measured") is not None]
+        vals = [float(r["measured"]) for r in span_rows]
+        span = (max(vals) - min(vals)) if len(vals) >= 2 else None
+        out = []
+        for r in rows:
+            r = dict(r)
+            r["reward"] = reward_from_row(r, scale=scale, history_span=span)
+            out.append(r)
+        return out
+
+    # --------------------------------------------- MAP-Elites QD archive
+    def qd_record(self, mechanism: str, angle: str, hyp_id: int | None,
+                  claim: str, quality: float) -> str:
+        """Archive ONE candidate into its behaviour cell (mechanism x angle).
+        The cell keeps the BEST-quality representative (MAP-Elites elite);
+        a weaker newcomer updates nothing but still proves the cell is
+        occupied. Island assignment is round-robin over insertion order.
+        Returns the cell key."""
+        mech = (mechanism or "unknown").strip().lower()[:60] or "unknown"
+        ang = (angle or "core").strip().lower()[:60] or "core"
+        key = f"{mech}|{ang}"
+        with self._lock, self._conn:
+            n = self._conn.execute(
+                "SELECT COUNT(*) FROM qd_cells").fetchone()[0]
+            island = int(n) % 8
+            row = self._conn.execute(
+                "SELECT best_quality FROM qd_cells WHERE cell_key=?",
+                (key,)).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO qd_cells (cell_key, mechanism, angle, "
+                    "best_hyp_id, best_claim, best_quality, island, ts) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (key, mech, ang, hyp_id, (claim or "")[:300],
+                     max(0.0, float(quality)), island, time.time()))
+            elif float(quality) > float(row[0]):
+                self._conn.execute(
+                    "UPDATE qd_cells SET best_hyp_id=?, best_claim=?, "
+                    "best_quality=?, ts=? WHERE cell_key=?",
+                    (hyp_id, (claim or "")[:300], float(quality),
+                     time.time(), key))
+            self._conn.execute(
+                "DELETE FROM qd_cells WHERE cell_key NOT IN "
+                "(SELECT cell_key FROM qd_cells ORDER BY best_quality DESC "
+                "LIMIT 400)")
+        return key
+
+    def qd_cells_list(self, limit: int = 40) -> list[dict]:
+        """Archived elites, best first (ideation hint + dashboard)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT cell_key, mechanism, angle, best_hyp_id, best_claim, "
+                "best_quality, island FROM qd_cells "
+                "ORDER BY best_quality DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for r in rows:
+            out.append({"cell": r[0], "mechanism": r[1], "angle": r[2],
+                        "hyp_id": r[3], "claim": r[4], "quality": r[5],
+                        "island": r[6]})
+        return out
+
+    def qd_underexplored(self, taxonomy: list[str], limit: int = 5) -> list[str]:
+        """Mechanisms from `taxonomy` (agentics/diversity.classify) that the
+        archive has NO elite for — the saturation pivot's target list."""
+        with self._lock:
+            have = {r[0] for r in self._conn.execute(
+                "SELECT DISTINCT mechanism FROM qd_cells").fetchall()}
+        missing = [m for m in taxonomy if m.lower() not in have]
+        return missing[:max(0, int(limit))]
+
+    # --------------------------------------------- GraphRAG-lite
+    def kg_entity(self, name: str, kind: str = "") -> int | None:
+        """Upsert one entity (case-insensitive name); mentions increment."""
+        clean = (name or "").strip().lower()[:80]
+        if not clean:
+            return None
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name=?", (clean,)).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE kg_entities SET mentions=mentions+1, "
+                    "kind=CASE WHEN kind='' THEN ? ELSE kind END WHERE id=?",
+                    ((kind or "")[:40], row[0]))
+                return int(row[0])
+            cur = self._conn.execute(
+                "INSERT INTO kg_entities (name, kind, mentions, ts) "
+                "VALUES (?,?,1,?)", (clean, (kind or "")[:40], time.time()))
+            self._conn.execute(
+                "DELETE FROM kg_entities WHERE id NOT IN "
+                "(SELECT id FROM kg_entities ORDER BY mentions DESC LIMIT 400)")
+            return int(cur.lastrowid or 0) or None
+
+    def kg_edge(self, src: str, dst: str, rel: str,
+                source_hyp: int | None = None) -> bool:
+        """One typed edge src -rel-> dst; entities auto-upserted."""
+        with self._lock:
+            a = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name=?",
+                ((src or "").strip().lower()[:80],)).fetchone()
+            b = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name=?",
+                ((dst or "").strip().lower()[:80],)).fetchone()
+        if not a or not b or int(a[0]) == int(b[0]):
+            return False
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO kg_edges (src, dst, rel, source_hyp, ts) "
+                "VALUES (?,?,?,?,?)",
+                (int(a[0]), int(b[0]), (rel or "related")[:40],
+                 source_hyp, time.time()))
+            self._conn.execute(
+                "DELETE FROM kg_edges WHERE id NOT IN "
+                "(SELECT id FROM kg_edges ORDER BY ts DESC LIMIT 2000)")
+        return True
+
+    def kg_context(self, terms: list[str], limit: int = 12) -> str:
+        """A PATH-based context block: entities matching any term plus their
+        outgoing/incoming edges, rendered as 'a -rel-> b (mentions)'. Empty
+        string when the graph has nothing relevant — callers just skip it."""
+        if not terms:
+            return ""
+        with self._lock:
+            ids: set[int] = set()
+            names: dict[int, str] = {}
+            for t in terms[:8]:
+                pat = f"%{str(t).strip().lower()[:60]}%"
+                for eid, name, kind, men in self._conn.execute(
+                        "SELECT id, name, kind, mentions FROM kg_entities "
+                        "WHERE name LIKE ? ORDER BY mentions DESC LIMIT 8",
+                        (pat,)).fetchall():
+                    ids.add(eid)
+                    names[eid] = name + (f" [{kind}]" if kind else "")
+            if not ids:
+                return ""
+            id_list = list(ids)[:40]
+            marks = ",".join("?" * len(id_list))
+            edges = self._conn.execute(
+                f"SELECT src, dst, rel FROM kg_edges WHERE src IN ({marks}) "
+                f"OR dst IN ({marks}) ORDER BY ts DESC LIMIT ?",
+                (*id_list, *id_list, limit)).fetchall()
+            # neighbor entities must be rendered too, or every edge to an
+            # unseeded node would be silently dropped
+            neighbor_ids = ({int(s) for s, _d, _r in edges}
+                            | {int(d) for _s, d, _r in edges}) - ids
+            for nid in neighbor_ids:
+                row = self._conn.execute(
+                    "SELECT id, name, kind FROM kg_entities WHERE id=?",
+                    (nid,)).fetchone()
+                if row:
+                    ids.add(row[0])
+                    names[row[0]] = row[1] + (f" [{row[2]}]" if row[2] else "")
+            lines: list[str] = []
+        for src, dst, rel in edges:
+            if src in names and dst in names:
+                lines.append(f"- {names[src]} --{rel}--> {names[dst]}")
+        if not lines:
+            return ""
+        return "\n".join(sorted(set(lines))[:limit])
+
+    # ------------------------------------- skill library (wave-2 #1)
+    def add_skill(self, name: str, description: str, code: str = "",
+                  metric: str = "", source_hyp: int | None = None,
+                  max_skills: int = 120) -> int:
+        """Store one distilled skill. One skill per source settle (the
+        UNIQUE-ish gate lives here): re-settling the same hypothesis
+        refreshes the row instead of duplicating it. Bounded table —
+        oldest, least-used skills fall off past `max_skills`."""
+        name = (name or "").strip()
+        if not name:
+            return 0
+        with self._lock, self._conn:
+            prior = None
+            if source_hyp is not None:
+                prior = self._conn.execute(
+                    "SELECT id FROM skill_library WHERE source_hyp=? "
+                    "AND status='active'", (int(source_hyp),)).fetchone()
+            if prior:
+                self._conn.execute(
+                    "UPDATE skill_library SET name=?, description=?, code=?, "
+                    "metric=?, ts=? WHERE id=?",
+                    (name[:120], (description or "")[:600], code[:20000],
+                     (metric or "")[:60], time.time(), prior[0]))
+                return int(prior[0])
+            cur = self._conn.execute(
+                "INSERT INTO skill_library (name, description, code, "
+                "metric, source_hyp, status, ts) VALUES (?,?,?,?,?,'active',?)",
+                (name[:120], (description or "")[:600], code[:20000],
+                 (metric or "")[:60], source_hyp, time.time()))
+            vid = int(cur.lastrowid or 0)
+            self._conn.execute(
+                "UPDATE skill_library SET status='superseded' WHERE id NOT IN "
+                "(SELECT id FROM skill_library ORDER BY uses DESC, id DESC "
+                "LIMIT ?)", (max(1, int(max_skills)),))
+            return vid
+
+    def library_skills(self, limit: int = 40) -> list[dict]:
+        """Active skills, most-used first (retrieval + dashboard feed)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, name, description, code, metric, source_hyp, "
+                "ts, uses FROM skill_library WHERE status='active' "
+                "ORDER BY uses DESC, id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r[0], "name": r[1], "description": r[2], "code": r[3],
+                 "metric": r[4], "source_hyp": r[5], "ts": r[6],
+                 "uses": r[7]} for r in rows]
+
+    def skill_for_hyp(self, hyp_id: int | None) -> dict | None:
+        """The skill distilled from this hypothesis' settle, if any."""
+        if hyp_id is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM skill_library WHERE source_hyp=? "
+                "AND status='active'", (int(hyp_id),)).fetchone()
+        return None if row is None else next(
+            (s for s in self.library_skills(limit=500)
+             if s["id"] == row[0]), None)
+
+    def bump_skill_uses(self, skill_ids: list[int]) -> None:
+        with self._lock, self._conn:
+            for sid in skill_ids:
+                self._conn.execute(
+                    "UPDATE skill_library SET uses=uses+1 WHERE id=?",
+                    (int(sid),))
+
+    def skill_library_stats(self) -> dict[str, int]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(uses),0) FROM skill_library "
+                "WHERE status='active'").fetchone()
+        return {"skills": row[0] or 0, "uses": row[1] or 0}
+
+    def recent_hypotheses(self, limit: int = 12) -> list[dict]:
+        """Newest hypotheses across ALL statuses with their QD signature.
+
+        Input for the diversity gates (agentics/diversity.py): the PEM
+        near-duplicate check and the CCR coverage window. Deliberately NOT
+        filtered by status — a proposed near-clone of a rejected idea is
+        exactly what the gate must catch."""
+        sql = ("SELECT id, claim, status, signature FROM hypotheses "
+               "ORDER BY id DESC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, (limit,)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                sig = json.loads(r[3] or "{}")
+            except ValueError:
+                sig = {}
+            out.append({"id": r[0], "claim": r[1], "status": r[2],
+                        "signature": sig})
+        return out
+
+    def set_hypothesis_signature(self, hyp_id: int, sig: dict) -> bool:
+        """Store the IDEAgent quintuple {problem, mechanism, novelty,
+        assumptions, effect} on a hypothesis (idempotent overwrite)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE hypotheses SET signature=? WHERE id=?",
+                (json.dumps(sig or {}, ensure_ascii=False), hyp_id))
+        return cur.rowcount > 0
+
+    # ------------------------------------------------- Kosmos world model
+    def world_add(self, agent: str, kind: str, text: str, source: str = "",
+                  level: int = 0, parents: list[int] | None = None) -> int:
+        """Append one structured note to the shared world model.
+
+        kind: finding | verified | refuted | gap | question | insight
+        (wave-2 #5: `insight` notes carry a reflection `level` >= 1 and
+        the `parents` ids they were synthesized FROM). Bounded state: the
+        table keeps at most the newest 400 notes (a world model is a
+        summary, not a ledger — the full history lives in evidence/
+        journal)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO world_notes (ts, agent, kind, text, source, "
+                "level, parents) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), agent, kind, (text or "")[:400],
+                 (source or "")[:60], max(0, min(3, int(level))),
+                 json.dumps(parents or [], ensure_ascii=False)))
+            self._conn.execute(
+                "DELETE FROM world_notes WHERE id NOT IN "
+                "(SELECT id FROM world_notes ORDER BY id DESC LIMIT 400)")
+        return cur.lastrowid
+
+    def world_items(self, kind: str | None = None, limit: int = 20) -> list[dict]:
+        cols = "id, ts, agent, kind, text, source, level, parents"
+        with self._lock:
+            if kind:
+                rows = self._conn.execute(
+                    f"SELECT {cols} FROM world_notes "
+                    "WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit)
+                ).fetchall()
+            else:
+                # DISCOVERY notes are PINNED above the stream: the world
+                # model is the swarm's context, and its breakthroughs must
+                # not age out under routine verified/refuted notes.
+                pinned = self._conn.execute(
+                    f"SELECT {cols} FROM world_notes "
+                    "WHERE text LIKE 'DISCOVERY(%' "
+                    "ORDER BY id DESC LIMIT ?", (min(4, limit),)).fetchall()
+                rows = list(pinned)
+                if pinned:
+                    placeholders = ",".join("?" * len(pinned))
+                    rows += self._conn.execute(
+                        f"SELECT {cols} "
+                        "FROM world_notes WHERE id NOT IN ("
+                        + placeholders + ") ORDER BY id DESC LIMIT ?",
+                        (*[r[0] for r in pinned], limit - len(pinned)),
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        f"SELECT {cols} "
+                        "FROM world_notes ORDER BY id DESC LIMIT ?",
+                        (limit,)).fetchall()
+        return [{"id": r[0], "ts": r[1], "agent": r[2], "kind": r[3],
+                 "text": r[4], "source": r[5], "level": r[6] if len(r) > 6 else 0,
+                 "parents": (json.loads(r[7]) if len(r) > 7 and r[7]
+                             else [])}
+                for r in rows]
+
+    def world_render(self, limit: int = 12) -> str:
+        """World model as bounded prompt text (Kosmos consumption side).
+        Insights (wave-2 #5) render with their reflection depth so prompts
+        distinguish synthesized patterns from raw cycle notes."""
+        items = self.world_items(limit=limit)
+        if not items:
+            return ""
+        mark = {"finding": "FINDING", "verified": "VERIFIED",
+                "refuted": "REFUTED", "gap": "GAP", "question": "QUESTION",
+                "insight": "INSIGHT"}
+        lines = []
+        for i in items:
+            tag = mark.get(i["kind"], i["kind"].upper())
+            if i.get("level"):
+                tag = f"{tag}-L{i['level']}"
+            lines.append(f"- [{tag}] {i['text'][:200]}"
+                         f" ({i['source']})")
+        return "\n".join(lines)
+
+    # --------------------------------- ideation closed loop (QD pipeline)
+    # autoresearch ledger: keep/discard history of EVERY settle; IDEAgent
+    # rejected-pattern archive: compact failure memory for seed prompts;
+    # testable_hypotheses: the deep-dive retry pool (near-misses first).
+    def record_experiment(
+        self, agent: str, hyp_id: int | None, status: str, metric: str = "",
+        measured: float | None = None, op: str = "", target: float | None = None,
+        verdict_note: str = "", protocol_path: str = "", source: str = "",
+        description: str = "", self_authored_ratio: float | None = None,
+        anchors: str = "",
+    ) -> int:
+        """Append one settle to the experiment ledger (autoresearch's
+        results.tsv: commit -> hyp_id, metric -> measured, status ->
+        supported|refuted|inconclusive, description -> verdict note).
+
+        Provenance (settle anchor law): `self_authored_ratio` is the share
+        of the verdict's deciding inputs the agent authored (1.0 = fully
+        self-graded); `anchors` is the JSON list of external anchor kinds
+        that made the verdict trustworthy. Both are None/'' for rows that
+        predate the law or carry no machine verdict.
+
+        C4 (TTT_DISCOVER.md): an anchored-supported settle whose continuous
+        reward beats the previous best journals `new_state_of_the_art` —
+        the paper's formal discovery event (R(s) > r_sota), independent of
+        the subjective novelty grade."""
+        from agentics.verify.reward import reward_from_row
+
+        reward = 0.0
+        if (status == "supported" and self_authored_ratio is not None
+                and float(self_authored_ratio) < 1.0):
+            reward = reward_from_row({
+                "status": status, "measured": measured, "op": op,
+                "target": target, "self_authored_ratio": self_authored_ratio,
+            })
+        with self._lock, self._conn:
+            prev_best = self._conn.execute(
+                "SELECT MAX(id) FROM experiment_ledger").fetchone()
+            prev_rows = []
+            if prev_best and prev_best[0]:
+                prev_rows = self._conn.execute(
+                    "SELECT status, measured, op, target, self_authored_ratio "
+                    "FROM experiment_ledger WHERE status='supported' AND "
+                    "self_authored_ratio IS NOT NULL AND "
+                    "self_authored_ratio < 1.0 AND anchors != ''").fetchall()
+            cur = self._conn.execute(
+                "INSERT INTO experiment_ledger (ts, agent, hyp_id, status, "
+                "metric, measured, op, target, verdict_note, protocol_path, "
+                "source, description, self_authored_ratio, anchors) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), agent, hyp_id, status, (metric or "")[:120],
+                 measured, (op or "")[:4], target, (verdict_note or "")[:400],
+                 (protocol_path or "")[:300], (source or "")[:40],
+                 (description or "")[:400], self_authored_ratio,
+                 (anchors or "")[:200]))
+            self._conn.execute(
+                "DELETE FROM experiment_ledger WHERE id NOT IN "
+                "(SELECT id FROM experiment_ledger ORDER BY id DESC LIMIT 500)")
+        if reward > 0.0 and (anchors or "").strip():
+            prev_rewards = [
+                reward_from_row(dict(zip(("status", "measured", "op",
+                                          "target", "self_authored_ratio"),
+                                         r)))
+                for r in prev_rows]
+            if reward > max(prev_rewards, default=0.0):
+                try:
+                    self.journal(agent, "new_state_of_the_art", {
+                        "hyp": hyp_id, "metric": (metric or "")[:120],
+                        "reward": round(reward, 4),
+                        "measured": measured, "op": op, "target": target,
+                    })
+                except Exception:  # noqa: BLE001 — telemetry never gates
+                    pass
+        return int(cur.lastrowid or 0)
+
+    def ledger_recent(self, limit: int = 50) -> list[dict]:
+        """Newest ledger rows, newest first (dashboard + audits)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, agent, hyp_id, status, metric, measured, op, "
+                "target, verdict_note, protocol_path, source, description, "
+                "self_authored_ratio, anchors "
+                "FROM experiment_ledger ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        keys = ("id", "ts", "agent", "hyp_id", "status", "metric", "measured",
+                "op", "target", "verdict_note", "protocol_path", "source",
+                "description", "self_authored_ratio", "anchors")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def add_rejected_pattern(self, agent: str, claim: str, mechanism: str,
+                             reason: str) -> int:
+        """Archive one REJECTED idea as a compact pattern (IDEAgent R store:
+        failure patterns, not full ideas, to keep seed prompts bounded)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO rejected_patterns (ts, agent, claim, mechanism, "
+                "reason) VALUES (?,?,?,?,?)",
+                (time.time(), agent, (claim or "")[:400],
+                 (mechanism or "")[:200], (reason or "")[:200]))
+            self._conn.execute(
+                "DELETE FROM rejected_patterns WHERE id NOT IN "
+                "(SELECT id FROM rejected_patterns ORDER BY id DESC LIMIT 100)")
+        return int(cur.lastrowid or 0)
+
+    def rejected_render(self, limit: int = 8) -> str:
+        """Compact rejected-pattern list for ideation seed prompts."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mechanism, claim, reason FROM rejected_patterns "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        lines = []
+        for mech, claim, reason in rows:
+            head = mech or "unknown"
+            lines.append(f"- {head[:60]}: {(claim or '')[:100]}"
+                         + (f" (rejected: {reason[:80]})" if reason else ""))
+        return "\n".join(lines)
+
+    def testable_hypotheses(self, limit: int = 6,
+                            max_attempts: int = 2) -> list[dict]:
+        """Deep-dive backlog v2: fresh `proposed` claims PLUS bounded
+        near-miss RETRIES.
+
+        Retry pool (autoresearch): `inconclusive` hypotheses whose protocol
+        run measured nothing usable get another attempt — with the previous
+        failure note in the prompt — until `max_attempts` is exhausted, so
+        one bad protocol draft does not permanently bury a claim. Retries
+        come first (closest to knowledge), fresh claims keep registry age
+        order. `attempts` is incremented by every update_hypothesis call,
+        which bounds the loop by construction."""
+        sql = ("SELECT id, ts, agent, task_id, finding_id, claim, criterion, "
+               "protocol_path, status, verdict_note, evidence_id, attempts, "
+               "protocol_code, replication, replication_attempts "
+               "FROM hypotheses "
+               "WHERE (status='proposed' AND protocol_code='') "
+               "OR (status='inconclusive' AND attempts < ?) "
+               "ORDER BY CASE WHEN status='inconclusive' THEN 0 ELSE 1 END, "
+               "id ASC LIMIT ?")
+        with self._lock:
+            rows = self._conn.execute(sql, (max_attempts, limit)).fetchall()
+        out = []
+        for r in rows:
+            row = self._hypothesis_row(r)
+            row["signature"] = {}
+            out.append(row)
+        return out
 
     # ------------------------------------- independent replication (P24bis)
     # The P24 ledger above (hypotheses.replication + selection) is the
@@ -1819,14 +2993,29 @@ class SharedMemory:
         The supervisor recomputes the FULL allocation every scan, so the
         table is deleted and re-inserted in one transaction — a stale award
         can never outlive one scan, and no per-row cleanup is ever needed.
+        Rows may carry ``hits`` (consecutive unclaimed re-award count) from
+        the TTL bookkeeping in ``recommend_awards``; defaults to 1.
         """
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM task_awards")
             self._conn.executemany(
-                "INSERT INTO task_awards (task_id, agent, score, ts) VALUES (?,?,?,?)",
-                [(r["task_id"], r["agent"], float(r["score"]), time.time())
+                "INSERT INTO task_awards (task_id, agent, score, ts, hits) "
+                "VALUES (?,?,?,?,?)",
+                [(r["task_id"], r["agent"], float(r["score"]), time.time(),
+                  int(r.get("hits", 1)))
                  for r in rows],
             )
+
+    def task_awards_rows(self) -> list[dict]:
+        """Full award rows (task_id, agent, score, ts, hits) — the TTL
+        bookkeeping input for ``recommend_awards`` (which pairs have been
+        re-awarded how many consecutive scans without being claimed)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, agent, score, ts, hits FROM task_awards"
+            ).fetchall()
+        return [{"task_id": int(r[0]), "agent": r[1], "score": float(r[2]),
+                 "ts": float(r[3]), "hits": int(r[4] or 1)} for r in rows]
 
     def awards_for(self, agent: str) -> dict[int, float]:
         """Awards the supervisor currently holds for ``agent``: task_id -> score."""

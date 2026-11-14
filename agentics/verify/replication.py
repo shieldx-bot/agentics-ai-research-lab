@@ -107,11 +107,33 @@ def replicate_candidate(memory, workspace, hyp: dict, agent: str,
     memory.record_replication(hyp_id, ev.verdict)
 
     if ev.verdict == "confirmed":
-        event = "replication_confirmed"
+        # Settle anchor law: an `unanchored` claim (machine verdict that
+        # passed its criterion but rests entirely on agent-authored inputs)
+        # is PROMOTED to supported by this independent confirmation — the
+        # replication IS the external anchor it was waiting for.
+        promoted = (hyp.get("status") == "unanchored")
+        event = "replication_promoted" if promoted else "replication_confirmed"
+        if promoted:
+            memory.update_hypothesis(
+                hyp_id, "supported",
+                note=f"independently replicated by {agent}: {note}"[:600])
+            try:
+                crit_d = hyp.get("criterion") or {}
+                memory.record_experiment(
+                    agent, hyp_id, "supported",
+                    metric=str(crit_d.get("metric", "")),
+                    op=str(crit_d.get("op", "")), target=crit_d.get("target"),
+                    verdict_note=f"promoted by replication ({agent})"[:200],
+                    protocol_path=path, source="replication",
+                    description=(hyp.get("claim") or "")[:200],
+                    self_authored_ratio=0.75, anchors='["replication"]')
+            except Exception:  # noqa: BLE001 — ledger must never break the promote
+                pass
         memory.journal(agent, event, {
             "hyp": hyp_id, "claim": (hyp.get("claim") or "")[:160],
             "measured": ev.meta.get("metrics", {}),
             "criterion": criterion.describe(), "peer_evidence": rep_ev,
+            "promoted_to_supported": promoted,
         })
     elif ev.verdict == "refuted":
         # P24 contract: the caller closes a refuted replication — re-verdict

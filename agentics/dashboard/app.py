@@ -80,6 +80,16 @@ def _state(memory: SharedMemory, settings: Settings) -> dict:
             "calls_last_hour": memory.llm_calls_in_window(3600.0),
             "cap_per_hour": settings.llm_max_calls_per_hour,
         },
+        # C4 (TTT_DISCOVER.md) — the discovery objective: best continuous
+        # reward among anchored-supported settles (r_sota) + the newest
+        # record-setting events, the analogue of the paper's Figure 1 curve.
+        "discovery": {
+            "best_reward": round(memory.best_reward(), 4),
+            "sota_events": [
+                e for e in memory.recent_journal(limit=200)
+                if e.get("event") == "new_state_of_the_art"][:8],
+            "qd_cells": len(memory.qd_cells_list(limit=400)),
+        },
         "alerts": [
             e for e in memory.recent_journal(limit=120)
             if e.get("event") in ("integrity_drift", "scope_violation",

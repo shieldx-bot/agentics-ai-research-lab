@@ -106,13 +106,19 @@ def replay_hypothesis(
 
 
 def replay_settled(memory, workspace, limit: int = 20, agent: str = "owner",
-                   timeout: int = 120) -> list[dict]:
+                   timeout: int = 120, cooldown_s: float = 0,
+                   max_replays: int = 0) -> list[dict]:
     """Replicate the newest settled claims (that carry stored protocols).
 
     The owner's / supervisor's maintenance sweep: one broken claim never
-    aborts the batch — the report list is what the reviewer reads."""
+    aborts the batch — the report list is what the reviewer reads.
+    `cooldown_s` / `max_replays` are the flood-control gates passed straight
+    to `settled_hypotheses` (0 = off): claims replayed too recently or too
+    often are skipped instead of duplicating evidence rows."""
     out: list[dict] = []
-    for hyp in memory.settled_hypotheses(limit=limit, require_code=True):
+    for hyp in memory.settled_hypotheses(limit=limit, require_code=True,
+                                         cooldown_s=cooldown_s,
+                                         max_replays=max_replays):
         try:
             out.append(replay_hypothesis(memory, workspace, hyp["id"],
                                          agent=agent, timeout=timeout))

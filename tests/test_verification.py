@@ -202,7 +202,10 @@ def _settled(mem, ws, code, **kw):
     h = _hyp(code, **kw)
     hyp_id = register_hypothesis(mem, "a02", h)
     ev = run_hypothesis(ws, h)
-    ev_id = settle_hypothesis(mem, "a02", hyp_id, h, ev)
+    # citations=1: an external anchor (the settle anchor law downgrades an
+    # anchorless supported to `unanchored`; these tests cover the LIFECYCLE
+    # mechanics, the law itself has its own suite)
+    ev_id = settle_hypothesis(mem, "a02", hyp_id, h, ev, citations=1)
     return h, hyp_id, ev, ev_id
 
 

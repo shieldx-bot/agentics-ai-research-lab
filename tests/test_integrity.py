@@ -77,7 +77,7 @@ def test_manifest_survives_a_reload(tmp_path):
     path = tmp_path / "integrity" / "baseline.json"
     save_manifest(path, build_manifest(tmp_path))
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["version"] == 1 and load_manifest(path)["files"] == data["files"]
+    assert data["version"] == 2 and load_manifest(path)["files"] == data["files"]
 
 
 def test_orchestrator_startup_writes_the_integrity_baseline(tmp_path):

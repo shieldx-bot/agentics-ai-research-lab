@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import subprocess
 import time
 from pathlib import Path
 
@@ -36,6 +37,19 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _git_head(root: Path) -> str:
+    """Current HEAD commit of the project repo ('' when not a git repo —
+    tests use plain temp dirs; the guard must tolerate that)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=False, capture_output=True, text=True, timeout=15,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
 def build_manifest(root: Path) -> dict:
     """Hash every runtime-critical file under ``root`` (a project directory)."""
     files: dict[str, str] = {}
@@ -52,8 +66,9 @@ def build_manifest(root: Path) -> dict:
         if candidate.is_file():
             files[name] = _sha256(candidate)
     return {
-        "version": 1,
+        "version": 2,
         "built_ts": time.time(),
+        "git_head": _git_head(root),
         "file_count": len(files),
         "files": files,
     }
@@ -96,14 +111,37 @@ class IntegrityGuard:
     def __init__(self, root: Path, manifest_path: Path) -> None:
         self.root = root
         self.manifest_path = manifest_path
+        # Set by ensure_baseline when the tree was re-anchored because the
+        # git HEAD moved since the baseline was built (a pull, a guarded
+        # merge) — expected change, not tampering. Owner-visible as info.
+        self.last_reanchor: dict | None = None
 
     def ensure_baseline(self) -> tuple[bool, list[dict]]:
-        """Return (baseline_exists, drift). Creates the baseline on first run."""
+        """Return (baseline_exists, drift). Creates the baseline on first run.
+
+        Drift WITH a HEAD move since the baseline was built is the normal
+        consequence of pulling/merging code: the runtime tree differs from
+        the manifest because the code legitimately changed. Re-anchor the
+        manifest to the new HEAD and report no drift. Drift WITHOUT a HEAD
+        move (baseline untouched, tree changed anyway) is still the real
+        alert this guard exists for — an escaped process or a manual edit
+        that no commit explains."""
+        self.last_reanchor = None
         manifest = load_manifest(self.manifest_path)
         if manifest is None:
             save_manifest(self.manifest_path, build_manifest(self.root))
             return False, []
-        return True, verify(self.root, manifest)
+        drift = verify(self.root, manifest)
+        if drift:
+            stored = str(manifest.get("git_head") or "")
+            current = _git_head(self.root)
+            if stored and current and stored != current:
+                changed = len(drift)
+                save_manifest(self.manifest_path, build_manifest(self.root))
+                self.last_reanchor = {"from": stored, "to": current,
+                                      "changed": changed}
+                return True, []
+        return True, drift
 
     def load(self) -> dict | None:
         """Read the stored baseline (None when there is none yet)."""

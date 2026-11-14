@@ -19,11 +19,20 @@ logic:
   row (broadcast to every agent, method ``hypothesis_contract``), protocol
   metrics/runs attached, and the hypothesis lifecycle moved to
   supported | refuted | inconclusive.
+
+The SETTLE ANCHOR LAW (verdict provenance round): `supported` requires at
+least one verdict input the agent did not author (self_authored_ratio < 1)
+— an anchorless supported is downgraded to `unanchored` and waits for
+independent replication / owner approval. See agentics/verify/anchors.py.
 """
 from __future__ import annotations
 
 import json
 
+from agentics.verify.anchors import (
+    VerdictProvenance, apply_settle_law, detect_pinned_data,
+    provenance_for_settle,
+)
 from agentics.verify.hypothesis import Hypothesis, RESULT_DIR
 from agentics.verify_metrics import (
     RESULT_MARKER, adjudicate, run_protocol,
@@ -86,7 +95,14 @@ def run_hypothesis(workspace, h: Hypothesis, repeat: int = 2,
         )
     evidence = run_protocol(workspace, h.script_path, h.criterion,
                             repeat=repeat, timeout=timeout)
-    if evidence.verdict == "inconclusive" and not evidence.meta.get("metrics"):
+    meta = evidence.meta if isinstance(evidence.meta, dict) else {}
+    # pinned-data anchor: the protocol may declare it measured against a
+    # hash-locked dataset — verify the declaration against the ACTUAL file
+    # the protocol reads, in the SAME code that is executed.
+    if detect_pinned_data(workspace, h.code):
+        meta = {**meta, "anchor_pinned_data": True}
+        evidence.meta = meta
+    if evidence.verdict == "inconclusive" and not meta.get("metrics"):
         # the stdout contract produced no measurement — before declaring
         # "measured nothing", honour the file contract: a protocol that
         # writes its result JSON but prints no marker still measured.
@@ -133,7 +149,9 @@ def _file_measurement(workspace, h: Hypothesis):
 
 
 def settle_hypothesis(memory, agent: str, hyp_id: int, h: Hypothesis,
-                      evidence: Evidence, method: str | None = None) -> int:
+                      evidence: Evidence, method: str | None = None,
+                      citations: int = 0, peer_judge: bool = False,
+                      require_anchor: bool = True) -> int:
     """Record the run as shared knowledge and close the hypothesis lifecycle.
 
     Returns the evidence row id. Every agent sees the verdict via the
@@ -143,7 +161,40 @@ def settle_hypothesis(memory, agent: str, hyp_id: int, h: Hypothesis,
 
     `method` overrides the evidence row's method label (the coder-path bridge
     records "hypothesis_contract"; the researcher protocol path keeps the
-    runner's own "protocol")."""
+    runner's own "protocol").
+
+    SETTLE ANCHOR LAW: `supported` requires self_authored_ratio < 1 — the
+    verdict must carry at least one input the agent did not author. Anchor
+    sources here: external citations attached to the claim's origin answer
+    (`citations`), a peer judge opinion (`peer_judge`), an already-confirmed
+    P24 replication or owner approval (read from the hypothesis row), and a
+    pinned-hash dataset the protocol declares (detected in run_hypothesis).
+    An anchorless supported is downgraded to `unanchored` + journaled
+    `settle_unanchored`; the ledger row records the ratio + anchors either
+    way."""
+    meta = evidence.meta if isinstance(evidence.meta, dict) else {}
+    anchor_state = memory.settle_anchor_state(hyp_id) \
+        if hasattr(memory, "settle_anchor_state") else \
+        {"replicated": False, "owner_approved": False}
+    prov: VerdictProvenance = provenance_for_settle(
+        citations=citations, peer_judge=peer_judge,
+        replicated=bool(anchor_state.get("replicated")),
+        owner_approved=bool(anchor_state.get("owner_approved")),
+        pinned_data=bool(meta.get("anchor_pinned_data")),
+    )
+    status = _STATUS_BY_VERDICT.get(evidence.verdict, "inconclusive")
+    status, downgraded = apply_settle_law(status, prov, require_anchor)
+    if downgraded:
+        try:
+            memory.journal(agent, "settle_unanchored", {
+                "hyp": hyp_id, "claim": h.claim[:160],
+                "self_authored_ratio": prov.ratio,
+                "why": "verdict passed the criterion but every deciding "
+                       "input was agent-authored — supported withheld "
+                       "until independent replication / owner approval",
+            })
+        except Exception:  # noqa: BLE001 — the law must never break a settle
+            pass
     ev_id = memory.record_evidence(
         agent, h.task, evidence.cmd, evidence.exit_code, evidence.verdict,
         hypothesis=f"{h.claim} | prediction: {h.prediction}",
@@ -156,9 +207,35 @@ def settle_hypothesis(memory, agent: str, hyp_id: int, h: Hypothesis,
         evidence.meta.get("runs", []) if evidence.meta else [],
         hypothesis_id=hyp_id,
     )
-    status = _STATUS_BY_VERDICT.get(evidence.verdict, "inconclusive")
+    status_by_law = status
     note = (evidence.meta or {}).get("note", "") or evidence.output[:200]
-    memory.update_hypothesis(hyp_id, status, evidence_id=ev_id, note=note)
+    if downgraded:
+        note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
+                f"no external anchor]")[:600]
+    # Wave-2 #4: the verdict carries its EMPIRICAL confidence floor — the
+    # lab's own re-measurement agreement (replays + replications, Wilson-95
+    # lower bound). Empty until the lab has enough decisive re-runs.
+    try:
+        from agentics.verify.calibration import calibration_suffix
+        note = f"{note}{calibration_suffix(memory)}"[:600]
+    except Exception:  # noqa: BLE001 — calibration must never break a settle
+        pass
+    memory.update_hypothesis(hyp_id, status_by_law, evidence_id=ev_id, note=note)
+    # autoresearch ledger (keep/discard history of every settle) — the
+    # coder-path twin of the deep-dive's record_experiment call. The ledger
+    # row carries the verdict's PROVENANCE next to the verdict.
+    try:
+        metrics = (evidence.meta or {}).get("metrics", {}) or {}
+        crit = h.criterion.as_dict()
+        memory.record_experiment(
+            agent, hyp_id, status_by_law, metric=str(crit.get("metric", "")),
+            measured=metrics.get(str(crit.get("metric", ""))),
+            op=str(crit.get("op", "")), target=crit.get("target"),
+            verdict_note=str(note)[:200], protocol_path=h.script_path,
+            source=method or evidence.method, description=h.claim[:200],
+            self_authored_ratio=prov.ratio, anchors=prov.anchors_json())
+    except Exception:  # noqa: BLE001 — ledger must never break a settle
+        pass
     return ev_id
 
 
