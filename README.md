@@ -29,6 +29,18 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
   score trong ledger). Chi tiết: `docs/VERIFICATION.md` §14. Bổ trợ GEPA +
   GraphRAG: verdict `refuted` của P25 chính là tín hiệu làm `kg_edges.trusted`
   mất tín nhiệm và là bài học thất bại máy-đọc-được cho reflective evolution.
+- **Wave 3 — tầng generator/cascade/tooling** (2026-11-14): đóng nốt roadmap
+  TOP 5 — **GEPA reflection trong chu kỳ** (`agentics/evolution/gepa_driver.py`:
+  mission hỏng lặp lại bị "chẩn đoán từ trace thật" rồi viết lại NGAY trong
+  chu kỳ, generator-only: lab vẫn là judge — bổ trợ cho `gepa.py` chạy batch
+  offline qua CLI `agentics gepa-evolve`), **cascade tĩnh** (`llm/router.py`:
+  ask pool chết → 1 lần thử lại trên provider frontier độc lập; purpose phán
+  quyết KHÔNG BAO GIỜ cascade), **MCP stdio bridge** (`tools/mcp_client.py`:
+  server owner-approved vào bảng `mcp_tools` riêng — `tool_registry` vẫn chỉ
+  nghĩa "code đã merge qua PR"), **risk gate học được ở chế độ shadow**
+  (`verify/gate.py`: logistic 6 feature dự đoán P(settle sạch) trước khi panel
+  mở — chỉ ghi nhật ký, không chặn; AUC in-sample ghi rõ là in-sample). Chi
+  tiết + KPI: [ADVANCED_STACK.md §6](docs/ADVANCED_STACK.md).
 - **GEPA — tối ưu prompt phản chiếu** (`agentics/evolution/gepa.py`): trên nền
   pool challenger wave-2, sinh ứng viên mission từ pareto-front (win-rate ×
   độ dài) + crossover + bài học thất bại thật; LOCAL router khi có, generator
@@ -39,6 +51,16 @@ Tiếng Việt ở dưới · [English quickstart](#english-quickstart)
   (`h1:`/`h2:`, lọc trust) chèn vào JUDGE prompt lúc propose; phát hiện
   mâu thuẫn NGỮ NGHĨA giữa các claim đã chốt ngược phán quyết. CLI:
   `agentics kg-query`, `agentics kg-contradictions`.
+<<<<<<< HEAD
+=======
+- **Wave 2 — tiến hoá & hiệu chuẩn** (2026-11-14, `e00bc29..7319550`): skill
+  library kiểu Voyager, tiến hoá prompt DSPy-lite, tầng hiệu chuẩn verify
+  (Wilson floor), cây phản tư, frontier EIG (information-gain-per-cost).
+- **Wave 1 — TOP 5 advanced stack** (2026-11-14, `04ebaac`): frontier PUCT +
+  entropic credit, MAP-Elites + islands, local small-model router (Ollama),
+  GraphRAG-lite (`kg_entities`/`kg_edges`), Hypothesis Arena (Elo + dual-judge
+  ChatGPT độc lập).
+>>>>>>> f2647da (feat(advanced): wave-3 — GEPA reflection, static cascade, MCP bridge, shadow risk gate)
 - **Luật neo verdict — `self_authored_ratio`** (2026-11-14, vòng "verdict
   provenance"): trục kiểm duyệt KHÔNG phải "thuật toán vs AI" — mà là *ai cầm
   bút viết thang điểm, và thang điểm có neo vào thứ nằm ngoài tầm với của

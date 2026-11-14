@@ -325,6 +325,18 @@ async def _llm_ask(
                                    {"purpose": purpose, "why": str(exc)[:200]})
             except Exception:  # noqa: BLE001 — telemetry must never gate harder
                 pass
+            # Wave-3 #2 — cascade: a refusal means the ask never reached a
+            # provider (dry pool / open circuit); an allowed purpose gets
+            # ONE independent-provider retry before the cycle degrades.
+            try:
+                from agentics.llm.router import try_cascade
+                casc = await try_cascade(
+                    ctx, prompt, mode, purpose,
+                    system if "system" in locals() else "")
+            except Exception:  # noqa: BLE001
+                casc = None
+            if casc is not None:
+                return casc
             return "", []
         if is_infra_failure(exc):
             # Session/transport-level (cloud session died mid-ask, the
@@ -348,6 +360,17 @@ async def _llm_ask(
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
         if budget is not None:
             budget.record(ctx.agent_id, purpose, False, time.monotonic() - started)
+        # Wave-3 #2 — one cascade retry against the configured frontier
+        # provider before the cycle degrades (journalled; llm/router.py).
+        try:
+            from agentics.llm.router import try_cascade
+            casc = await try_cascade(
+                ctx, prompt, mode, purpose,
+                system if "system" in locals() else "")
+        except Exception:  # noqa: BLE001
+            casc = None
+        if casc is not None:
+            return casc
         if state is not None and not state.get("error"):
             state["error"] = f"llm {purpose} call failed: {exc}"
         return "", []
@@ -3463,6 +3486,13 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 + 'Reply ONLY JSON: {"verdict": "approve|request_changes", '
                 '"comment": "..."}'
             )
+            # Wave-3 #5 — shadow risk gate: journal the learned merge-risk
+            # prediction before the panel opens (never blocks; verify/gate.py).
+            try:
+                from agentics.verify.gate import shadow_check
+                shadow_check(ctx, state)
+            except Exception:  # noqa: BLE001
+                pass
             answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
             if state.get("error"):             # reviewer unreachable — retry next cycle
                 state["done"] = True

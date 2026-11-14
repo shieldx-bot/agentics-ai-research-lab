@@ -1,6 +1,7 @@
 """Central configuration: .env file + env vars + configs/lab.yaml."""
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +89,19 @@ def _env_float(key: str, default: float) -> float:
     try:
         return float(os.environ.get(key, default))
     except (TypeError, ValueError):
+        return default
+
+
+def _env_json(key: str, default: dict) -> dict:
+    """A dict-valued setting via one JSON env var (MCP_SERVERS etc.)."""
+    _load_dotenv()
+    raw = os.environ.get(key, "")
+    if not raw:
+        return default
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) else default
+    except (ValueError, TypeError):
         return default
 
 
@@ -414,6 +428,33 @@ class Settings:
     prompt_variant_promote_edge: float = field(
         default_factory=lambda: _env_float("PROMPT_VARIANT_PROMOTE_EDGE",
                                            0.15))
+    # --- Wave-3 advanced add-ons (roadmap #1/#2/#3/#5) ----------------------
+    # (#1) GEPA-style reflective regeneration: when the champion mission's
+    # recent experience shows failures, the local model first explains WHY
+    # (from real traces) and then rewrites the mission against that
+    # explanation. Generator only — the lab stays the judge.
+    gepa_reflection_enabled: bool = field(
+        default_factory=lambda: _env_bool("GEPA_REFLECTION", True))
+    # (#2) static cascade: on a pool-side failure (refusal/provider error),
+    # allowed purposes get ONE retry against the configured frontier
+    # provider. Verdict/jury purposes can NEVER cascade; "" = off.
+    llm_cascade_provider: str = field(
+        default_factory=lambda: _env("LLM_CASCADE_PROVIDER", ""))
+    llm_cascade_purposes: str = field(
+        default_factory=lambda: _env("LLM_CASCADE_PURPOSES",
+                                     "research,plan,implement"))
+    # (#3) MCP bridge: OWNER-APPROVED stdio servers (JSON env, or the
+    # tools.mcp_servers: key in lab.yaml). Empty = strict no-op.
+    mcp_servers: dict = field(default_factory=lambda: _env_json("MCP_SERVERS",
+                                                                {}))
+    mcp_timeout_s: float = field(
+        default_factory=lambda: _env_float("MCP_TIMEOUT_S", 30.0))
+    # (#5) learned risk gate: shadow-only v1 — journals predictions, never
+    # blocks. "off" disables even the journaling.
+    risk_gate_mode: str = field(
+        default_factory=lambda: _env("RISK_GATE_MODE", "shadow"))
+    risk_gate_soft_threshold: float = field(
+        default_factory=lambda: _env_float("RISK_GATE_SOFT_THRESHOLD", 0.25))
     # Wave-2 #5 — reflection tree (Generative-Agents style): every
     # reflect_every_cycles supervisor cycles, the world model's recent
     # notes are synthesized into 1-2 higher-level INSIGHT notes on the

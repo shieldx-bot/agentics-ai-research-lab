@@ -190,6 +190,13 @@ CREATE TABLE IF NOT EXISTS tool_registry (
     ts REAL NOT NULL,
     uses INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS mcp_tools (
+    server TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    ts REAL NOT NULL,
+    PRIMARY KEY (server, name)
+);
 CREATE TABLE IF NOT EXISTS merge_queue (
     pr_number INTEGER PRIMARY KEY,
     author TEXT NOT NULL,
@@ -808,6 +815,34 @@ class SharedMemory:
                 line += f" (failure: {failure[:120]})"
             lines.append(line)
         return "\n".join(lines)
+
+    # ------------------------------------------------------------ risk gate (wave-3 #5)
+    def trace_outcomes(self, agent: str, before_ts: float | None = None,
+                       limit: int = 200) -> list[tuple[float, str]]:
+        """(ts, outcome) oldest→newest for one agent — the risk gate's raw
+        material (machine truth only). ``before_ts`` keeps training rows
+        leakage-free (features computed strictly from prior traces)."""
+        with self._lock:
+            if before_ts is None:
+                rows = self._conn.execute(
+                    "SELECT ts, outcome FROM traces WHERE agent=? "
+                    "ORDER BY ts LIMIT ?", (agent, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT ts, outcome FROM traces WHERE agent=? AND ts<? "
+                    "ORDER BY ts LIMIT ?", (agent, before_ts, limit)).fetchall()
+        return [(float(r[0]), str(r[1])) for r in rows]
+
+    def terminal_traces(self, limit: int = 500) -> list[dict]:
+        """Settled trace rows (the gate's labelled dataset), newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, agent, outcome, attempted, cycle FROM traces "
+                "WHERE outcome IN ('approved','merged','rejected','failed') "
+                "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return [{"ts": float(r[0]), "agent": str(r[1]), "outcome": str(r[2]),
+                 "attempted": str(r[3] or ""), "cycle": int(r[4] or 0)}
+                for r in rows]
 
     # ------------------------------------------------------------ messages
     def post_message(self, agent: str, kind: str, content: str, issue: int | None = None) -> None:
@@ -3696,6 +3731,43 @@ class SharedMemory:
     def bump_tool_use(self, name: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE tool_registry SET uses = uses + 1 WHERE name=?", (name,))
+
+    # ------------------------------------------------------------ MCP bridge (wave-3 #3)
+    def upsert_mcp_tools(self, server: str,
+                         tools: list[dict]) -> int:
+        """Record the discovered capabilities of one MCP server. Tools the
+        server no longer exposes are dropped (the listing is the truth).
+        Returns the number of stored tools."""
+        now = time.time()
+        with self._lock, self._conn:
+            for t in tools:
+                self._conn.execute(
+                    "INSERT INTO mcp_tools (server, name, description, ts) "
+                    "VALUES (?,?,?,?) ON CONFLICT(server, name) DO UPDATE SET "
+                    "description=excluded.description, ts=excluded.ts",
+                    (server, t["name"], t.get("description", ""), now))
+            if tools:
+                marks = ",".join("?" for _ in tools)
+                self._conn.execute(
+                    f"DELETE FROM mcp_tools WHERE server=? AND name NOT IN ({marks})",
+                    (server, *[t["name"] for t in tools]))
+            else:
+                self._conn.execute("DELETE FROM mcp_tools WHERE server=?", (server,))
+        return len(tools)
+
+    def list_mcp_tools(self, server: str = "") -> list[dict]:
+        """Discovered MCP capabilities (read-only introspection)."""
+        with self._lock:
+            if server:
+                rows = self._conn.execute(
+                    "SELECT server, name, description, ts FROM mcp_tools "
+                    "WHERE server=? ORDER BY server, name", (server,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT server, name, description, ts FROM mcp_tools "
+                    "ORDER BY server, name").fetchall()
+        return [{"server": r[0], "name": r[1], "description": r[2], "ts": r[3]}
+                for r in rows]
 
     # ------------------------------------------------------------ workflow clusters + skills (LifeMem)
     def create_cluster(self, category: str, description: str = "") -> int:
