@@ -38,7 +38,9 @@ Environment knobs (all read from `agentics/config.py`):
 | `LOCAL_LLM_ENABLED` | `0` | master switch; off = no localhost calls at all |
 | `LOCAL_LLM_URL` | `http://127.0.0.1:11434` | OpenAI-compatible/Ollama base URL |
 | `LOCAL_LLM_MODEL` | *(empty)* | model tag, e.g. `qwen3:1.7b`, `qwen3:4b` |
-| `LOCAL_LLM_TIMEOUT` | `20.0` | per-request timeout, seconds |
+| `LOCAL_LLM_TIMEOUT` | `120.0` | per-request timeout, seconds — CPU-realistic: the FIRST call also loads the model into RAM |
+| `LOCAL_LLM_NUM_PREDICT` | `512` | bounded generation so CPU inference finishes in seconds |
+| `LOCAL_LLM_THINK` | `0` | `1` lets qwen3-family models think (slower; `<think>` blocks are stripped either way) |
 | `LOCAL_LLM_PURPOSES` | `kg_extract,plan,role_synthesis` | comma-separated purposes allowed to route local |
 
 Two routing behaviors (in `agentics/graph/nodes.py:_llm_ask` and
@@ -184,6 +186,16 @@ FROM journal WHERE event='discovery_confirmed';
 
 ## 4. Ops notes and failure modes
 
+* **CPU inference is the bottleneck, budget it**: with `qwen3:1.7b` the
+  first `/api/chat` also loads 1.3 GB into RAM (30-60s on CPU), the
+  model would otherwise think and generate up to 2048 tokens. The router
+  therefore sends `num_predict: 512`, `think: false` (strips any leftover
+  `<think>` block too) and `keep_alive: 30m` so the model stays warm
+  between cycles. Raise `LOCAL_LLM_NUM_PREDICT` only if local answers
+  get truncated.
+* **Silent `failed: ` warnings are timeouts**: `TimeoutError` stringifies
+  to empty — the router now logs `failed: TimeoutError: `. If you see it,
+  raise `LOCAL_LLM_TIMEOUT` or lower `LOCAL_LLM_NUM_PREDICT`.
 * **Ollama down / model missing** → router returns `ok=False`, lab logs a
   warning and continues exactly as before. Nothing to clean up; fix with
   `ollama serve` / `ollama pull`.

@@ -101,6 +101,57 @@ def test_ask_empty_content_is_none(monkeypatch):
     assert asyncio.run(local_router.ask("hi", _settings())) is None
 
 
+# --------------------------------- CPU-realistic completion (2026-11-14 08:51)
+def test_ask_payload_is_cpu_bounded(monkeypatch):
+    """Live 08:51: every /api/chat timed out (TimeoutError str() is empty —
+    hence the silent `failed: ` warnings). The payload must bound
+    generation and keep the model warm so CPU inference fits the window."""
+    captured = {}
+
+    async def fake_post(url, payload, settings=None):
+        captured.update(payload)
+        return {"message": {"content": "ok"}}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_num_predict=256, local_llm_timeout=120.0)
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert captured["keep_alive"] == "30m"
+    assert captured["options"]["num_predict"] == 256
+    assert captured["think"] is False          # thinking off by default
+
+
+def test_ask_think_param_respects_env(monkeypatch):
+    async def fake_post(url, payload, settings=None):
+        captured.update(payload)
+        return {"message": {"content": "ok"}}
+
+    captured = {}
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _settings(local_llm_think=True)
+    assert asyncio.run(local_router.ask("hi", s)) is not None
+    assert "think" not in captured             # runtime decides, model thinks
+
+
+def test_ask_strips_think_blocks(monkeypatch):
+    async def fake_post(url, payload, settings=None):
+        return {"message": {
+            "content": "<think>\nlet me reason about triples...\n</think>\n"
+                       "A causes B"}}            # thinking left in by the
+                                                     # runtime despite think=0
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    resp = asyncio.run(local_router.ask("hi", _settings()))
+    assert resp is not None
+    assert "<think>" not in resp.answer
+    assert resp.answer == "A causes B"
+
+
+def test_timeout_default_is_cpu_realistic():
+    import agentics.config as config
+    cfg = config.Settings()
+    assert cfg.local_llm_timeout >= 60.0        # 20s starved the first call
+    assert cfg.local_llm_num_predict > 0
+
+
 def test_post_never_raises_on_garbage(monkeypatch):
     async def boom(*a, **k):
         raise RuntimeError("exploded")

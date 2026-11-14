@@ -202,8 +202,20 @@ class Settings:
     local_llm_url: str = field(
         default_factory=lambda: _env("LOCAL_LLM_URL", "http://127.0.0.1:11434"))
     local_llm_model: str = field(default_factory=lambda: _env("LOCAL_LLM_MODEL"))
+    # CPU-realistic defaults (live 2026-11-14 08:51: the first /api/chat
+    # also LOADS the model into RAM and qwen3 would think/generate for
+    # minutes — 20s timed out with an empty error string every cycle).
     local_llm_timeout: float = field(
-        default_factory=lambda: _env_float("LOCAL_LLM_TIMEOUT", 20.0))
+        default_factory=lambda: _env_float("LOCAL_LLM_TIMEOUT", 120.0))
+    # Bounded generation: plumbing answers (triples, plans, prompts) never
+    # need 2048 tokens — cap it so CPU inference finishes in seconds.
+    local_llm_num_predict: int = field(
+        default_factory=lambda: _env_int("LOCAL_LLM_NUM_PREDICT", 512))
+    # qwen3-family thinking models: <think> blocks are stripped from the
+    # answer regardless; this ALSO asks the runtime to skip thinking
+    # entirely (Ollama >= 0.9; older runtimes just ignore the field).
+    local_llm_think: bool = field(
+        default_factory=lambda: _env_bool("LOCAL_LLM_THINK", False))
     # Comma-separated purposes that may route to the local model. Science
     # purposes (research/verify/ideation/implement/review/repair/defend/
     # tournament) can NEVER be listed here — the router refuses them even

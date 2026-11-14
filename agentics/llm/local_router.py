@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from types import SimpleNamespace
 
@@ -51,7 +52,10 @@ async def _post(url: str, payload: dict,
                     return None
                 return await resp.json(content_type=None)
     except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
-        log.warning("local_router %s failed: %s", url, exc)
+        # type(exc).__name__ first: TimeoutError / ServerDisconnectedError
+        # stringify to EMPTY and would log as `failed: ` (live 08:51).
+        log.warning("local_router %s failed: %s: %s",
+                    url, type(exc).__name__, exc)
         return None
 
 
@@ -66,7 +70,8 @@ async def _get(url: str, settings=None) -> dict | None:
                     return None
                 return await resp.json(content_type=None)
     except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
-        log.warning("local_router %s failed: %s", url, exc)
+        log.warning("local_router %s failed: %s: %s",
+                    url, type(exc).__name__, exc)
         return None
 
 
@@ -84,12 +89,28 @@ async def available(settings=None) -> bool:
     return bool(data)
 
 
+def _strip_think(text: str) -> str:
+    """qwen3 (and other reasoning models) prepend a <think>...</think>
+    block before the answer — the lab's parsers only want the answer."""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+
+
 async def ask(prompt: str, settings=None, purpose: str = "local",
               system: str = "") -> SimpleNamespace | None:
     """One Ollama /api/chat completion. Returns an LLMResponse-shaped
     namespace (answer/citations/ok) or None when the runtime is absent/
     failing. Deliberately NOT budget-recorded: local calls burn no cookie
-    quota (see module docstring)."""
+    quota (see module docstring).
+
+    CPU-realistic completion contract (live 2026-11-14 08:51 — three
+    silent `api/chat failed:` warnings, all TimeoutError, whose str() is
+    empty): the FIRST call also loads the model into RAM (1.7B ≈ 30-60s
+    on CPU), qwen3 is a reasoning model that would burn hundreds of
+    tokens in <think>, and without num_predict Ollama generates up to
+    2048 tokens. So: bounded generation (num_predict), thinking off by
+    default (LOCAL_LLM_THINK=1 to re-enable), a long keep_alive so the
+    model stays warm between cycles, and the default timeout raised to
+    120s (LOCAL_LLM_TIMEOUT)."""
     base = str(getattr(settings, "local_llm_url", "") or "").rstrip("/")
     model = str(getattr(settings, "local_llm_model", "") or "").strip()
     if not base or not model or not prompt.strip():
@@ -99,12 +120,20 @@ async def ask(prompt: str, settings=None, purpose: str = "local",
     if system.strip():
         messages.append({"role": "system", "content": system[:2000]})
     messages.append({"role": "user", "content": prompt[:16000]})
-    data = await _post(f"{base}/api/chat", {
+    payload = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "options": {"temperature": 0.2},
-    }, settings=settings)
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.2,
+            "num_predict": int(getattr(settings, "local_llm_num_predict",
+                                       512) or 512),
+        },
+    }
+    if not bool(getattr(settings, "local_llm_think", False)):
+        payload["think"] = False          # ignored by pre-0.9 Ollama
+    data = await _post(f"{base}/api/chat", payload, settings=settings)
     if not isinstance(data, dict):
         return None
     content = ""
@@ -113,10 +142,11 @@ async def ask(prompt: str, settings=None, purpose: str = "local",
         content = str(message.get("content") or "")
     if not content and isinstance(data.get("response"), str):
         content = data["response"]          # llama.cpp-style payloads
+    content = _strip_think(content)
     if not content.strip():
         return None
     return SimpleNamespace(
-        answer=content,
+        answer=content.strip(),
         citations=[],
         ok=True,
         elapsed_s=time.monotonic() - started,
