@@ -203,8 +203,8 @@ def reset_memory_cmd(
     for kept in report.kept:
         console.print(f"  [green]giữ[/] {kept}")
     console.print(f"[bold green]Memory đã reset[/] — giải phóng "
-                  f"{report.freed_human}. Đổi RESEARCH_TOPIC trong .env/"
-                  f"configs/lab.yaml rồi chạy lại `python -m agentics.cli run` "
+                  f"{report.freed_human}. Đổi RESEARCH_TOPIC trong "
+                  f"configs/secrets.yaml rồi chạy lại `python -m agentics.cli run` "
                   f"— lab tự seed lại lab.git và schema mới.")
 
 

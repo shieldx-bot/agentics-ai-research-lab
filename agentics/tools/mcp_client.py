@@ -5,8 +5,9 @@ hand-wrapping each one.
 
 Design (honest add-on, same rules as every module in this stack):
 
-* config-gated — ``tools.mcp_servers`` in configs/lab.yaml (or the
-  ``MCP_SERVERS`` env JSON): an empty map is a strict no-op. Roadmap
+* config-gated — ``mcp_servers`` in configs/secrets.yaml (the single
+  config file, or the ``MCP_SERVERS`` env JSON): an empty map is a strict
+  no-op. Roadmap
   boundary: "không tin schema server lạ" — a capability is usable only
   after the OWNER added it to the config;
 * stdio JSON-RPC 2.0 only, no SDK dependency: initialize → tools/list →

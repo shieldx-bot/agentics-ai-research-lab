@@ -100,7 +100,11 @@ def test_extract_answer_handles_missing_marker_and_chrome_only():
 
 
 def test_get_judge_client_none_off_and_raises_on_missing_file(tmp_path):
-    assert get_judge_client(Settings()) is None  # provider off by default
+    # provider off when explicitly emptied ("": single-jury behaviour);
+    # the shipped DEFAULT is "chatgpt" (dual jury on out of the box)
+    off = Settings()
+    off.judge_second_provider = ""
+    assert get_judge_client(off) is None
     s = Settings()
     s.judge_second_provider = "chatgpt"
     s.chatgpt_cookie_path = str(tmp_path / "missing.json")

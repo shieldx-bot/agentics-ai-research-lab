@@ -131,7 +131,7 @@ Agentics AI Research Lab được xây dựng theo nguyên lý **"đàn kiến n
 - **Agent tự chọn vai (role) hoặc được phân vai thích nghi** — Supervisor,
   Researcher, Coder, Writer, Reviewer, Integrator. Bịn một agent đơn độc tự
   thành researcher; hai agent thành supervisor + researcher; đàn lớn round-robin
-  với supervisor/integrator luôn đảm bảo (xem `role_map` trong `configs/lab.yaml`).
+  với supervisor/integrator luôn đảm bảo (xem `role_map` trong `configs/secrets.yaml`).
 - **Agents làm việc trên repo như một chuyên gia GitHub thật** (chế độ GitHub)
   hoặc **hoàn toàn local** (mặc định trên nhánh này): quét việc → claim → tạo
   nhánh → code / chạy lệnh → review chéo → merge vào bare repo `data/lab.git`.
@@ -149,7 +149,7 @@ Agentics AI Research Lab được xây dựng theo nguyên lý **"đàn kiến n
     bị code phản chứng không được vào bể đấu dù tranh luận thấy nó đẹp thế nào.
 
 **Miền nghiên cứu mặc định:** AI/ML cho NFV (Network Function Virtualization) —
-đổi chủ đề chỉ bằng một dòng `research_topic` trong `configs/lab.yaml`.
+đổi chủ đề chỉ bằng một dòng `research_topic` trong `configs/secrets.yaml`.
 
 ---
 
@@ -215,14 +215,15 @@ cd agentics-ai-research-lab
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1) Cấu hình chạy — KHÔNG cần token GitHub
-cp .env.example .env             # tuỳ chỉnh RESEARCH_TOPIC / MAX_AGENTS
-#    agentics/config.py TỰ NẠP .env khi khởi động (không cần `source .env`).
-#    Biến môi trường thật trong shell vẫn luôn thắng file .env.
+# 1) Cấu hình — MỘT FILE DUY NHẤT, không cần token GitHub
+cp configs/secrets.example.yaml configs/secrets.yaml   # gitignored — chmod 600
+#    chỉnh TẤT CẢ trong đúng file này: research_topic, max_agents,
+#    local_llm_* (OmniRoute), hyperbrowser_api_keys, role_map...
+#    Mọi key đều TUỲ CHỌN — mặc định nằm trong agentics/config.py.
+#    (kiểu cũ .env vẫn được nạp nếu có, nhưng secrets.yaml luôn thắng)
 
 # 2) LLM backend — Perplexity qua Hyperbrowser cloud browser
-#    (bắt buộc trên IP datacenter; browser_backend: hyperbrowser trong lab.yaml)
-cp configs/secrets.example.yaml configs/secrets.yaml   # gitignored, chmod 600
+#    (bắt buộc trên IP datacenter; mặc định browser_backend: hyperbrowser)
 #    điền pool token: hyperbrowser_api_keys: [hb_..., hb_...]
 #    1 token = 1 cloud session; K token = K session song song thật
 #    (tương đương env: HB_API_KEYS="tk1,tk2,tk3")
@@ -255,7 +256,7 @@ Xem trạng thái: `python -m agentics.cli status`
 Đo tiến hóa của lab: `python -m agentics.cli metrics` — [docs/EVOLUTION.md](docs/EVOLUTION.md)  
 Sức khỏe bộ nhớ LifeMem: `python -m agentics.cli memory-stats` — [docs/MEMORY.md](docs/MEMORY.md)
 
-### Các khóa cấu hình mới quan trọng (`configs/lab.yaml`)
+### Các khóa cấu hình mới quan trọng (`configs/secrets.yaml`)
 
 | Khóa | Mặc định | Ý nghĩa |
 |---|---|---|
@@ -448,8 +449,7 @@ scan → claim → research → plan → implement → verify (P16/P16-R)
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env                              # optional tuning; no GITHUB_TOKEN needed
-cp configs/secrets.example.yaml configs/secrets.yaml   # put your Hyperbrowser pool here
+cp configs/secrets.example.yaml configs/secrets.yaml   # THE one config file — tuning + tokens
 python -m agentics.cli run        # infinite research loop — 100% local
 python -m agentics.cli dashboard  # owner's live view (http://127.0.0.1:8080)
 python -m agentics.cli standings  # Elo table of the hypothesis tournament

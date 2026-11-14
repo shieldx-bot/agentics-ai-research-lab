@@ -32,7 +32,7 @@ Every GitHub touchpoint of the research cycle has a local replacement:
 
 The `agentics/github_ops` package stays on disk as **dormant legacy code**
 (still covered by its own unit tests) but is no longer imported by the
-research cycle. `configs/lab.yaml` now also seeds the local backlog with
+research cycle. Local mode now also seeds the local backlog with
 starter tasks, and the Supervisor tops the backlog up from a rotation of
 survey angles when it runs dry (`agentics/local_ops.py`).
 
@@ -58,7 +58,7 @@ owner: agentics task "Benchmark X"          # or Supervisor seeds it
 
 ## 2. H1 — the agent code cannot be corrupted (5 layers)
 
-**Layer 0 — ownership matrix (P3, `configs/lab.yaml`).** The writable research
+**Layer 0 — ownership matrix (P3; code default + `configs/secrets.yaml` override).** The writable research
 surface per role is `experiments/`, `tests/`, `benchmarks/` (coder),
 `research_notes/` (researcher), `docs/` (writer), `reports/` (integrator).
 The lab's own code is out of bounds for every role.
@@ -172,7 +172,7 @@ Single-token labs: the swarm is sized by the Hyperbrowser token pool, so
 `HB_API_KEY` (one token) means ONE agent. `assign_roles` gives a lone agent
 the **researcher** role — a lone supervisor would only scan the backlog and
 never call the LLM (live 2026-11-13) — and pins supervisor+researcher for
-two agents. Pin explicit roles in `configs/lab.yaml` `role_map` only when
+two agents. Pin explicit roles in `configs/secrets.yaml` `role_map` only when
 your token pool matches that exact size. When the configured research topic
 is already covered (P7: >= 3 vector hits), the researcher rotates through
 fresh angles (benchmarks, open problems, deployments, recent advances) and
@@ -202,7 +202,7 @@ confirm prompt), `--keep-repo` (preserve `data/lab.git`), `--force`
 agent heartbeat is fresher than 120 s and not marked `stopped` — a reset
 under a live swarm would corrupt sessions; stop the lab first
 (`agentics stop`). After the reset, change `research_topic`
-(`configs/lab.yaml` wins over `RESEARCH_TOPIC` in `.env`) and start the lab
+(`configs/secrets.yaml` wins over `RESEARCH_TOPIC` in `.env`) and start the lab
 again — schema, bare origin and vector store are rebuilt empty.
 
 ### 4c. Grading the swarm itself — `agentics swarm-eval`
@@ -402,7 +402,7 @@ LLM itself, with code owning only the safety rails.
   falls back to the static `build_system_prompt` behavior — the adaptive lab
   turns back into the pre-adaptive one, never into a crash.
 - Config: `adaptive_prompts: true`, `role_prompt_ttl_hours`,
-  `role_prompt_max_chars`, `role_prompt_rework_failures` (configs/lab.yaml;
+  `role_prompt_max_chars`, `role_prompt_rework_failures` (configs/secrets.yaml;
   env `ADAPTIVE_PROMPTS`, `ROLE_PROMPT_TTL_HOURS`, …).
 
 ### Plans — proposed by the model, normalized by code

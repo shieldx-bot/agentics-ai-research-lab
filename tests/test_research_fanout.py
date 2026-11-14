@@ -154,10 +154,10 @@ def _offline_bibtex(monkeypatch):
 
 # ---------------------------------------------------------------- config
 def test_settings_fanout_knob(monkeypatch):
-    monkeypatch.setenv("RESEARCH_FANOUT", "3")
-    assert Settings().research_fanout == 3
-    monkeypatch.delenv("RESEARCH_FANOUT")
+    monkeypatch.setenv("RESEARCH_FANOUT", "1")
     assert Settings().research_fanout == 1
+    monkeypatch.delenv("RESEARCH_FANOUT")
+    assert Settings().research_fanout == 3   # shipped default (was lab.yaml)
 
 
 # ---------------------------------------------------------------- view leasing

@@ -25,10 +25,12 @@ def _clean_env(monkeypatch, keys):
 
 
 def test_real_env_file_exists_and_gitignored():
-    """The deployed repo must have .env gitignored and .env.example committed."""
+    """The deployed repo has .env gitignored; the ONE config template is
+    configs/secrets.example.yaml (the deprecated .env.example is gone)."""
     gitignore = (PROJECT_ROOT / ".gitignore").read_text()
     assert ".env" in gitignore
-    assert (PROJECT_ROOT / ".env.example").is_file()
+    assert not (PROJECT_ROOT / ".env.example").exists()
+    assert (PROJECT_ROOT / "configs" / "secrets.example.yaml").is_file()
 
 
 def test_dotenv_fills_missing_keys(temp_env, monkeypatch):

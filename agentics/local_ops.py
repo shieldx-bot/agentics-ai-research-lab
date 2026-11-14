@@ -213,7 +213,8 @@ class LocalRepo:
         smuggling cannot slip through) and the default branch only moves via
         the sanctioned integrator env. This call site is the one delta kept
         from the parallel proposal: the pattern list follows the RUNTIME
-        settings (``PROTECTED_PATHS`` / lab.yaml), so extending the list at
+        settings (``PROTECTED_PATHS`` / configs/secrets.yaml), so extending
+        the list at
         the app layer also extends the git layer — same source of truth, no
         drift.
         """

@@ -82,7 +82,7 @@ bao giờ giả 200.
 
 - [ ] `python -m pytest -q` — full suite xanh trên máy đích.
 - [ ] `python -m agentics.cli verify` — integrity baseline khớp.
-- [ ] `configs/lab.yaml` có `protected_paths` + `writable_roots` đúng vùng.
+- [ ] `configs/secrets.yaml` có `protected_paths` + `writable_roots` đúng vùng.
 - [ ] `AUTO_MERGE=false` cho đến khi branch protection + CI + secret
       scanning bật ở origin.
 - [ ] Chiếm slot tài nguyên: `LLM_MAX_CALLS_PER_HOUR` theo dung lượng pool

@@ -1,4 +1,6 @@
-"""Central configuration: .env file + env vars + configs/lab.yaml."""
+"""Central configuration: env vars (+ optional legacy .env) and ONE config
+file — configs/secrets.yaml (gitignored, the only file an operator edits).
+configs/lab.yaml is a deprecated alias still read for backward compat."""
 from __future__ import annotations
 
 import json
@@ -166,8 +168,13 @@ class Settings:
     # Paths
     data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
     accounts_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "accounts")
+    # Owner dashboard bind port (python -m agentics.cli dashboard) — env
+    # DASHBOARD_PORT still wins over this default; configs/secrets.yaml can
+    # pin it per deployment (dashboard_port:).
+    dashboard_port: int = field(
+        default_factory=lambda: _env_int("DASHBOARD_PORT", 8080))
     # P10 — the lab's own code that agents must never modify. Owner can extend
-    # via configs/lab.yaml (protected_paths:) or ALLOW_PROTECTED_PATHS=1 env
+    # via configs/secrets.yaml (protected_paths:) or ALLOW_PROTECTED_PATHS=1 env
     # to grant a run-wide override (see agentics/policies/guard.py).
     protected_paths: list[str] = field(default_factory=lambda: [
         p for p in _env("PROTECTED_PATHS",
@@ -177,9 +184,12 @@ class Settings:
     # P14 — optional whitelist ring ("cấm tuyệt đối"): when non-empty, ANY
     # file outside these roots is refused for every agent (owner exemption
     # per task still lifts it; credentials are never writable). Empty = off.
-    # Default lives in configs/lab.yaml as the union of the ownership surfaces.
+    # Default = the union of the ownership surfaces (was configs/lab.yaml).
     writable_roots: list[str] = field(default_factory=lambda: [
-        p for p in _env("WRITABLE_ROOTS", "").split(",") if p.strip()
+        p for p in _env("WRITABLE_ROOTS",
+                        "research_notes/,experiments/,benchmarks/,tests/,"
+                        "docs/,reports/,README.md").split(",")
+        if p.strip()
     ])
     # P13 — per-file lock TTL in the swarm (anti "hai agent đè tay nhau").
     file_lock_ttl_minutes: int = field(
@@ -424,11 +434,11 @@ class Settings:
     )
     pplx_timeout: int = field(default_factory=lambda: _env_int("PPLX_TIMEOUT", 180))
     # Browser backend for the Perplexity pool (see docs/LLM_PROVIDERS.md):
-    # "local" (default) = raw cookie WebSocket from THIS machine — works only
+    # "hyperbrowser" (default) = browser runs on Hyperbrowser cloud (stealth
+    #   + US residential proxy) via Playwright CDP; works from any VPS.
+    # "local" = raw cookie WebSocket from THIS machine — works only
     #   from residential IPs; Perplexity 403-blocks datacenter IPs.
-    # "hyperbrowser" = browser runs on Hyperbrowser cloud (stealth + US
-    #   residential proxy) via Playwright CDP; works from any VPS.
-    browser_backend: str = field(default_factory=lambda: _env("BROWSER_BACKEND", "local"))
+    browser_backend: str = field(default_factory=lambda: _env("BROWSER_BACKEND", "hyperbrowser"))
     hyperbrowser_api_key: str = field(default_factory=lambda: _env("HB_API_KEY"))
     # HB_API_KEYS: comma-separated Hyperbrowser tokens. Each token owns ONE
     # cloud session, so K tokens scale the swarm to K truly parallel agents
@@ -451,9 +461,10 @@ class Settings:
     # before Elo moves; disagreement records a `contested` match (no Elo
     # movement) for the owner. "" keeps the single-jury behaviour.
     judge_second_provider: str = field(
-        default_factory=lambda: _env("JUDGE_SECOND_PROVIDER", ""))
+        default_factory=lambda: _env("JUDGE_SECOND_PROVIDER", "chatgpt"))
     chatgpt_cookie_path: str = field(
-        default_factory=lambda: _env("CHATGPT_COOKIE_PATH", ""))
+        default_factory=lambda: _env("CHATGPT_COOKIE_PATH",
+                                     "accounts/chatgpt-01.json"))
     # Free-plan Hyperbrowser sessions carry a hard duration cap (~10 min;
     # live 2026-11-13: six sessions aged 9m37s-10m06s all died mid-ask inside
     # one 30-second window, wrecking every in-flight call). Recycle each
@@ -571,7 +582,7 @@ class Settings:
     # different cookie account on the local backend). Results merge into one
     # finding; every angle still passes the P20 budget gate and the fan-out
     # is journalled. 1 keeps the single-ask behaviour.
-    research_fanout: int = field(default_factory=lambda: _env_int("RESEARCH_FANOUT", 1))
+    research_fanout: int = field(default_factory=lambda: _env_int("RESEARCH_FANOUT", 3))
     # Solo-lab unblock: when the pool has fewer identities than angles
     # (e.g. one Hyperbrowser token), the extra angle still runs — SEQUENTIALLY
     # on the agent's own pinned view, never parallel on the same session.
@@ -636,20 +647,18 @@ class Settings:
         """Baseline of the runtime tree's hashes (`agentics verify`, layer 4)."""
         return self.data_dir / "integrity" / "baseline.json"
 
-    @property
-    def dashboard_port(self) -> int:
-        return _env_int("DASHBOARD_PORT", 8080)
-
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.chroma_path, self.workspaces_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 
 def load_yaml_overrides(settings: Settings) -> Settings:
-    """Merge configs/lab.yaml over env-derived settings (yaml wins where present).
+    """Apply YAML config over env-derived settings (yaml wins where present).
 
-    configs/secrets.yaml (gitignored) is merged last and wins over everything
-    else — it holds per-deployment credentials such as ``hyperbrowser_api_key``.
+    THE config file is ``configs/secrets.yaml`` (gitignored) — it holds the
+    per-deployment values AND the credentials and wins over everything else.
+    ``configs/lab.yaml`` is a deprecated alias, still read FIRST for backward
+    compatibility with older checkouts; secrets.yaml overrides it key by key.
     """
     for name in ("lab.yaml", "secrets.yaml"):
         cfg_path = PROJECT_ROOT / "configs" / name

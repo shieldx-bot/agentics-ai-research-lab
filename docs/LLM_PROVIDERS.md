@@ -45,7 +45,7 @@ unofficial APIs and can change or break at any time; use your own accounts.
 ```bash
 cp accounts/qwen-account.example.json accounts/qwen-account-01.json
 # ... paste real cookies + refresh_token (see the template's _comment)
-echo "LLM_PROVIDER=qwen" >> .env
+echo "LLM_PROVIDER=qwen" >> .env    # hoặc llm_provider: "qwen" trong configs/secrets.yaml
 python -m agentics.cli test-llm          # uses the first qwen-* account
 python -m agentics.cli run
 ```
@@ -138,9 +138,9 @@ python scripts/hyperbrowser_smoke.py --accounts 1-3 --wait 60
 
 ### Running the lab itself through Hyperbrowser (`BROWSER_BACKEND=hyperbrowser`)
 
-Set in the environment (or `configs/lab.yaml`):
+Set in the environment (or `configs/secrets.yaml`):
 
-Via `configs/lab.yaml` (committed, no secrets):
+Via `configs/secrets.yaml` (gitignored, THE single config file):
 
 ```yaml
 browser_backend: hyperbrowser
@@ -186,7 +186,7 @@ Scaling in cloud-browser mode (P18 token pool):
 * offline unit tests never create sessions; live check:
   `HB_API_KEYS=tk1,tk2,tk3 python scripts/live_research_run.py`
 
-Research fan-out (P18b, `research_fanout` in `configs/lab.yaml` or
+Research fan-out (P18b, `research_fanout` in `configs/secrets.yaml` or
 `RESEARCH_FANOUT`):
 
 * when > 1, `node_research` asks complementary angles — benchmarks &
@@ -200,8 +200,8 @@ Research fan-out (P18b, `research_fanout` in `configs/lab.yaml` or
   headings, citations deduped) feeding one batched BibTeX grounding call;
   the P20 budget gate and usage ledger apply to every angle; the fan-out
   is journalled per agent (`research_fanout` event, meta `research_fanout`).
-* `1` disables the fan-out (legacy single-ask behavior — the safe default;
-  `configs/lab.yaml` ships with `research_fanout: 2` = survey + 1 angle).
+* `1` disables the fan-out (legacy single-ask behavior; the shipped
+  default is `research_fanout: 3` = survey + 2 angles).
 
 ### Failure handling
 

@@ -55,16 +55,32 @@ def _effective_agent_count(settings: Settings, available_accounts: int) -> int:
     return count
 
 
+def _yaml_config() -> dict:
+    """Merged YAML config maps (lab.yaml deprecated alias, then THE single
+    file configs/secrets.yaml which wins key by key). Missing files skip."""
+    merged: dict = {}
+    for name in ("lab.yaml", "secrets.yaml"):
+        cfg_path = PROJECT_ROOT / "configs" / name
+        if not cfg_path.exists():
+            continue
+        try:
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            if isinstance(data, dict):
+                merged.update(data)
+        except Exception:  # noqa: BLE001 — malformed yaml must not kill boot
+            log.warning("configs/%s is not valid YAML — ignored", name)
+    return merged
+
+
 def _role_map(settings: Settings) -> dict[int, str]:
-    cfg_path = PROJECT_ROOT / "configs" / "lab.yaml"
-    role_map: dict[int, str] = {}
-    if cfg_path.exists():
-        import yaml
-        with open(cfg_path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-        raw = data.get("role_map") or {}
-        role_map = {int(k): str(v) for k, v in raw.items()}
-    return role_map
+    raw = _yaml_config().get("role_map") or {}
+    try:
+        return {int(k): str(v) for k, v in raw.items()}
+    except (TypeError, ValueError):
+        log.warning("role_map keys must be 1-based account indices — ignored")
+        return {}
 
 
 def _startup_delay_s(index: int) -> float:
@@ -92,7 +108,10 @@ class Orchestrator:
         self.host = BrowserSessionHost.from_settings(self.settings)
         self.local = LocalOps(self.memory, self.settings)
         self.local.setup()          # seed data/lab.git + the starter backlog
-        self.ownership = OwnershipPolicy.from_config(None)
+        # Ownership matrix: code DEFAULT_OWNERSHIP unless the single config
+        # file (configs/secrets.yaml, legacy lab.yaml) overrides `ownership:`.
+        self.ownership = OwnershipPolicy.from_config(
+            _yaml_config().get("ownership"))
         self.agents: list[AgentContext] = []
         self._integrity_baseline()
 
