@@ -539,3 +539,161 @@ def test_post_carries_bearer_when_key_set(monkeypatch):
     s2 = _settings(local_llm_url="http://127.0.0.1:20128/v1")
     assert asyncio.run(local_router.ask("hi", s2)) is not None
     assert "Authorization" not in seen["headers"]
+
+
+# ---------------------- live 2026-11-14 21:25 incident: HTTP 502 bursts
+def _burst_settings(**kw):
+    return _settings(local_llm_url="http://127.0.0.1:20128/v1",
+                     local_llm_model="nvidia/nemotron-3-ultra-550b-a55b",
+                     **kw)
+
+
+def test_ask_serializes_concurrent_calls(monkeypatch):
+    """Live 21:25: two SAME-SECOND lab asks both came back HTTP 502 while a
+    single dashboard-chat completion kept working — the gateway's upstream
+    serves one completion at a time. The default gate
+    (local_llm_max_concurrent=1) must keep at most ONE local ask in flight."""
+    _clear_mode_cache()
+    state = {"in_flight": 0, "max_in_flight": 0}
+
+    async def fake_post(url, payload, settings=None):
+        state["in_flight"] += 1
+        state["max_in_flight"] = max(state["max_in_flight"],
+                                     state["in_flight"])
+        await asyncio.sleep(0.02)
+        state["in_flight"] -= 1
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+
+    async def burst():
+        return await asyncio.gather(
+            *[local_router.ask("hi", _burst_settings()) for _ in range(4)])
+
+    results = asyncio.run(burst())
+    assert all(r is not None and r.ok for r in results)
+    assert state["max_in_flight"] == 1
+
+
+def test_gate_respects_local_llm_max_concurrent(monkeypatch):
+    """A host whose upstream PROVABLY handles parallel completions (probe
+    --ask --concurrency 3) may raise the gate; the semaphore then admits
+    exactly that many in flight."""
+    _clear_mode_cache()
+    state = {"in_flight": 0, "max_in_flight": 0}
+
+    async def fake_post(url, payload, settings=None):
+        state["in_flight"] += 1
+        state["max_in_flight"] = max(state["max_in_flight"],
+                                     state["in_flight"])
+        await asyncio.sleep(0.02)
+        state["in_flight"] -= 1
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(local_router, "_post", fake_post)
+    s = _burst_settings(local_llm_max_concurrent=2)
+
+    async def burst():
+        return await asyncio.gather(*[local_router.ask("hi", s)
+                                      for _ in range(4)])
+
+    results = asyncio.run(burst())
+    assert all(r is not None for r in results)
+    assert state["max_in_flight"] == 2
+
+
+def test_default_max_concurrent_is_serialized():
+    """Shipped default = 1: the honest edge queues instead of bursting."""
+    import agentics.config as config
+    cfg = config.Settings()
+    assert cfg.local_llm_max_concurrent == 1
+
+
+def _fake_gateway_session(posts: list, statuses: list):
+    """aiohttp.ClientSession stand-in answering `statuses` in sequence;
+    non-200 bodies carry the upstream's real error text."""
+    class _Resp:
+        def __init__(self, status):
+            self.status = status
+
+        async def text(self):
+            return ('{"error": {"message": "upstream provider nvidia: '
+                    'model busy"}}')
+
+        async def json(self, *a, **k):
+            return {"choices": [{"message": {"content": "recovered"}}]}
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, json=None, headers=None):
+            posts.append(statuses[min(len(posts), len(statuses) - 1)])
+            return _Ctx(_Resp(posts[-1]))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    return _Session
+
+
+def _patch_gateway(monkeypatch, posts: list, statuses: list):
+    monkeypatch.setattr(local_router.aiohttp, "ClientTimeout",
+                        lambda *a, **k: 1.0)
+    monkeypatch.setattr(local_router.aiohttp, "ClientSession",
+                        _fake_gateway_session(posts, statuses))
+
+
+def test_post_logs_model_and_body_on_502(monkeypatch, caplog):
+    """The bare `-> HTTP 502` warning hid the real upstream error for a
+    whole incident (2026-11-14 21:25). Non-200 must log the configured
+    model AND the gateway's error body (truncated)."""
+    import logging as _logging
+    posts: list = []
+    _patch_gateway(monkeypatch, posts, [502])
+    monkeypatch.setattr(local_router, "_RETRY_DELAY_S", 0)
+    with caplog.at_level(_logging.WARNING, logger="llm.local_router"):
+        assert asyncio.run(local_router._post(
+            "http://127.0.0.1:20128/v1/chat/completions",
+            {"model": "nvidia/nemotron-3-ultra-550b-a55b"})) is None
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "model=nvidia/nemotron-3-ultra-550b-a55b" in joined
+    assert "upstream provider nvidia" in joined
+    assert len(posts) == 2                    # exactly ONE quiet retry
+
+
+def test_post_retries_once_on_502_then_succeeds(monkeypatch):
+    """429/502/503 get exactly ONE quiet retry — the gateway's upstream
+    hiccup recovers in seconds; without it the caller loses a whole agent
+    cycle. Anything that then succeeds is returned normally."""
+    posts: list = []
+    _patch_gateway(monkeypatch, posts, [502, 200])
+    monkeypatch.setattr(local_router, "_RETRY_DELAY_S", 0)
+    data = asyncio.run(local_router._post(
+        "http://127.0.0.1:20128/v1/chat/completions", {"model": "m"}))
+    assert data is not None
+    assert data["choices"][0]["message"]["content"] == "recovered"
+    assert posts == [502, 200]
+
+
+def test_post_does_not_retry_non_retryable(monkeypatch):
+    """400/401/404 are CONFIG errors — retrying them is pure noise; one
+    attempt, then the warning with the body."""
+    posts: list = []
+    _patch_gateway(monkeypatch, posts, [400])
+    assert asyncio.run(local_router._post(
+        "http://127.0.0.1:20128/v1/chat/completions", {"model": "m"})) is None
+    assert posts == [400]

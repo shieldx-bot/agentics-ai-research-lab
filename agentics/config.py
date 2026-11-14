@@ -285,6 +285,14 @@ class Settings:
     # need 2048 tokens — cap it so CPU inference finishes in seconds.
     local_llm_num_predict: int = field(
         default_factory=lambda: _env_int("LOCAL_LLM_NUM_PREDICT", 512))
+    # Max CONCURRENT local completions (default 1 = serialized). Live
+    # 2026-11-14 21:25: two same-second lab asks hit the OmniRoute gateway
+    # and BOTH came back HTTP 502, while a single dashboard-chat completion
+    # kept working — the upstream serves one request at a time, so the lab
+    # must queue instead of burst. Raise only if your backend provably
+    # handles parallel completions (probe --ask --concurrency 3).
+    local_llm_max_concurrent: int = field(
+        default_factory=lambda: _env_int("LOCAL_LLM_MAX_CONCURRENT", 1))
     # Hard context cap per request (live 2026-11-14 10:35 + 13:43: the
     # kernel OOM-killed llama-server TWICE). llama.cpp's prompt cache
     # grows ~per DISTINCT prompt, and each slot's size scales with the

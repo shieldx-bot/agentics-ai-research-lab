@@ -31,7 +31,12 @@ Design constraints (honest edge, same as every pool client):
   and MAY fall back so a dry pool degrades to a local plan, not an idle
   agent);
 * the P20 ledger does NOT count local asks: they consume no shared cookie
-  quota, and inflating the ledger would starve the pool cap artificially.
+  quota, and inflating the ledger would starve the pool cap artificially;
+* local asks are SERIALIZED by default (``local_llm_max_concurrent``,
+  default 1 — live 2026-11-14 21:25: two same-second lab asks both came
+  back HTTP 502 while a single dashboard-chat completion kept working,
+  i.e. the gateway's upstream serves ONE completion at a time; concurrent
+  plumbing asks must queue, not burst).
 """
 from __future__ import annotations
 
@@ -48,6 +53,27 @@ log = logging.getLogger("llm.local_router")
 
 _local: SimpleNamespace | None = None      # process-wide singleton state
 _mode_cache: dict[str, str] = {}           # base url -> confirmed protocol
+_gates: dict = {}                          # (loop, n) -> asyncio.Semaphore
+
+# Gateway/upstream hiccups worth exactly ONE quiet retry (live 2026-11-14
+# 21:25: HTTP 502 bursts from the OmniRoute upstream; the same ask seconds
+# later would have passed — a retry beats losing a whole agent cycle).
+_RETRY_STATUSES = frozenset({429, 502, 503})
+_RETRY_DELAY_S = 2.0
+
+
+def _gate(settings=None) -> asyncio.Semaphore:
+    """Loop-scoped concurrency gate for local asks — see module docstring.
+    Keyed by the running loop so repeated ``asyncio.run()`` test loops
+    stay independent of each other."""
+    loop = asyncio.get_running_loop()
+    n = max(1, int(getattr(settings, "local_llm_max_concurrent", 1) or 1))
+    key = (loop, n)
+    sem = _gates.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(n)
+        _gates[key] = sem
+    return sem
 
 
 def _timeout(settings=None) -> float:
@@ -97,23 +123,41 @@ def _mode(base: str, settings=None) -> str:
 
 async def _post(url: str, payload: dict,
                 settings=None) -> dict | None:
-    """One POST to the local runtime; None on any failure (never raises)."""
-    try:
-        timeout = aiohttp.ClientTimeout(total=_timeout(settings))
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.post(url, json=payload,
-                                 headers=_headers(settings)) as resp:
-                if resp.status != 200:
-                    log.warning("local_router %s -> HTTP %s",
-                                url, resp.status)
-                    return None
-                return await resp.json(content_type=None)
-    except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
-        # type(exc).__name__ first: TimeoutError / ServerDisconnectedError
-        # stringify to EMPTY and would log as `failed: ` (live 08:51).
-        log.warning("local_router %s failed: %s: %s",
-                    url, type(exc).__name__, exc)
-        return None
+    """One POST to the local runtime; None on any failure (never raises).
+
+    Non-200 logs the configured model AND the gateway's error body
+    (truncated) — the bare ``-> HTTP 502`` warning hid the real upstream
+    error for a whole incident (live 2026-11-14 21:25). Retryable gateway
+    statuses (429/502/503) get exactly ONE quiet retry after
+    ``_RETRY_DELAY_S`` seconds."""
+    model = str(payload.get("model") or "")
+    for attempt in (0, 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=_timeout(settings))
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.post(url, json=payload,
+                                     headers=_headers(settings)) as resp:
+                    if resp.status != 200:
+                        body = ""
+                        try:
+                            body = (await resp.text())[:300].replace("\n", " ")
+                        except Exception:  # noqa: BLE001 — body is best-effort
+                            pass
+                        log.warning("local_router POST %s model=%s -> HTTP %s"
+                                    " body=%s", url, model or "?", resp.status,
+                                    body or "<empty>")
+                        if resp.status not in _RETRY_STATUSES or attempt:
+                            return None
+                        await asyncio.sleep(_RETRY_DELAY_S)
+                        continue
+                    return await resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
+            # type(exc).__name__ first: TimeoutError / ServerDisconnectedError
+            # stringify to EMPTY and would log as `failed: ` (live 08:51).
+            log.warning("local_router %s failed: %s: %s",
+                        url, type(exc).__name__, exc)
+            return None
+    return None
 
 
 async def _get(url: str, settings=None) -> dict | None:
@@ -123,7 +167,13 @@ async def _get(url: str, settings=None) -> dict | None:
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.get(url, headers=_headers(settings)) as resp:
                 if resp.status != 200:
-                    log.warning("local_router %s -> HTTP %s", url, resp.status)
+                    body = ""
+                    try:
+                        body = (await resp.text())[:200].replace("\n", " ")
+                    except Exception:  # noqa: BLE001 — body is best-effort
+                        pass
+                    log.warning("local_router GET %s -> HTTP %s body=%s",
+                                url, resp.status, body or "<empty>")
                     return None
                 return await resp.json(content_type=None)
     except Exception as exc:  # noqa: BLE001 — local outage must never break a cycle
@@ -180,9 +230,10 @@ async def ask(prompt: str, settings=None, purpose: str = "local",
     model = str(getattr(settings, "local_llm_model", "") or "").strip()
     if not base or not model or not prompt.strip():
         return None
-    if _mode(base, settings) == "openai":
-        return await _ask_openai(base, model, prompt, settings, system)
-    return await _ask_ollama(base, model, prompt, settings, system)
+    async with _gate(settings):        # serialized by default — see docstring
+        if _mode(base, settings) == "openai":
+            return await _ask_openai(base, model, prompt, settings, system)
+        return await _ask_ollama(base, model, prompt, settings, system)
 
 
 def _messages(prompt: str, system: str) -> list[dict]:

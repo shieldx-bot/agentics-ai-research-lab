@@ -7,6 +7,11 @@ configs/secrets.yaml), so what it validates is exactly what the lab will do:
 
   python scripts/probe_omnirouter.py            # health + model-id audit
   python scripts/probe_omnirouter.py --ask      # + one real completion
+  python scripts/probe_omnirouter.py --ask --concurrency 3
+                                                # + parallel burst (502 repro:
+                                                #   live 2026-11-14 21:25 two
+                                                #   same-second asks -> HTTP 502
+                                                #   while one call worked)
 
 Checks:
   1. GET {base}/v1/models answers (the same read-only probe `available()`
@@ -26,6 +31,7 @@ Stdlib only — no aiohttp/pytest dependency, safe on any host.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
@@ -58,7 +64,12 @@ def _http(url: str, payload: dict | None,
             except json.JSONDecodeError:
                 return resp.status, body
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.reason
+        # the BODY matters (the bare reason 'Bad Gateway' hid the real
+        # upstream error during the live 2026-11-14 21:25 incident)
+        try:
+            return exc.code, exc.read().decode("utf-8", errors="replace")[:400]
+        except Exception:  # noqa: BLE001 — probe must print, not raise
+            return exc.code, str(exc.reason)
     except Exception as exc:  # noqa: BLE001 — probe must print, not raise
         return 0, f"{type(exc).__name__}: {exc}"
 
@@ -81,10 +92,24 @@ def _model_ids(doc: dict | str) -> list[str]:
     return ids
 
 
+def _content_of(doc: dict | str) -> str:
+    """choices[0].message.content from an OpenAI-shape completion."""
+    if isinstance(doc, dict):
+        choices = doc.get("choices")
+        if isinstance(choices, list) and choices:
+            msg = choices[0].get("message")
+            if isinstance(msg, dict):
+                return str(msg.get("content") or "")
+    return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ask", action="store_true",
                     help="also run one real bounded completion")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="with --ask: fire N PARALLEL completions to test "
+                         "whether the upstream handles bursts (502 repro)")
     ap.add_argument("--timeout", type=float, default=120.0,
                     help="per-request timeout seconds (default 120)")
     args = ap.parse_args()
@@ -138,20 +163,46 @@ def main() -> int:
             "temperature": 0.2,
             "max_tokens": 64,
         }
-        t_status, t_doc = _http(f"{url_base}/chat/completions", payload,
-                                api_key, args.timeout)
-        content = ""
-        if isinstance(t_doc, dict):
-            choices = t_doc.get("choices")
-            if isinstance(choices, list) and choices:
-                msg = choices[0].get("message")
-                if isinstance(msg, dict):
-                    content = str(msg.get("content") or "")
-        if t_status == 200 and content.strip():
-            print(f"  OK completion via '{model}' -> {content.strip()[:150]!r}")
+        if args.concurrency > 1:
+            n = max(1, args.concurrency)
+            print(f"  .. firing {n} PARALLEL completions (502 burst repro)")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+                results = list(pool.map(
+                    lambda _: _http(f"{url_base}/chat/completions", payload,
+                                    api_key, args.timeout), range(n)))
+            burst_ok = True
+            for i, (st, doc_) in enumerate(results):
+                content = _content_of(doc_)
+                if st == 200 and content.strip():
+                    print(f"    OK [{i}] -> {content.strip()[:120]!r}")
+                else:
+                    print(f"    FAIL [{i}] -> HTTP {st}: {str(doc_)[:250]}")
+                    burst_ok = False
+            if burst_ok:
+                print("  OK concurrent burst — the upstream handles "
+                      "parallel completions; local_llm_max_concurrent may "
+                      "be raised")
+            else:
+                print("  !! parallel burst FAILED -> keep "
+                      "local_llm_max_concurrent=1 (the lab serializes "
+                      "local asks by default)")
+                ok = False
         else:
-            print(f"  FAIL completion -> HTTP {t_status}: {str(t_doc)[:200]}")
-            ok = False
+            t_status, t_doc = _http(f"{url_base}/chat/completions", payload,
+                                    api_key, args.timeout)
+            content = _content_of(t_doc)
+            if t_status == 200 and content.strip():
+                print(f"  OK completion via '{model}' -> "
+                      f"{content.strip()[:150]!r}")
+            else:
+                hint = ("  <- 502/503 with a short body usually means the "
+                        "gateway's UPSTREAM refused: re-check the model id "
+                        "above and the provider key inside OmniRoute, and "
+                        "keep local_llm_max_concurrent=1"
+                        ) if t_status in (502, 503) else ""
+                print(f"  FAIL completion -> HTTP {t_status}: "
+                      f"{str(t_doc)[:300]}{hint}")
+                ok = False
 
     print("RESULT:", "HEALTHY" if ok else "BROKEN (see !! above)")
     return 0 if ok else 1
