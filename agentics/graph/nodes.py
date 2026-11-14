@@ -471,6 +471,22 @@ def node_scan(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 "proposals should target an under-represented category.")
     except Exception:  # noqa: BLE001 — the audit must never break the scan
         pass
+    # Wave-2 #4: verify calibration audit — the settle verdicts' empirical
+    # confidence floor (replay/replication agreement, Wilson-95); the owner
+    # gets ONE alert when the floor drops, not a flood.
+    try:
+        from agentics.verify.calibration import calibration_audit
+        calibration_audit(ctx)
+    except Exception:  # noqa: BLE001 — the audit must never break the scan
+        pass
+    # Wave-2 #5: periodic reflection tree — the supervisor synthesizes
+    # higher-level insights from the world model on the LOCAL router
+    # (zero cookie cost); insights carry provenance and feed ideation.
+    try:
+        from agentics.graph.reflection import maybe_reflect
+        maybe_reflect(ctx)
+    except Exception:  # noqa: BLE001 — reflection must never break the scan
+        pass
     tasks = ctx.memory.scan_open_tasks(limit=30)
     if freed:
         ctx.memory.post_message(

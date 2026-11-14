@@ -409,6 +409,15 @@ class Settings:
     prompt_variant_promote_edge: float = field(
         default_factory=lambda: _env_float("PROMPT_VARIANT_PROMOTE_EDGE",
                                            0.15))
+    # Wave-2 #5 — reflection tree (Generative-Agents style): every
+    # reflect_every_cycles supervisor cycles, the world model's recent
+    # notes are synthesized into 1-2 higher-level INSIGHT notes on the
+    # LOCAL router (purpose reflect) — insights carry provenance (parent
+    # note ids, validated) and feed ideation seeding. 0 = off.
+    reflect_every_cycles: int = field(
+        default_factory=lambda: _env_int("REFLECT_EVERY_CYCLES", 6))
+    reflect_min_notes: int = field(
+        default_factory=lambda: _env_int("REFLECT_MIN_NOTES", 5))
     # --- Coordination pack A2X (docs/COORDINATION.md) ------------------------
     # Contract-Net-lite: rank bonus a claim adds to a task the supervisor's
     # scan awarded to THIS agent (0 disables the allocation signal entirely;

@@ -212,6 +212,14 @@ def settle_hypothesis(memory, agent: str, hyp_id: int, h: Hypothesis,
     if downgraded:
         note = (f"{note} [unanchored: self_authored_ratio={prov.ratio}, "
                 f"no external anchor]")[:600]
+    # Wave-2 #4: the verdict carries its EMPIRICAL confidence floor — the
+    # lab's own re-measurement agreement (replays + replications, Wilson-95
+    # lower bound). Empty until the lab has enough decisive re-runs.
+    try:
+        from agentics.verify.calibration import calibration_suffix
+        note = f"{note}{calibration_suffix(memory)}"[:600]
+    except Exception:  # noqa: BLE001 — calibration must never break a settle
+        pass
     memory.update_hypothesis(hyp_id, status_by_law, evidence_id=ev_id, note=note)
     # autoresearch ledger (keep/discard history of every settle) — the
     # coder-path twin of the deep-dive's record_experiment call. The ledger

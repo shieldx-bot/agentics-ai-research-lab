@@ -174,7 +174,8 @@ def purposes_for(settings) -> tuple[str, ...]:
     """The purposes allowed to route to the local model (config list,
     minus anything science-critical)."""
     raw = str(getattr(settings, "local_llm_purposes",
-                      "kg_extract,plan,role_synthesis") or "")
+                      "kg_extract,plan,role_synthesis,"
+                      "prompt_evolve,reflect") or "")
     return tuple(p.strip().lower() for p in raw.split(",") if p.strip()
                  and p.strip().lower() not in _SCIENCE_PURPOSES)
 

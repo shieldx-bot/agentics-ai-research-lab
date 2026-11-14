@@ -93,7 +93,10 @@ CREATE TABLE IF NOT EXISTS world_notes (
     agent TEXT NOT NULL,
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT ''
+    source TEXT NOT NULL DEFAULT '',
+    level INTEGER NOT NULL DEFAULT 0,       -- wave-2 #5: 0=raw note,
+                                            -- 1..3 = reflection depth
+    parents TEXT NOT NULL DEFAULT '[]'      -- JSON ids of source notes
 );
 -- autoresearch (karpathy/autoresearch) experiment ledger: EVERY settle --
 -- deep-dive, coder protocol, replication attempt -- lands here with
@@ -551,6 +554,13 @@ class SharedMemory:
                 # wait here (or for P24 replication) before becoming common
                 # ground.
                 "ALTER TABLE hypotheses ADD COLUMN owner_approved INTEGER NOT NULL DEFAULT 0",
+                # Wave-2 #5 reflection tree: world notes gain a DEPTH
+                # (0=raw note from a cycle, 1..3=synthesized insight) and
+                # the JSON ids of the notes each insight was synthesized
+                # FROM — provenance the dashboard renders and stale-insight
+                # downgrades walk.
+                "ALTER TABLE world_notes ADD COLUMN level INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE world_notes ADD COLUMN parents TEXT NOT NULL DEFAULT '[]'",
                 # experiment_ledger provenance columns: every settle records
                 # its self_authored_ratio (1.0 = fully self-graded) and the
                 # JSON list of external anchors that made the verdict trust-
@@ -2203,28 +2213,34 @@ class SharedMemory:
         return cur.rowcount > 0
 
     # ------------------------------------------------- Kosmos world model
-    def world_add(self, agent: str, kind: str, text: str, source: str = "") -> int:
+    def world_add(self, agent: str, kind: str, text: str, source: str = "",
+                  level: int = 0, parents: list[int] | None = None) -> int:
         """Append one structured note to the shared world model.
 
-        kind: finding | verified | refuted | gap | question. Bounded state:
-        the table keeps at most the newest 400 notes (a world model is a
-        summary, not a ledger — the full history lives in evidence/journal)."""
+        kind: finding | verified | refuted | gap | question | insight
+        (wave-2 #5: `insight` notes carry a reflection `level` >= 1 and
+        the `parents` ids they were synthesized FROM). Bounded state: the
+        table keeps at most the newest 400 notes (a world model is a
+        summary, not a ledger — the full history lives in evidence/
+        journal)."""
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "INSERT INTO world_notes (ts, agent, kind, text, source) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO world_notes (ts, agent, kind, text, source, "
+                "level, parents) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), agent, kind, (text or "")[:400],
-                 (source or "")[:60]))
+                 (source or "")[:60], max(0, min(3, int(level))),
+                 json.dumps(parents or [], ensure_ascii=False)))
             self._conn.execute(
                 "DELETE FROM world_notes WHERE id NOT IN "
                 "(SELECT id FROM world_notes ORDER BY id DESC LIMIT 400)")
         return cur.lastrowid
 
     def world_items(self, kind: str | None = None, limit: int = 20) -> list[dict]:
+        cols = "id, ts, agent, kind, text, source, level, parents"
         with self._lock:
             if kind:
                 rows = self._conn.execute(
-                    "SELECT id, ts, agent, kind, text, source FROM world_notes "
+                    f"SELECT {cols} FROM world_notes "
                     "WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit)
                 ).fetchall()
             else:
@@ -2232,35 +2248,46 @@ class SharedMemory:
                 # model is the swarm's context, and its breakthroughs must
                 # not age out under routine verified/refuted notes.
                 pinned = self._conn.execute(
-                    "SELECT id, ts, agent, kind, text, source FROM world_notes "
+                    f"SELECT {cols} FROM world_notes "
                     "WHERE text LIKE 'DISCOVERY(%' "
                     "ORDER BY id DESC LIMIT ?", (min(4, limit),)).fetchall()
                 rows = list(pinned)
                 if pinned:
                     placeholders = ",".join("?" * len(pinned))
                     rows += self._conn.execute(
-                        "SELECT id, ts, agent, kind, text, source "
+                        f"SELECT {cols} "
                         "FROM world_notes WHERE id NOT IN ("
                         + placeholders + ") ORDER BY id DESC LIMIT ?",
                         (*[r[0] for r in pinned], limit - len(pinned)),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
-                        "SELECT id, ts, agent, kind, text, source "
+                        f"SELECT {cols} "
                         "FROM world_notes ORDER BY id DESC LIMIT ?",
                         (limit,)).fetchall()
         return [{"id": r[0], "ts": r[1], "agent": r[2], "kind": r[3],
-                 "text": r[4], "source": r[5]} for r in rows]
+                 "text": r[4], "source": r[5], "level": r[6] if len(r) > 6 else 0,
+                 "parents": (json.loads(r[7]) if len(r) > 7 and r[7]
+                             else [])}
+                for r in rows]
 
     def world_render(self, limit: int = 12) -> str:
-        """World model as bounded prompt text (Kosmos consumption side)."""
+        """World model as bounded prompt text (Kosmos consumption side).
+        Insights (wave-2 #5) render with their reflection depth so prompts
+        distinguish synthesized patterns from raw cycle notes."""
         items = self.world_items(limit=limit)
         if not items:
             return ""
         mark = {"finding": "FINDING", "verified": "VERIFIED",
-                "refuted": "REFUTED", "gap": "GAP", "question": "QUESTION"}
-        lines = [f"- [{mark.get(i['kind'], i['kind'].upper())}] {i['text'][:200]}"
-                 f" ({i['source']})" for i in items]
+                "refuted": "REFUTED", "gap": "GAP", "question": "QUESTION",
+                "insight": "INSIGHT"}
+        lines = []
+        for i in items:
+            tag = mark.get(i["kind"], i["kind"].upper())
+            if i.get("level"):
+                tag = f"{tag}-L{i['level']}"
+            lines.append(f"- [{tag}] {i['text'][:200]}"
+                         f" ({i['source']})")
         return "\n".join(lines)
 
     # --------------------------------- ideation closed loop (QD pipeline)
