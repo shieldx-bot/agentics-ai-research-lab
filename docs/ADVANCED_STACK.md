@@ -225,3 +225,83 @@ FROM journal WHERE event='discovery_confirmed';
 * **Integrity**: pull/merge re-anchors the manifest automatically
   (`integrity_reanchored` journal event); a drift *without* a HEAD change
   is still a rogue-edit alarm.
+
+---
+
+## 5. Wave 2 — evolution & calibration stack (2026-11-14, commits e00bc29..7319550)
+
+The second five technologies, layered on the wave-1 stack. Shared design
+rules: selection signal is EXIT-CODE truth only (never an LLM's opinion);
+all generation/mutation/reflection runs on the LOCAL router (zero cookie
+cost); every consumer degrades to the previous behavior when its feature
+flag is off.
+
+| # | Technology | Default | Env knobs |
+|---|------------|---------|-----------|
+| 2 | DSPy-lite prompt evolution | on | `PROMPT_EVOLUTION`, `PROMPT_VARIANT_POOL`, `PROMPT_EXPLORE_P`, `PROMPT_VARIANT_PROMOTE_MIN/EDGE` |
+| 4 | Verify calibration layer | on | thresholds in `verify/calibration.py` |
+| 5 | Reflection tree | on | `REFLECT_EVERY_CYCLES`, `REFLECT_MIN_NOTES` |
+| 1 | Skill library | on | `SKILL_LIBRARY`, `SKILL_DISTILL_EVERY_CYCLES`, `SKILL_MAX` |
+| 3 | EIG frontier | on (w=0.5) | `EIG_WEIGHT` (0 = pure PUCT) |
+
+**What each does, one line each**
+
+* **#2 Prompt evolution** — the role mission EVOLVES: a bounded pool of
+  mutation arms (`prompt_variants`) is served on exploration cycles
+  (Thompson sampling, `prompt_explore_p`), scored on real cycle outcomes,
+  and promoted through the ordinary role_prompts machinery when it beats
+  the champion win-rate by 0.15 with >=10 samples. Mutation via the local
+  router (`prompt_evolve`).
+* **#4 Verify calibration** — settle notes carry an empirical confidence
+  floor `[cal r over n re-runs, Wilson-95 >= lo]` computed from replay +
+  replication agreement; the supervisor sweep journals
+  `verify_calibration` and alerts ONCE when the floor drops below 0.7
+  (n>=10) — because a wrongly confident verdict compounds through PUCT Q,
+  Elo and GraphRAG simultaneously.
+* **#5 Reflection tree** — every 6 supervisor cycles, recent world notes
+  are synthesized into INSIGHT notes (level 1-3, provenance-validated
+  parent ids, fabricated citations dropped) on the local router
+  (`reflect`); ideation seeds from `[INSIGHT-Ln]` lines in world_render.
+* **#1 Skill library** — supported settles are distilled into
+  `skill_library` rows (description via the local router `skill_distill`;
+  protocol code stored verbatim); retrieval injects the token-overlap
+  top-3 into the protocol-writing and implement prompts.
+* **#3 EIG frontier** — the PUCT order is refined by information-gain-per-
+  cost: Beta-Bernoulli priors per metric from the ledger, closed-form
+  mutual information (digamma/Beta entropy), cost = 1 + 0.5*attempts.
+
+**Wave-2 KPI queries** (same `data/shared_memory.db`)
+
+```sql
+-- prompt evolution: are challengers winning?
+SELECT status, COUNT(*), SUM(uses), SUM(wins) FROM prompt_variants
+GROUP BY status;
+SELECT reason, COUNT(*) FROM role_prompts WHERE reason='prompt_evolved';
+
+-- calibration: how trustworthy are verdicts this hour?
+SELECT rate, wilson_lo FROM (…)  -- or read journal event verify_calibration
+SELECT COUNT(*) FROM journal WHERE event='verify_calibration_alert';
+
+-- reflection: insights synthesized and cited by ideation?
+SELECT level, COUNT(*) FROM world_notes WHERE kind='insight' GROUP BY level;
+SELECT COUNT(*) FROM journal WHERE event='reflection_stored';
+
+-- skill library: compounding or idle?
+SELECT COUNT(*), SUM(uses) FROM skill_library WHERE status='active';
+SELECT COUNT(*) FROM journal WHERE event='skill_distilled';
+
+-- EIG: is the frontier buying information?
+SELECT COUNT(*) FROM journal WHERE event='frontier_priority';
+-- compare eig_score of picked vs average proposed claim over time
+```
+
+**Failure modes**
+
+* No Ollama → prompt evolution never mutates, no reflections, no skill
+  distillation, no kg extraction — everything else runs exactly as before.
+  The lab does not NEED the local edge; it just pays full cookie price.
+* A promoted variant immediately failing → the existing
+  `too_many_failures` rework path supersedes it like any champion; arms
+  are not special.
+* `EIG_WEIGHT` too high (>1.0) can pull the frontier toward flashy unknown
+  metrics over deep-dive continuity — keep it <= 0.5.
