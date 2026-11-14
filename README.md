@@ -399,6 +399,7 @@ scan → claim → research → plan → implement → verify (P16/P16-R)
 | [LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) | Perplexity + Hyperbrowser cloud browser |
 | [CONTRIBUTING.md](docs/CONTRIBUTING.md) | Phát triển nhiều người cùng lúc, ít xung đột |
 | [ADVANCED_TECH_ROADMAP.md](docs/ADVANCED_TECH_ROADMAP.md) | TOP 5 công nghệ tiên tiến dự kiến đưa vào (GEPA, router, MCP, GraphRAG, verifier học được) |
+| [ADVANCED_TECH_ROADMAP_WAVE3.md](docs/ADVANCED_TECH_ROADMAP_WAVE3.md) | TOP 5 wave 3 (semantic cache, hybrid rerank, MCP, RLVR gate, fulltext + citation grounding) — wave-1/2 đã tích hợp, xem [ADVANCED_STACK.md](docs/ADVANCED_STACK.md) |
 
 ## English quickstart
 
