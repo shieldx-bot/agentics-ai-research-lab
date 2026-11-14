@@ -2,11 +2,17 @@
 
 > Đọc kèm `docs/ADVANCED_TECH_ROADMAP.md` (TOP 5 hướng LLM-optimization:
 > GEPA / router / MCP / GraphRAG / RLVR) và `docs/ADVANCED_STACK.md`
-> (wave 1–2 đã tích hợp 10 công nghệ). Tài liệu này KHÔNG trùng lặp: nó lấp
-> **5 khoảng trống còn lại** theo trục mà các tài liệu trên chưa chạm tới —
-> **an toàn thực thi, niềm tin vào phán quyết, khả năng quan sát và độ bền
-> vận hành**. Nguyên tắc giữ nguyên: add-on gắn vào điểm móc sẵn có, không
-> đụng core (graph/orchestrator/P16).
+> (wave 1–2 đã tích hợp 10 công nghệ), cùng 2 tài liệu wave-3 song song khác:
+> `docs/ADVANCED_WAVE3.md` (hợp nhất bộ A/B/C: hermetic replay, best-of-N
+> gate, auto-ablation, N-seed CI, learned prior, literature watchdog, paper
+> assembler, semantic cache, hybrid rerank, MCP, RLVR-lite, fulltext) và
+> `docs/ADVANCED_TECH_ROADMAP_WAVE3.md` (TOP-5 hợp nhất). Tài liệu này lấp
+> **5 khoảng trống còn lại theo trục chưa ai chạm tới** — an toàn thực thi,
+> niềm tin vào phán quyết, khả năng quan sát và độ bền vận hành: 4/5 mục
+> (sandbox, injection defense, OTel, chaos) KHÔNG có trong 15 candidate đã
+> map; mục #3 giao thoa một phần với auto-ablation/N-seed CI của bộ A/B —
+> ghi rõ ở mục đó. Nguyên tắc giữ nguyên: add-on gắn vào điểm móc sẵn có,
+> không đụng core (graph/orchestrator/P16).
 
 ## Bảng so sánh nhanh
 
@@ -116,6 +122,14 @@ sai. Đây là lớp khác: độ tin cậy **của chính phép đo**. Với la
 protocol là mô phỏng nhỏ); criterion hiện có không bắt buộc nâng cấp ngay
 (mặc định giữ hành vi cũ, opt-in qua criterion).
 
+**Truy nguyên (đối chiếu với bộ A/B trong `ADVANCED_WAVE3.md`).** Bộ A/B đã
+đề xuất `auto-ablation` (arm baseline vs treatment) và `N-seed CI` — cùng
+hướng "delta không có CI là delta nhiễu". Điểm khác của mục này: đóng gói
+thành **hợp đồng criterion** (`seeds`/`alpha` trong pre-registration + seed
+dẫn xuất từ `claim_hash` + lower-bound-CI là ngưỡng verdict) — tức thống kê
+trở thành một phần của gate máy P16/P23, chứ không chỉ là công cụ phân tích
+sau khi đã settle. Nên ghép: nền thống kê dùng chung, hai consumer.
+
 ## 4. OpenTelemetry GenAI tracing — hạ tầng dữ liệu dùng chung
 
 **Cái gì.** OTel GenAI semantic conventions (`opentelemetry.io/docs/specs/
@@ -186,13 +200,17 @@ chạy trong CI local (không cần infra); không tự động bật trên prod
 
 - **GEPA / router đa mô hình / MCP / GraphRAG / RLVR gate**: đã có roadmap
   riêng (`ADVANCED_TECH_ROADMAP.md`) — không trùng lặp.
+- **Semantic cache / hybrid rerank / fulltext grounding / hermetic replay /
+  best-of-N gate / auto-ablation / literature watchdog / paper assembler /
+  federation / Z3 formal track**: đã nằm trong hợp nhất bộ A/B/C
+  (`ADVANCED_WAVE3.md` + `ADVANCED_TECH_ROADMAP_WAVE3.md`) — kể cả Z3, mà bộ
+  A đánh giá đúng là payoff cao nhưng chi phí thiết kế cao nhất; mục #3 dưới
+  đây giữ quan điểm ưu tiên CI trước, SMT sau.
 - **PUCT, MAP-Elites, Elo Arena, skill library, prompt evolution, EIG,
   calibration, reflection tree**: đã chạy thật (wave 1–2).
 - **WebAssembly sandbox (wasmtime/pyodide)**: phương án thay thế của mục #1 —
   nếu gVisor/podman quá nặng với môi trường hiện tại, WASM là plan B của #1,
   không phải mục riêng.
-- **Formal verification (SMT/Z3) cho criterion**: với độ lớn hiện tại, CI +
-  metamorphic test của mục #3 đủ; SMT chỉ đáng khi có claim bất biến phức tạp.
 - **A2A, context compression, LATS**: đã bị roadmap loại với lý do rõ.
 
 ## Thứ tự triển khai gợi ý và cách đo
