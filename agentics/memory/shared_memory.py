@@ -190,6 +190,13 @@ CREATE TABLE IF NOT EXISTS tool_registry (
     ts REAL NOT NULL,
     uses INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS mcp_tools (
+    server TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    ts REAL NOT NULL,
+    PRIMARY KEY (server, name)
+);
 CREATE TABLE IF NOT EXISTS merge_queue (
     pr_number INTEGER PRIMARY KEY,
     author TEXT NOT NULL,
@@ -534,6 +541,11 @@ class SharedMemory:
                 "ALTER TABLE evidence ADD COLUMN runs TEXT NOT NULL DEFAULT '[]'",
                 # P16bis dedup: normalized claim identity for reuse across agents
                 "ALTER TABLE hypotheses ADD COLUMN claim_hash TEXT DEFAULT ''",
+                # GraphRAG verdict layer (roadmap #4): an edge born from text
+                # ingested under a hypothesis becomes UNTRUSTED the moment
+                # that hypothesis settles REFUTED — the graph never forgets
+                # which triples machine truth killed.
+                "ALTER TABLE kg_edges ADD COLUMN trusted INTEGER NOT NULL DEFAULT 1",
                 # P23 replay: keep the protocol source so settled claims can be
                 # re-run even after P21 pruned the workspaces that held them
                 "ALTER TABLE hypotheses ADD COLUMN protocol_code TEXT NOT NULL DEFAULT ''",
@@ -803,6 +815,34 @@ class SharedMemory:
                 line += f" (failure: {failure[:120]})"
             lines.append(line)
         return "\n".join(lines)
+
+    # ------------------------------------------------------------ risk gate (wave-3 #5)
+    def trace_outcomes(self, agent: str, before_ts: float | None = None,
+                       limit: int = 200) -> list[tuple[float, str]]:
+        """(ts, outcome) oldest→newest for one agent — the risk gate's raw
+        material (machine truth only). ``before_ts`` keeps training rows
+        leakage-free (features computed strictly from prior traces)."""
+        with self._lock:
+            if before_ts is None:
+                rows = self._conn.execute(
+                    "SELECT ts, outcome FROM traces WHERE agent=? "
+                    "ORDER BY ts LIMIT ?", (agent, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT ts, outcome FROM traces WHERE agent=? AND ts<? "
+                    "ORDER BY ts LIMIT ?", (agent, before_ts, limit)).fetchall()
+        return [(float(r[0]), str(r[1])) for r in rows]
+
+    def terminal_traces(self, limit: int = 500) -> list[dict]:
+        """Settled trace rows (the gate's labelled dataset), newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, agent, outcome, attempted, cycle FROM traces "
+                "WHERE outcome IN ('approved','merged','rejected','failed') "
+                "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return [{"ts": float(r[0]), "agent": str(r[1]), "outcome": str(r[2]),
+                 "attempted": str(r[3] or ""), "cycle": int(r[4] or 0)}
+                for r in rows]
 
     # ------------------------------------------------------------ messages
     def post_message(self, agent: str, kind: str, content: str, issue: int | None = None) -> None:
@@ -1397,6 +1437,16 @@ class SharedMemory:
             changed = cur.rowcount > 0
             if not (changed and opposite):
                 return changed
+            # GraphRAG verdict layer: a REFUTED settle kills the trust of
+            # every graph edge born from text ingested under this claim
+            # (P16 provenance). Never raises — the KG is context sugar.
+            if status == "refuted":
+                try:
+                    self._conn.execute(
+                        "UPDATE kg_edges SET trusted=0 "
+                        "WHERE source_hyp=? AND trusted=1", (hyp_id,))
+                except Exception:  # noqa: BLE001
+                    pass
             # contradiction check — same criterion, opposite settled verdict
             row = self._conn.execute(
                 "SELECT agent, criterion FROM hypotheses WHERE id=?", (hyp_id,),
@@ -2214,6 +2264,144 @@ class SharedMemory:
         if not lines:
             return ""
         return "\n".join(sorted(set(lines))[:limit])
+
+    # ------------------------- GraphRAG verdict layer (roadmap #4)
+    def kg_neighborhood(self, terms: list[str], hops: int = 2,
+                        limit: int = 24, trust_only: bool = True) -> str:
+        """MULTI-HOP context block: BFS from LIKE-matched seed entities over
+        kg_edges, every hop rendered with its distance (`h1:` / `h2:`).
+
+        trust_only=True drops edges whose source hypothesis settled REFUTED
+        (P16 provenance — machine truth killed that triple). A hop-2 edge is
+        only shown when BOTH endpoints exist as entities. Empty string when
+        the graph has nothing relevant — callers just skip the block."""
+        if not terms:
+            return ""
+        try:
+            hops = max(0, min(2, int(hops)))
+        except (TypeError, ValueError):
+            hops = 2
+        with self._lock:
+            seed: dict[int, str] = {}
+            for t in terms[:8]:
+                pat = f"%{str(t).strip().lower()[:60]}%"
+                for eid, name, kind in self._conn.execute(
+                        "SELECT id, name, kind FROM kg_entities "
+                        "WHERE name LIKE ? ORDER BY mentions DESC LIMIT 8",
+                        (pat,)).fetchall():
+                    seed.setdefault(eid, name + (f" [{kind}]" if kind else ""))
+            if not seed:
+                return ""
+            names = dict(seed)
+            lines: list[str] = []
+            frontier = set(seed)
+            for hop in range(1, hops + 1):
+                if not frontier:
+                    break
+                marks = ",".join("?" * len(frontier))
+                fl = list(frontier)
+                trust_clause = "AND trusted=1" if trust_only else ""
+                rows = self._conn.execute(
+                    f"SELECT src, dst, rel, trusted FROM kg_edges "
+                    f"WHERE (src IN ({marks}) OR dst IN ({marks})) "
+                    f"{trust_clause} ORDER BY ts DESC LIMIT 200",
+                    (*fl, *fl)).fetchall()
+                nxt: set[int] = set()
+                for src, dst, rel, trusted in rows:
+                    for nid in (src, dst):
+                        if nid not in names:
+                            row = self._conn.execute(
+                                "SELECT name, kind FROM kg_entities WHERE id=?",
+                                (nid,)).fetchone()
+                            if row:
+                                names[nid] = row[0] + (
+                                    f" [{row[1]}]" if row[1] else "")
+                    if src in names and dst in names:
+                        marker = "" if trusted \
+                            else " (untrusted: nguồn P16 refuted)"
+                        lines.append(f"h{hop}: {names[src]} --{rel}--> "
+                                     f"{names[dst]}{marker}")
+                        nxt.update((src, dst))
+                frontier = nxt - set(seed) - frontier
+            if not lines:
+                return ""
+            dedup = list(dict.fromkeys(lines))
+            return "\n".join(dedup[:max(1, int(limit))])
+
+    def kg_seed_terms_from_text(self, text: str, max_terms: int = 6) -> list[str]:
+        """Word tokens of `text` that EXACTLY match known graph entities —
+        the honest seed set for propose-time context (no LLM, no fuzz)."""
+        words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,39}", text or "")
+        found: list[str] = []
+        if not words:
+            return found
+        with self._lock:
+            for w in dict.fromkeys(w.lower() for w in words):
+                if len(found) >= max_terms:
+                    break
+                row = self._conn.execute(
+                    "SELECT 1 FROM kg_entities WHERE name=?", (w,)).fetchone()
+                if row:
+                    found.append(w)
+        return found
+
+    def kg_neighborhood_from_text(self, text: str, hops: int = 2,
+                                  limit: int = 16) -> str:
+        """Propose-time helper: seed from the text's own entity mentions,
+        then the multi-hop block. Empty graph -> empty string."""
+        return self.kg_neighborhood(self.kg_seed_terms_from_text(text),
+                                    hops=hops, limit=limit)
+
+    def kg_trust_report(self) -> dict:
+        """Graph hygiene: edges split by the settle status of the hypothesis
+        that produced their text (P16 provenance). `untrusted` = source
+        settled refuted — the triple must stop being served as context."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(trusted=1),0), COALESCE(SUM(trusted=0),0) "
+                "FROM kg_edges").fetchone()
+            bad = self._conn.execute(
+                "SELECT e.id, e.src, e.dst, e.rel FROM kg_edges e "
+                "WHERE e.trusted=0 ORDER BY e.ts DESC LIMIT 12").fetchall()
+        return {"edges": row[0], "trusted": row[1], "untrusted": row[2],
+                "untrusted_sample": [{"id": b[0], "src": b[1], "dst": b[2],
+                                      "rel": b[3]} for b in bad]}
+
+    def kg_contradictions(self, threshold: float = 0.55,
+                          limit: int = 200) -> list[dict]:
+        """Semantic contradiction candidates the ledger itself did not catch:
+        settled claim pairs with OPPOSITE verdicts and high word overlap
+        (Jaccard >= threshold) but different criteria — the same-criterion
+        alarm in update_hypothesis only fires on exact criterion equality."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, claim, status FROM hypotheses "
+                "WHERE status IN ('supported','refuted') "
+                "ORDER BY id DESC LIMIT ?", (max(2, int(limit)),)).fetchall()
+        out: list[dict] = []
+        token_sets = []
+        for hid, claim, status in rows:
+            toks = {w for w in re.findall(r"[a-z]{3,}", (claim or "").lower())}
+            if toks:
+                token_sets.append((hid, claim or "", status, toks))
+        for i in range(len(token_sets)):
+            for j in range(i + 1, len(token_sets)):
+                a_id, a_claim, a_st, a_toks = token_sets[i]
+                b_id, b_claim, b_st, b_toks = token_sets[j]
+                if a_st == b_st:
+                    continue
+                inter = len(a_toks & b_toks)
+                union = len(a_toks | b_toks)
+                if not union or inter / union < threshold:
+                    continue
+                out.append({"a": a_id, "a_status": a_st,
+                            "b": b_id, "b_status": b_st,
+                            "jaccard": round(inter / union, 3),
+                            "a_claim": a_claim[:160],
+                            "b_claim": b_claim[:160]})
+        return out[:24]
+
 
     # ------------------------------------- skill library (wave-2 #1)
     def add_skill(self, name: str, description: str, code: str = "",
@@ -3564,6 +3752,43 @@ class SharedMemory:
     def bump_tool_use(self, name: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE tool_registry SET uses = uses + 1 WHERE name=?", (name,))
+
+    # ------------------------------------------------------------ MCP bridge (wave-3 #3)
+    def upsert_mcp_tools(self, server: str,
+                         tools: list[dict]) -> int:
+        """Record the discovered capabilities of one MCP server. Tools the
+        server no longer exposes are dropped (the listing is the truth).
+        Returns the number of stored tools."""
+        now = time.time()
+        with self._lock, self._conn:
+            for t in tools:
+                self._conn.execute(
+                    "INSERT INTO mcp_tools (server, name, description, ts) "
+                    "VALUES (?,?,?,?) ON CONFLICT(server, name) DO UPDATE SET "
+                    "description=excluded.description, ts=excluded.ts",
+                    (server, t["name"], t.get("description", ""), now))
+            if tools:
+                marks = ",".join("?" for _ in tools)
+                self._conn.execute(
+                    f"DELETE FROM mcp_tools WHERE server=? AND name NOT IN ({marks})",
+                    (server, *[t["name"] for t in tools]))
+            else:
+                self._conn.execute("DELETE FROM mcp_tools WHERE server=?", (server,))
+        return len(tools)
+
+    def list_mcp_tools(self, server: str = "") -> list[dict]:
+        """Discovered MCP capabilities (read-only introspection)."""
+        with self._lock:
+            if server:
+                rows = self._conn.execute(
+                    "SELECT server, name, description, ts FROM mcp_tools "
+                    "WHERE server=? ORDER BY server, name", (server,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT server, name, description, ts FROM mcp_tools "
+                    "ORDER BY server, name").fetchall()
+        return [{"server": r[0], "name": r[1], "description": r[2], "ts": r[3]}
+                for r in rows]
 
     # ------------------------------------------------------------ workflow clusters + skills (LifeMem)
     def create_cluster(self, category: str, description: str = "") -> int:

@@ -57,3 +57,31 @@ Cần một **probe set** cố định (vd. 10–20 issue mẫu có checker xác
 JSON, file nằm đúng vùng ownership, test của repo phải xanh). Khi đó mỗi bản prompt có
 `z_i` và `α_i` thật, và `select_parent_group()` (đã có sẵn, generic) dùng được nguyên xi như
 Alg. 1. Chi phí: mỗi bản prompt × mỗi probe = 1 lượt gọi LLM — tính theo quota cookie trước.
+
+## 6. GEPA — tối ưu prompt phản chiếu (roadmap #1, đã triển khai)
+
+`agentics/evolution/gepa.py` bổ sung nửa REFLECTION + VARIATION mà wave-2
+(DSPy-lite: champion vs mutation arms, Thompson sampling, promotion theo
+exit-code) còn thiếu:
+
+1. **reflect** — `collect_reflection()` gom champion, win-rate từng arm và
+   failure lines thật (`role_experience`) từ ledger;
+2. **pareto** — `pareto_front()` chọn cha không bị trội trên (win-rate ↑,
+   độ dài mission ↓) — arm cũ không được làm cha chỉ vì nó cũ;
+3. **generate** — `reflective_candidates()`: khi LOCAL router được phép
+   (purpose `prompt_evolve`) một biến thể phản chiếu được xin từ model nhỏ,
+   còn lại là generator xác định (crossover xen kẽ câu + bài học thất bại
+   lặp lại) — không tốn cookie, không bao giờ raise;
+4. **insert** — ứng viên vào challenger pool qua `store_prompt_variant(
+   origin='gepa')`; pool cap tự retire arm cũ; champion KHÔNG đổi.
+
+Lab vẫn là judge: ứng viên chỉ thăng chức champion qua `promote_prompt_variant`
+khi thắng champion đủ biên trên `min_uses` mẫu exit-code thật.
+
+```bash
+agentics gepa-evolve coder code --n 3          # sinh + chèn ứng viên
+agentics gepa-evolve coder code --dry-run      # chỉ xem
+```
+
+Tín hiệu theo dõi: `swarm-eval` G4 `role_prompt_success_rate` trước/sau; flag
+`gepa_enabled` (mặc định bật) tắt toàn bộ đường này.

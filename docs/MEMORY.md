@@ -164,3 +164,32 @@ Operational notes:
   not just commit messages) directly improves skill quality.
 - Skills are advisory context for the planner, never executed — a bad skill
   can waste a cycle but cannot break a merge (tier-1/tier-2 gates still apply).
+
+## GraphRAG verdict layer — tin cậy + đa hop + mâu thuẫn (roadmap #4, đã triển khai)
+
+Trên nền `kg_entities`/`kg_edges` (khai thác triple từ findings/settles qua
+`research/kg_extract.py`, LOCAL router), `SharedMemory` giờ có lớp phán quyết:
+
+- **Trust provenance (P16)** — cột `kg_edges.trusted`: khi một hypothesis sinh
+  ra cạnh đó bị settle `refuted`, mọi cạnh có `source_hyp` = nó được đánh dấu
+  `trusted=0` NGAY trong `update_hypothesis` — máy giết triple, đồ thị không
+  được quên. `kg_trust_report()` trả edges/trusted/untrusted.
+- **Multi-hop retrieval** — `kg_neighborhood(terms, hops≤2)`: BFS từ seed
+  (LIKE entity), mỗi hop đánh dấu `h1:`/`h2:`, mặc định chỉ phục vụ cạnh
+  trusted; `kg_neighborhood_from_text(claim)` tự seed bằng token khớp entity
+  CHÍNH XÁC (không LLM, không fuzz).
+- **Propose-time context** — `_gate_and_register` chèn block neighbourhood
+  vào JUDGE prompt khi đồ thị có entity liên quan (flag `kg_propose_context`,
+  mặc định bật; đồ thị rỗng → prompt byte-đồng-nhất như trước).
+- **Mâu thuẫn ngữ nghĩa** — `kg_contradictions(threshold=0.55)`: cặp claim đã
+  chốt NGƯỢC phán quyết với chồng từ Jaccard cao nhưng criterion KHÁC nhau —
+  lớp mà alarm cùng-criterion (`claim_contradiction`) không thấy.
+
+```bash
+agentics kg-query lstm --hops 2        # lái đồ thị (cạnh untrusted có nhãn)
+agentics kg-contradictions             # cặp mâu thuẫn + vệ sinh đồ thị
+```
+
+Ranh giới trung thực: cạnh CHỈ sinh từ sự kiện có nguồn (kg_extract có
+`source_hyp`); đồ thị rỗng = không context, không bịa; KG là context sugar —
+không phải stage pipeline, mọi lỗi degrade về không-block.

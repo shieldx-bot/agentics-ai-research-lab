@@ -326,6 +326,18 @@ async def _llm_ask(
                                    {"purpose": purpose, "why": str(exc)[:200]})
             except Exception:  # noqa: BLE001 — telemetry must never gate harder
                 pass
+            # Wave-3 #2 — cascade: a refusal means the ask never reached a
+            # provider (dry pool / open circuit); an allowed purpose gets
+            # ONE independent-provider retry before the cycle degrades.
+            try:
+                from agentics.llm.router import try_cascade
+                casc = await try_cascade(
+                    ctx, prompt, mode, purpose,
+                    system if "system" in locals() else "")
+            except Exception:  # noqa: BLE001
+                casc = None
+            if casc is not None:
+                return casc
             return "", []
         if is_infra_failure(exc):
             # Session/transport-level (cloud session died mid-ask, the
@@ -349,6 +361,17 @@ async def _llm_ask(
         log.warning("[%s] %s llm call failed: %s", ctx.agent_id, purpose, exc)
         if budget is not None:
             budget.record(ctx.agent_id, purpose, False, time.monotonic() - started)
+        # Wave-3 #2 — one cascade retry against the configured frontier
+        # provider before the cycle degrades (journalled; llm/router.py).
+        try:
+            from agentics.llm.router import try_cascade
+            casc = await try_cascade(
+                ctx, prompt, mode, purpose,
+                system if "system" in locals() else "")
+        except Exception:  # noqa: BLE001
+            casc = None
+        if casc is not None:
+            return casc
         if state is not None and not state.get("error"):
             state["error"] = f"llm {purpose} call failed: {exc}"
         return "", []
@@ -1194,12 +1217,25 @@ async def _gate_and_register(ctx: AgentContext, child: dict,
             f"near-duplicate of h#{dup[1].get('id')} "
             f"(jaccard={dup[0]:.2f})", "PEM: re-proposed an existing idea")
         return None
-    # IDEAgent judge: one call, scores on the four axes.
-    answer, _ = await _llm_ask(
-        ctx,
-        idea.JUDGE_PROMPT.format(claim=claim[:1200],
-                                 criterion=json.dumps(crit, ensure_ascii=False)),
-        purpose="ideation")
+    # IDEAgent judge: one call, scores on the four axes. When the knowledge
+    # graph already holds entities mentioned in this claim, a multi-hop
+    # neighborhood block rides along (GraphRAG-lite #4: retrieval BEFORE
+    # propose — refuted-source edges are excluded by the trust filter).
+    # Empty graph -> empty block -> prompt byte-identical to before.
+    kg_block = ""
+    if bool(getattr(ctx.settings, "kg_propose_context", True)):
+        try:
+            kg_block = await asyncio.to_thread(
+                ctx.memory.kg_neighborhood_from_text, claim)
+        except Exception:  # noqa: BLE001 — context sugar, never a gate
+            kg_block = ""
+    judge_prompt = idea.JUDGE_PROMPT.format(
+        claim=claim[:1200], criterion=json.dumps(crit, ensure_ascii=False))
+    if kg_block:
+        judge_prompt += ("\n\nKnown research graph (context only — machine-"
+                         "verified facts about these entities; may be stale):\n"
+                         + kg_block)
+    answer, _ = await _llm_ask(ctx, judge_prompt, purpose="ideation")
     j = idea.parse_scores(answer)
     if j is None:
         return None                      # judge unavailable — no registration
@@ -3522,6 +3558,13 @@ async def node_review(ctx: AgentContext, state: ResearchState) -> ResearchState:
                 + 'Reply ONLY JSON: {"verdict": "approve|request_changes", '
                 '"comment": "..."}'
             )
+            # Wave-3 #5 — shadow risk gate: journal the learned merge-risk
+            # prediction before the panel opens (never blocks; verify/gate.py).
+            try:
+                from agentics.verify.gate import shadow_check
+                shadow_check(ctx, state)
+            except Exception:  # noqa: BLE001
+                pass
             answer, _ = await _llm_ask(ctx, prompt, mode="concise", purpose="review", state=state)
             if state.get("error"):             # reviewer unreachable — retry next cycle
                 state["done"] = True

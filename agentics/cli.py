@@ -508,6 +508,137 @@ def swarm_eval(
         memory.close()
 
 
+@app.command("gepa-evolve")
+def gepa_evolve(
+    role: str = typer.Argument(..., help="role cần tiến hoá mission (vd: coder)"),
+    category: str = typer.Argument("code", help="category của (role, category)"),
+    n: int = typer.Option(3, "--n", help="số ứng viên sinh ra mỗi batch"),
+    seed: int = typer.Option(0, "--seed", help="seed cho generator xác định"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="chỉ in, không chèn vào pool"),
+) -> None:
+    """GEPA — tối ưu prompt phản chiếu: pareto cha + crossover + bài học thất bại.
+
+    Sinh ứng viên mission cho (role, category) từ chính vết tích thật của lab
+    (win-rate của các arm, failure lines của chu kỳ). Ưu tiên LOCAL router
+    (purpose prompt_evolve) — không tốn cookie; không có local runtime thì
+    dùng generator xác định. Lab vẫn là judge: ứng viên chỉ vào challenger
+    pool (origin='gepa'), thăng chức champion vẫn do P11 quyết trên exit-code."""
+    import asyncio as _asyncio
+
+    from agentics.evolution import gepa as _gepa
+    from agentics.memory.shared_memory import SharedMemory
+
+    settings = _settings()
+    setup_logging("ERROR")
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        texts = _asyncio.run(_gepa.reflective_candidates(
+            memory, settings, role, category, n=n, seed=seed))
+        if not texts:
+            console.print("[yellow]Không có gì để lai tạo: chưa có champion "
+                          "lẫn arm nào cho (role, category) này.[/]")
+            return
+        table = Table(title=f"GEPA candidates — {role}/{category} (seed={seed})")
+        table.add_column("#", justify="right")
+        table.add_column("độ dài", justify="right")
+        table.add_column("mở đầu mission", overflow="fold")
+        for i, t in enumerate(texts, 1):
+            table.add_row(str(i), str(len(t)), t[:140])
+        console.print(table)
+        if dry_run:
+            console.print("[dim]--dry-run: không chèn gì vào pool.[/]")
+            return
+        ids = _gepa.evolve(memory, settings, role, category, texts)
+        pool = memory.prompt_variants(role, category)
+        gepa_arms = sum(1 for v in pool if v.get("origin") == "gepa")
+        console.print(f"[green]Đã chèn {len(ids)} ứng viên[/] "
+                      f"(origin='gepa') — pool hiện {len(pool)} arm, "
+                      f"{gepa_arms} từ GEPA. Champion không đổi; promotion "
+                      f"vẫn do exit-code quyết (P11).")
+        try:
+            memory.journal("owner", "gepa_candidates",
+                           {"role": role, "category": category,
+                            "inserted": ids, "seed": seed})
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        memory.close()
+
+
+@app.command("kg-query")
+def kg_query(
+    term: str = typer.Argument(..., help="từ khoá seed (khớp entity trong đồ thị)"),
+    hops: int = typer.Option(2, "--hops", help="số hop BFS (tối đa 2)"),
+    term_multiple: list[str] = typer.Option([], "--term", help="thêm seed khác"),
+) -> None:
+    """GraphRAG-lite — lái đồ thị tri thức: neighbourhood đa hop từ seed.
+
+    Đồ thị được khai thác từ findings/settles (kg_extract) và bị lọc TRỰC TIẾP
+    bởi máy: cạnh sinh từ giả thuyết bị P16 kết luận refuted bị đánh dấu
+    untrusted và (mặc định) không được phục vụ nữa."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        terms = [term] + list(term_multiple)
+        block = memory.kg_neighborhood(terms, hops=hops, limit=24)
+        if not block:
+            console.print("[yellow]Đồ thị trống hoặc không có entity nào khớp "
+                          "seed — chưa có gì để lái.[/]")
+            return
+        console.print(block)
+        tr = memory.kg_trust_report()
+        console.print(f"[dim]đồ thị: {tr['edges']} cạnh "
+                      f"({tr['trusted']} trusted / {tr['untrusted']} untrusted "
+                      f"— untrusted = nguồn P16 bị refuted)[/]")
+    finally:
+        memory.close()
+
+
+@app.command("kg-contradictions")
+def kg_contradictions(
+    threshold: float = typer.Option(0.55, "--threshold",
+                                    help="Jaccard tối thiểu giữa 2 claim"),
+) -> None:
+    """Phát hiện mâu thuẫn: cặp claim đã chốt với phán quyết NGƯỢC nhau.
+
+    Hai lớp: (1) cặp criterion trùng khớp — alarm đã journal sẵn lúc chốt;
+    (2) cặp claim khác criterion nhưng chồng từ ≥ threshold — alarm NGỮ NGHĨA
+    chỉ lớp này bắt được. Kèm báo cáo vệ sinh đồ thị (cạnh mất tín nhiệm)."""
+    settings = _settings()
+    setup_logging("ERROR")
+    from agentics.memory.shared_memory import SharedMemory
+    settings.ensure_dirs()
+    memory = SharedMemory(settings.db_path)
+    try:
+        pairs = memory.kg_contradictions(threshold=threshold)
+        if pairs:
+            t = Table(title="Mâu thuẫn ngữ nghĩa (opposite verdicts, overlap cao)")
+            t.add_column("hypothesis", justify="right")
+            t.add_column("phán quyết")
+            t.add_column("đối lập")
+            t.add_column("phán quyết")
+            t.add_column("jaccard", justify="right")
+            for p in pairs:
+                t.add_row(f"h#{p['a']}", p["a_status"], f"h#{p['b']}",
+                          p["b_status"], f"{p['jaccard']:.2f}")
+            console.print(t)
+            for p in pairs[:6]:
+                console.print(f"[dim]h#{p['a']}: {p['a_claim']}[/]\n"
+                              f"[dim]h#{p['b']}: {p['b_claim']}[/]")
+        else:
+            console.print("[green]Không tìm thấy cặp mâu thuẫn ngữ nghĩa nào.[/]")
+        tr = memory.kg_trust_report()
+        console.print(f"[dim]vệ sinh đồ thị: {tr['trusted']} cạnh trusted, "
+                      f"{tr['untrusted']} untrusted (nguồn P16 refuted) — "
+                      f"không còn được phục vụ vào context propose.[/]")
+    finally:
+        memory.close()
+
+
 @app.command("standings")
 def standings(
     limit: int = typer.Option(15, "--limit", help="số hypothesis hiển thị"),

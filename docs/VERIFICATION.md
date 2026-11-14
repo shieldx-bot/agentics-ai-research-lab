@@ -332,3 +332,66 @@ Tests: `tests/test_replication_ledger.py` (selection + bookkeeping),
 `tests/test_node_replicate.py` (reviewer route + routing table),
 `tests/test_replication_surfaces.py` (prompt + dashboard), plus the
 dedup composition pinned in `tests/test_hypothesis_dedup.py`.
+
+## 14. P25 — the falsification layer: a claim is verified only if it SURVIVES
+
+One base run passing the criterion is a WEAK kind of verified: a real
+researcher states the claim as a universal property ("holds for EVERY
+input of class X") and then tries to break it. P25 mechanizes exactly that
+on top of the existing stack — `verify_ops.run_experiment` stays the only
+execution path, `verify_metrics.adjudicate` stays the only verdict logic;
+the new modules ORCHESTRATE the loop and the comparisons, nothing else.
+
+**The contract (opt-in, `falsification` field of the hypothesis JSON):**
+
+```json
+"falsification": {
+  "cases":   [{"vals": [1.0, 2.0]}, {"vals": [0.6, 0.6]}],
+  "relations": [
+    {"transform": "shuffle", "expect": "same_within", "tolerance": 1e-9},
+    {"transform": "double",  "expect": "criterion_holds"}
+  ],
+  "mutation": true, "mutation_threshold": 0.5
+}
+```
+
+`agentics/verify/falsify.py` — the runner writes each case to
+`research_notes/experiments/cases/<id>.json` (the case-delivery contract;
+`run_hypothesis` parks case 0 BEFORE the base run so the 2-run
+reproducibility gate stays meaningful) and runs the protocol once per
+case, then once per case x relation. Built-in transforms: `shuffle`,
+`double`, `negate`, `subset_half`, `duplicate`, `noise` — each seeded from
+a stable hash of (hypothesis, case, relation), so ANY agent can replay the
+exact suite. Relation expectations: `criterion_holds` (the transformed run
+must still satisfy the pre-registered criterion), `same` (metrics agree
+with the base run), `same_within` (the criterion metric stays within
+tolerance).
+
+**Verdict laws (Popper, mechanically):** one counterexample refutes the
+universal claim; one violated metamorphic relation refutes it too (the
+measurement moved under a transformation that must not move it); a broken
+or unparsable case run is inconclusive, NEVER refuted (the b359557 law);
+everything survived -> confirmed stands, enriched with the falsification
+record (`meta.falsification`: runs, cases, violations, plus a
+`case_binding` audit — identical metrics across distinct cases means the
+protocol plausibly ignored its input class; flagged honestly, kept
+confirmed). Only a CONFIRMED verdict enters the suite — refuted and
+inconclusive evidence passes through untouched.
+
+**The mutation quality gate (`agentics/verify/mutation.py`):** "test yếu
+thì bằng chứng vô giá trị". The lab SABOTAGES the confirmed protocol with
+deterministic operators (`flip_comparison` — exact negation, `swap_boolean`,
+`perturb_constant` — string literals guarded, `swap_add_sub` — non-binary
+`+` guarded), re-runs each mutant once, and scores detections:
+`score = killed / total`, a mutant killed when its run stops confirming.
+`score < threshold` downgrades confirmed -> INCONCLUSIVE ("weak protocol:
+a sabotaged measurement would have confirmed the claim too") — never
+refuted, the idea was not measured well enough to count as confirmed.
+No mutable sites -> the gate passes with an honest note (the absence of
+anything to sabotage is not scored 1.0). Mutants live in the researcher's
+own territory (`research_notes/experiments/mutants/`); the machinery never
+breaks a settle (an error keeps the verdict, recorded in meta).
+
+Tests: `tests/test_falsify.py` (spec validation, transforms, runner
+verdicts, the run_hypothesis wiring) and `tests/test_mutation.py`
+(operators, kill/survive scoring, the gate downgrade).

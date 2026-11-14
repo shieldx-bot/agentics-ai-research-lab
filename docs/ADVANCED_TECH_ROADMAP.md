@@ -1,7 +1,27 @@
 # Lộ trình công nghệ tiên tiến — TOP 5 cần đưa vào
 
+> **Trạng thái 2026-11-14: #1 (GEPA) và #4 (GraphRAG verdict layer) ĐÃ TRIỂN KHAI**
+> — `agentics/evolution/gepa.py` + CLI `gepa-evolve`; `kg_edges.trusted` +
+> `kg_neighborhood`/`kg_contradictions` + CLI `kg-query`/`kg-contradictions`;
+> propose-time KG context trong `_gate_and_register`. Chi tiết: EVOLUTION.md §6,
+> MEMORY.md (GraphRAG verdict layer).
+> Còn lại của TOP 5: #2 Router đã có (`agentics/llm/local_router.py` +
+> `allowed_for`); #3 MCP chưa làm — chuyển thành mục #3 của wave-3; #5
+> Verifier mới landed nửa calibration (`agentics/verify/calibration.py` —
+> floor confidence), predictor cho panel rounds chuyển thành mục #4 của
+> wave-3 (`docs/ADVANCED_TECH_ROADMAP_WAVE3.md`).
+>
+> **Audit 2026-11-14** (kiểm chứng độc lập trước khi triển khai tiếp):
+> trích dẫn học thuật đã tra web xác nhận THẬT — GEPA (arXiv:2507.19457),
+> RouteLLM/FrugalGPT, survey routing arXiv:2603.04445 (TMLR 2026),
+> AgentV-RL arXiv:2604.16004 (ACL 2026), MemGraphRAG arXiv:2606.00610
+> (KDD 2026), khảo sát Stacklok 09/2026; hai số chưa đối chiếu được chính
+> xác đã đánh dấu trong thân bài ("ICLR 2026" của GEPA, "~40%" Stacklok).
+> Con trỏ `polices.py` là file không tồn tại — fallback thật là
+> keyword-overlap ranking trong `shared_memory` (comment
+> `vector_store.py` đã sửa). Suite hiện tại: xem badge README.
 > Nguyên tắc của owner: **không đụng vào core** (graph/orchestrator/P16 đã bền
-> qua 801 test) — mọi thứ dưới đây là **lớp add-on** gắn vào các điểm móc sẵn
+> qua bộ test đầy đủ, xem badge README) — mọi thứ dưới đây là **lớp add-on** gắn vào các điểm móc sẵn
 > có (ledger `llm_usage`, `role_prompts`, `findings`/`evidence`/`hypotheses`,
 > `tool_registry`, pool token). Mỗi mục ghi rõ: cái gì, vì sao hợp lab này,
 > kế hoạch gắn vào đâu, và ranh giới trung thực.
@@ -20,11 +40,12 @@
 
 ## 1. GEPA — tối ưu prompt bằng phản chiếu (nâng cấp P11)
 
-**Cái gì.** GEPA (Genetic-Pareto, Agrawal et al. 2025; trình bày ICLR 2026) là
-optimizer **không gradient**: chạy pipeline, đọc trace, dùng chính LLM phản
-chiếu "vì sao thất bại", tiến hoá prompt theo front Pareto (chất lượng/chi phí).
-Paper cho thấy vượt RL trên nhiều task agent; đã có sẵn trong DSPy
-(`dspy.GEPA`) và repo độc lập `gepa-ai/gepa`.
+**Cái gì.** GEPA (Genetic-Pareto, Agrawal et al. 2025 — arXiv:2507.19457,
+đã kiểm chứng có thật; dòng "trình bày ICLR 2026" chưa đối chiếu được
+riêng lẻ) là optimizer **không gradient**: chạy pipeline, đọc trace, dùng
+chính LLM phản chiếu "vì sao thất bại", tiến hoá prompt theo front Pareto
+(chất lượng/chi phí). Paper cho thấy vượt RL trên nhiều task agent; đã có
+sẵn trong DSPy (`dspy.GEPA`) và repo độc lập `gepa-ai/gepa`.
 
 **Vì sao hợp lab.** Lab đã tự làm việc này bằng tay: P11 `role_prompts`
 (`store_role_prompt` / `bump_role_prompt` với decay failure, supersede khi
@@ -76,8 +97,11 @@ kết quả.
 ## 3. MCP — chuẩn hoá lớp tool, mở khoá hệ sinh thái
 
 **Cái gì.** Model Context Protocol đã thành **chuẩn de facto** kết nối agent–tool
-(~40% doanh nghiệp theo khảo sát Stacklok Q3/2026; tốc độ tăng trưởng nhanh
-nhất từng ghi nhận 2024–2025), cộng đồng phát hành hàng nghìn MCP server:
+(khảo sát Stacklok "State of MCP in Software 2026" / "State of AI
+Architecture 2026" là có thật — 100 lãnh đạo kỹ thuật và 520 lãnh đạo
+AI respectively, 09/2026; con số "~40% doanh nghiệp" ban đầu chưa đối chiếu
+được chính xác với báo cáo, đã làm mềm theo audit 2026-11-14), cộng đồng
+phát hành hàng nghìn MCP server:
 GitHub, arXiv, database, filesystem, browser…
 
 **Vì sao hợp lab.** Lab đang tự bọc từng tool: `research/free_tools.py`

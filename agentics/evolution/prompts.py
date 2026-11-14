@@ -95,6 +95,16 @@ async def _mutate_into_pool(ctx, role: str, category: str, champion: str,
     settings = getattr(ctx, "settings", None)
     if not local_router.allowed_for(settings, "prompt_evolve"):
         return
+    # Wave-3 #1 — GEPA reflection first: when the champion's recent
+    # experience shows failures, a critique-then-rewrite arm beats a blind
+    # mutation. The plain mutation below stays the fallback (and the only
+    # path for healthy champions with nothing to reflect on).
+    try:
+        from agentics.evolution import gepa_driver
+        if await gepa_driver.regenerate(ctx, role, category, champion):
+            return
+    except Exception:  # noqa: BLE001 — reflection is sugar
+        pass
     try:
         experience = ctx.memory.role_experience(role, category, limit=6)
         prompt = _MUTATE_PROMPT.format(
